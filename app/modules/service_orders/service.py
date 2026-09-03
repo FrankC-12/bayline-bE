@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.modules.parts.models import Part
-from app.modules.parts.service import _sync_availability
+from app.modules.parts.service import PartsService, _sync_availability
 from app.modules.post_ventas.models import LaborSettings, Tempario
 from app.modules.service_orders.enums import ServiceOrderStatus, TaskStatus, TransferStatus, UpsellStatus
 from app.modules.service_orders.exceptions import (
@@ -226,7 +226,8 @@ class ServiceOrderService:
             for tp in linked_parts:
                 part = await self.db.get(Part, tp.part_id)
                 if part is not None:
-                    await self._add_line_to_transfer(transfer, part.id, tp.quantity, float(part.price))
+                    unit_price = await PartsService(self.db).get_reference_price(part.id)
+                    await self._add_line_to_transfer(transfer, part.id, tp.quantity, unit_price)
 
         await self.db.commit()
         await self.db.refresh(task)
@@ -273,7 +274,8 @@ class ServiceOrderService:
         if part is None:
             raise TransferNotFoundError(str(part_id))
         transfer = await self._get_or_create_pending_transfer(service_order_id)
-        await self._add_line_to_transfer(transfer, part.id, quantity, float(part.price))
+        unit_price = await PartsService(self.db).get_reference_price(part.id)
+        await self._add_line_to_transfer(transfer, part.id, quantity, unit_price)
         await self.db.commit()
         await self.db.refresh(transfer)
         return transfer

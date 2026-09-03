@@ -11,10 +11,32 @@ from app.modules.administracion.enums import (
     IncomeSource,
     PurchaseRequestStatus,
     SupplierStatus,
+    SupplierPaymentMethod,
     SupplierType,
 )
 
 # Suppliers
+
+
+class SupplierPaymentAccountInput(BaseModel):
+    payment_method: SupplierPaymentMethod
+    bank_name: str | None = Field(default=None, max_length=100)
+    account_holder: str = Field(min_length=2, max_length=150)
+    document: str | None = Field(default=None, max_length=20)
+    account_number: str | None = Field(default=None, max_length=40)
+    account_type: str | None = Field(default=None, max_length=30)
+    currency: AccountCurrency
+    phone: str | None = Field(default=None, max_length=30)
+    email: str | None = Field(default=None, max_length=150)
+    notes: str | None = None
+    is_active: bool = True
+
+
+class SupplierPaymentAccountRead(SupplierPaymentAccountInput):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    created_at: datetime
 
 
 class SupplierCreate(BaseModel):
@@ -27,6 +49,7 @@ class SupplierCreate(BaseModel):
     phone: str | None = None
     email: str | None = None
     address: str | None = None
+    payment_accounts: list[SupplierPaymentAccountInput] = Field(default_factory=list)
 
 
 class SupplierUpdate(BaseModel):
@@ -55,6 +78,11 @@ class SupplierRead(BaseModel):
     address: str | None
     status: SupplierStatus
     created_at: datetime
+
+
+class SupplierDetailRead(SupplierRead):
+    payment_accounts: list[SupplierPaymentAccountRead]
+    purchase_history: list["PurchaseRequestRead"]
 
 
 # Purchase requests

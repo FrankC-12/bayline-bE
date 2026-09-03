@@ -17,4 +17,5 @@ from app.modules.parts.models import Part, PartSale, PartSaleLine, PartReturn  #
 from app.modules.post_ventas.models import LaborSettings, Tempario, TemparioPart  # noqa: F401
 from app.modules.warehouse.models import Warehouse, PartLot, StockMovement, Transfer, TransferLine  # noqa: F401
 from app.modules.concesionario.models import DealershipVehicle, VehicleSale  # noqa: F401
-from app.modules.administracion.models import Supplier, PurchaseRequest, PurchaseRequestLine, SupplierClaim, Account, IncomeEntry, ExpenseEntry  # noqa: F401
+from app.modules.administracion.models import Supplier, PurchaseRequest, PurchaseRequestLine, SupplierClaim, SupplierPaymentAccount, Account, IncomeEntry, ExpenseEntry  # noqa: F401
+from app.modules.exchange_rates.models import ExchangeRate  # noqa: F401

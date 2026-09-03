@@ -14,6 +14,7 @@ from app.modules.administracion.enums import (
     IncomeSource,
     PurchaseRequestStatus,
     SupplierStatus,
+    SupplierPaymentMethod,
     SupplierType,
 )
 
@@ -39,6 +40,37 @@ class Supplier(Base):
         Enum(SupplierStatus, name="supplier_status"), nullable=False, default=SupplierStatus.ACTIVO
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    payment_accounts: Mapped[list["SupplierPaymentAccount"]] = relationship(
+        back_populates="supplier", cascade="all, delete-orphan"
+    )
+
+
+class SupplierPaymentAccount(Base):
+    __tablename__ = "supplier_payment_accounts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    supplier_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("suppliers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    payment_method: Mapped[SupplierPaymentMethod] = mapped_column(
+        Enum(SupplierPaymentMethod, name="supplier_payment_method"), nullable=False
+    )
+    bank_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    account_holder: Mapped[str] = mapped_column(String(150), nullable=False)
+    document: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    account_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    account_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    currency: Mapped[AccountCurrency] = mapped_column(
+        Enum(AccountCurrency, name="account_currency", create_type=False), nullable=False
+    )
+    phone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    supplier: Mapped["Supplier"] = relationship(back_populates="payment_accounts")
 
 
 class PurchaseRequest(Base):

@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +16,8 @@ from app.modules.warehouse.exceptions import (
 from app.modules.warehouse.models import PartLot, StockMovement, Transfer, TransferLine, Warehouse
 from app.modules.warehouse.schemas import (
     BulkLotItem,
+    BulkLotReview,
+    BulkLotReviewItem,
     InventoryRow,
     LotLineInput,
     PartLotRead,
@@ -169,13 +171,29 @@ class AlmacenService:
         items: list[BulkLotItem],
         responsible_user_id: uuid.UUID | None = None,
     ) -> tuple[list[PartLot], list[str]]:
+        review = await self.review_bulk_lots(filial_id, items)
+        if review.conflicts:
+            raise ValueError("Bulk import contains catalog name conflicts")
+
         result = await self.db.execute(select(Part).where(Part.filial_id == filial_id))
-        parts_by_code = {p.code: p for p in result.scalars().all()}
+        parts_by_code = {p.code.strip().casefold(): p for p in result.scalars().all()}
+
+        for item in review.new:
+            part = Part(
+                filial_id=filial_id, code=item.part_code, name=item.part_name,
+                category=item.category or "Sin categoría", brand="Sin marca",
+                application="Universal", unit="Unidad", price=0,
+                stock_quantity=0, min_stock=0,
+            )
+            _sync_availability(part)
+            self.db.add(part)
+            await self.db.flush()
+            parts_by_code[part.code.strip().casefold()] = part
 
         created: list[PartLot] = []
         skipped: list[str] = []
         for item in items:
-            part = parts_by_code.get(item.part_code)
+            part = parts_by_code.get(item.part_code.strip().casefold())
             if part is None:
                 skipped.append(item.part_code)
                 continue
@@ -192,6 +210,32 @@ class AlmacenService:
         for lot in created:
             await self.db.refresh(lot)
         return created, skipped
+
+    async def review_bulk_lots(
+        self, filial_id: uuid.UUID, items: list[BulkLotItem]
+    ) -> BulkLotReview:
+        result = await self.db.execute(select(Part).where(Part.filial_id == filial_id))
+        parts_by_code = {part.code.strip().casefold(): part for part in result.scalars().all()}
+        existing: list[BulkLotReviewItem] = []
+        new: list[BulkLotReviewItem] = []
+        conflicts: list[BulkLotReviewItem] = []
+        seen_codes: set[str] = set()
+        for item in items:
+            normalized_code = item.part_code.strip().casefold()
+            part = parts_by_code.get(normalized_code)
+            reviewed = BulkLotReviewItem(
+                **item.model_dump(), catalog_name=part.name if part else None
+            )
+            if normalized_code in seen_codes:
+                conflicts.append(reviewed.model_copy(update={"catalog_name": "Código repetido en archivo"}))
+            elif part is None:
+                new.append(reviewed)
+            elif part.name.strip().casefold() != item.part_name.strip().casefold():
+                conflicts.append(reviewed)
+            else:
+                existing.append(reviewed)
+            seen_codes.add(normalized_code)
+        return BulkLotReview(existing=existing, new=new, conflicts=conflicts)
 
     # Salidas (manual stock-out, e.g. consumption or returns to a supplier)
 
@@ -357,7 +401,7 @@ class AlmacenService:
                         responsible_user_id=responsible_user_id,
                     )
                 )
-            transfer.completed_at = datetime.now(timezone.utc)
+            transfer.completed_at = datetime.now(UTC)
             transfer.completed_by_user_id = responsible_user_id
 
         transfer.status = new_status

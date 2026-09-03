@@ -15,12 +15,11 @@ from app.modules.parts.models import Part, PartReturn, PartSale, PartSaleLine
 from app.modules.parts.schemas import (
     PartBulkItem,
     PartCreate,
+    PartRead,
     PartReturnCreate,
     PartSaleCreate,
     PartUpdate,
 )
-
-
 
 SALE_TRANSITIONS: dict[PartSaleStatus, set[PartSaleStatus]] = {
     PartSaleStatus.PENDIENTE: {PartSaleStatus.PEDIDO, PartSaleStatus.CANCELADO},
@@ -53,14 +52,62 @@ class PartsService:
 
     # Parts (catalog)
 
-    async def list_parts(self, filial_id: uuid.UUID, search: str | None = None) -> list[Part]:
-        query = select(Part).where(Part.filial_id == filial_id).order_by(Part.name)
-        result = await self.db.execute(query)
-        parts = list(result.scalars().all())
+    async def list_parts(self, filial_id: uuid.UUID, search: str | None = None) -> list[PartRead]:
+        from app.modules.warehouse.models import PartLot
+
+        stock_total = (
+            select(func.coalesce(func.sum(PartLot.quantity_remaining), 0))
+            .where(PartLot.part_id == Part.id)
+            .correlate(Part)
+            .scalar_subquery()
+        )
+        latest_cost = (
+            select(PartLot.unit_cost)
+            .where(PartLot.part_id == Part.id)
+            .order_by(PartLot.received_at.desc(), PartLot.id.desc())
+            .limit(1)
+            .correlate(Part)
+            .scalar_subquery()
+        )
+        query = select(Part, stock_total, latest_cost).where(Part.filial_id == filial_id)
         if search:
-            term = search.lower()
-            parts = [p for p in parts if term in p.code.lower() or term in p.name.lower()]
-        return parts
+            term = f"%{search.strip()}%"
+            query = query.where(Part.code.ilike(term) | Part.name.ilike(term))
+
+        result = await self.db.execute(query.order_by(Part.name))
+        return [
+            PartRead(
+                id=part.id,
+                filial_id=part.filial_id,
+                code=part.code,
+                name=part.name,
+                category=part.category,
+                brand=part.brand,
+                application=part.application,
+                unit=part.unit,
+                stock_total=int(total),
+                reference_price=round(float(cost) * 1.30, 2) if cost is not None else None,
+                created_at=part.created_at,
+                updated_at=part.updated_at,
+            )
+            for part, total, cost in result.all()
+        ]
+
+    async def get_latest_cost(self, part_id: uuid.UUID) -> float | None:
+        from app.modules.warehouse.models import PartLot
+
+        result = await self.db.execute(
+            select(PartLot.unit_cost)
+            .where(PartLot.part_id == part_id)
+            .order_by(PartLot.received_at.desc(), PartLot.id.desc())
+            .limit(1)
+        )
+        cost = result.scalar_one_or_none()
+        return float(cost) if cost is not None else None
+
+    async def get_reference_price(self, part_id: uuid.UUID) -> float:
+        cost = await self.get_latest_cost(part_id)
+        return round(cost * 1.30, 2) if cost is not None else 0.0
 
     async def get_part(self, part_id: uuid.UUID) -> Part:
         part = await self.db.get(Part, part_id)
@@ -74,9 +121,13 @@ class PartsService:
             filial_id=payload.filial_id,
             code=payload.code,
             name=payload.name,
-            price=payload.price,
-            stock_quantity=payload.stock_quantity,
-            min_stock=payload.min_stock,
+            category=payload.category,
+            brand=payload.brand,
+            application=payload.application,
+            unit=payload.unit,
+            price=0,
+            stock_quantity=0,
+            min_stock=0,
         )
         _sync_availability(part)
         self.db.add(part)
@@ -86,15 +137,12 @@ class PartsService:
 
     async def update_part(self, part_id: uuid.UUID, payload: PartUpdate) -> Part:
         part = await self.get_part(part_id)
-        if payload.name is not None:
-            part.name = payload.name
-        if payload.price is not None:
-            part.price = payload.price
-        if payload.stock_quantity is not None:
-            part.stock_quantity = payload.stock_quantity
-        if payload.min_stock is not None:
-            part.min_stock = payload.min_stock
-        _sync_availability(part)
+        if payload.code is not None and payload.code != part.code:
+            await self._ensure_code_available(part.filial_id, payload.code)
+        for field in ("code", "name", "category", "brand", "application", "unit"):
+            value = getattr(payload, field)
+            if value is not None:
+                setattr(part, field, value)
         await self.db.commit()
         await self.db.refresh(part)
         return part
@@ -125,9 +173,13 @@ class PartsService:
                 filial_id=filial_id,
                 code=item.code,
                 name=item.name,
-                price=item.price,
-                stock_quantity=item.stock_quantity,
-                min_stock=item.min_stock,
+                category=item.category,
+                brand=item.brand,
+                application=item.application,
+                unit=item.unit,
+                price=0,
+                stock_quantity=0,
+                min_stock=0,
             )
             _sync_availability(part)
             self.db.add(part)
@@ -169,28 +221,22 @@ class PartsService:
             filial_id=payload.filial_id,
             client_name=payload.client_name,
             client_document=payload.client_document,
-            request_reason=payload.request_reason,
+            request_reason="Venta de Repuestos",
             discount_label=payload.discount_label,
             sequence_number=next_seq,
         )
         self.db.add(sale)
         await self.db.flush()
 
-  
-
-        from app.modules.warehouse.service import AlmacenService
-
-        almacen_service = AlmacenService(self.db)
-
         for line in payload.lines:
             part = await self.get_part(line.part_id)
-            cost_snapshot = await almacen_service.get_average_cost(part.id)
+            cost_snapshot = await self.get_latest_cost(part.id)
             self.db.add(
                 PartSaleLine(
                     part_sale_id=sale.id,
                     part_id=part.id,
                     quantity=line.quantity,
-                    unit_price=part.price,
+                    unit_price=round(cost_snapshot * 1.30, 2) if cost_snapshot is not None else 0.0,
                     unit_cost=cost_snapshot,
                 )
             )

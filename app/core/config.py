@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     database_url: str
     secret_key: str
     access_token_expire_minutes: int = 60
+    refresh_token_expire_days: int = 30
 
     platform_admin_email: str
     platform_admin_password: str

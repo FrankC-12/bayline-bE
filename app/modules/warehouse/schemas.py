@@ -55,6 +55,8 @@ class PartLotRead(BaseModel):
 
 class BulkLotItem(BaseModel):
     part_code: str = Field(min_length=1, max_length=40)
+    part_name: str = Field(min_length=1, max_length=150)
+    category: str | None = Field(default=None, max_length=80)
     quantity: int = Field(ge=1)
     unit_cost: float = Field(ge=0)
     location: str | None = None
@@ -69,6 +71,16 @@ class BulkLotCreate(BaseModel):
 class BulkLotResult(BaseModel):
     created: list[PartLotRead]
     skipped: list[str]
+
+
+class BulkLotReviewItem(BulkLotItem):
+    catalog_name: str | None = None
+
+
+class BulkLotReview(BaseModel):
+    existing: list[BulkLotReviewItem]
+    new: list[BulkLotReviewItem]
+    conflicts: list[BulkLotReviewItem]
 
 
 class StockOutCreate(BaseModel):

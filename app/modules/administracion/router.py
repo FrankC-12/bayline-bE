@@ -22,6 +22,7 @@ from app.modules.administracion.schemas import (
     SupplierClaimRead,
     SupplierClaimUpdate,
     SupplierCreate,
+    SupplierDetailRead,
     SupplierRead,
     SupplierUpdate,
 )
@@ -71,6 +72,17 @@ async def create_supplier(
 ) -> SupplierRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_supplier(payload)
+
+
+@router.get("/suppliers/{supplier_id}", response_model=SupplierDetailRead)
+async def get_supplier_detail(
+    supplier_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+) -> SupplierDetailRead:
+    existing = await service.get_supplier(supplier_id)
+    await _ensure_access(current_user, existing.filial_id, service.db)
+    return await service.get_supplier_detail(supplier_id)
 
 
 @router.patch("/suppliers/{supplier_id}", response_model=SupplierRead)

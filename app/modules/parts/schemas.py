@@ -3,23 +3,26 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.modules.parts.enums import PartAvailability, PartSaleStatus, ReturnCondition, ReturnReason
+from app.modules.parts.enums import PartSaleStatus, ReturnCondition, ReturnReason
 
 
 class PartCreate(BaseModel):
     filial_id: uuid.UUID
     code: str = Field(min_length=1, max_length=40)
     name: str = Field(min_length=1, max_length=150)
-    price: float = Field(ge=0)
-    stock_quantity: int = Field(default=0, ge=0)
-    min_stock: int = Field(default=10, ge=0)
+    category: str = Field(min_length=1, max_length=80)
+    brand: str = Field(min_length=1, max_length=80)
+    application: str = Field(min_length=1, max_length=180)
+    unit: str = Field(min_length=1, max_length=30)
 
 
 class PartUpdate(BaseModel):
+    code: str | None = Field(default=None, min_length=1, max_length=40)
     name: str | None = Field(default=None, min_length=1, max_length=150)
-    price: float | None = Field(default=None, ge=0)
-    stock_quantity: int | None = Field(default=None, ge=0)
-    min_stock: int | None = Field(default=None, ge=0)
+    category: str | None = Field(default=None, min_length=1, max_length=80)
+    brand: str | None = Field(default=None, min_length=1, max_length=80)
+    application: str | None = Field(default=None, min_length=1, max_length=180)
+    unit: str | None = Field(default=None, min_length=1, max_length=30)
 
 
 class PartRead(BaseModel):
@@ -29,10 +32,12 @@ class PartRead(BaseModel):
     filial_id: uuid.UUID
     code: str
     name: str
-    price: float
-    stock_quantity: int
-    min_stock: int
-    availability: PartAvailability
+    category: str
+    brand: str
+    application: str
+    unit: str
+    stock_total: int = 0
+    reference_price: float | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -40,9 +45,10 @@ class PartRead(BaseModel):
 class PartBulkItem(BaseModel):
     code: str = Field(min_length=1, max_length=40)
     name: str = Field(min_length=1, max_length=150)
-    price: float = Field(ge=0)
-    stock_quantity: int = Field(default=0, ge=0)
-    min_stock: int = Field(default=10, ge=0)
+    category: str = Field(min_length=1, max_length=80)
+    brand: str = Field(min_length=1, max_length=80)
+    application: str = Field(min_length=1, max_length=180)
+    unit: str = Field(min_length=1, max_length=30)
 
 
 class PartBulkCreate(BaseModel):
@@ -74,7 +80,6 @@ class PartSaleCreate(BaseModel):
     filial_id: uuid.UUID
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None
-    request_reason: str = Field(default="Venta de Repuestos", max_length=150)
     discount_label: str = Field(default="Costo + 30% (Sin Descuento)", max_length=60)
     lines: list[PartSaleLineInput] = Field(min_length=1)
 

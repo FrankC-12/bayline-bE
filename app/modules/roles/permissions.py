@@ -7,6 +7,7 @@ from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.models import RoleModulePermission
+from app.modules.users.models import UserModulePermission
 
 # The Súper Administrador role always has full access within its own filial —
 # it's the role that configures everyone else's permissions in the first place.
@@ -40,6 +41,18 @@ async def ensure_module_access(
         raise InsufficientPermissionsError()
 
     if current_user.role_slug == SUPER_ADMIN_SLUG:
+        return
+
+    override_result = await db.execute(
+        select(UserModulePermission).where(
+            UserModulePermission.user_id == current_user.user_id,
+            UserModulePermission.module_id == module_id,
+        )
+    )
+    override = override_result.scalar_one_or_none()
+    if override is not None:
+        if override.access not in _MEETS_LEVEL[level]:
+            raise InsufficientPermissionsError()
         return
 
     result = await db.execute(

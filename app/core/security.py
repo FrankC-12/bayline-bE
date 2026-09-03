@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import bcrypt
@@ -23,12 +23,33 @@ def create_access_token(claims: dict[str, Any], expires_minutes: int | None = No
     """Encode a JWT access token embedding the given claims."""
     settings = get_settings()
     minutes = expires_minutes or settings.access_token_expire_minutes
-    expire_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    payload = {**claims, "exp": expire_at}
+    expire_at = datetime.now(UTC) + timedelta(minutes=minutes)
+    payload = {**claims, "type": "access", "exp": expire_at}
+    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+
+
+def create_refresh_token(subject: str, expires_days: int | None = None) -> str:
+    """Create a longer-lived JWT that can only be used to renew a session."""
+    settings = get_settings()
+    days = expires_days or settings.refresh_token_expire_days
+    expire_at = datetime.now(UTC) + timedelta(days=days)
+    payload = {"sub": subject, "type": "refresh", "exp": expire_at}
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
 def decode_access_token(token: str) -> dict[str, Any]:
     """Decode and verify a JWT access token. Raises jwt exceptions on failure."""
     settings = get_settings()
-    return jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
+    payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
+    if payload.get("type") != "access":
+        raise jwt.InvalidTokenError("Expected an access token")
+    return payload
+
+
+def decode_refresh_token(token: str) -> dict[str, Any]:
+    """Decode a refresh JWT and reject access tokens used at the refresh endpoint."""
+    settings = get_settings()
+    payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
+    if payload.get("type") != "refresh":
+        raise jwt.InvalidTokenError("Expected a refresh token")
+    return payload

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.modules.warehouse.schemas import (
     BulkLotCreate,
+    BulkLotReview,
     BulkLotResult,
     InventoryRow,
     PartLotRead,
@@ -123,6 +124,16 @@ async def bulk_create_lots(
         payload.filial_id, payload.warehouse_id, payload.items, current_user.user_id
     )
     return BulkLotResult(created=[_lot_to_read(lot) for lot in created], skipped=skipped)
+
+
+@router.post("/almacen/stock-in/bulk/review", response_model=BulkLotReview)
+async def review_bulk_lots(
+    payload: BulkLotCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> BulkLotReview:
+    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.review_bulk_lots(payload.filial_id, payload.items)
 
 
 @router.post("/almacen/stock-out", status_code=status.HTTP_201_CREATED)

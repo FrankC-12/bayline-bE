@@ -49,11 +49,35 @@ class DealershipVehicle(Base):
     price_cash: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     price_financed: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     cost_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    price_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
+    iva_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=16)
+    igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=3)
+    luxury_tax_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+    financing_provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    financing_external_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     images: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    @property
+    def iva_amount(self) -> float:
+        return round(float(self.price_cash) * float(self.iva_percentage) / 100, 2)
+
+    @property
+    def igtf_amount(self) -> float:
+        if self.price_currency != "USD":
+            return 0.0
+        return round(float(self.price_cash) * float(self.igtf_percentage) / 100, 2)
+
+    @property
+    def luxury_tax_amount(self) -> float:
+        return round(float(self.price_cash) * float(self.luxury_tax_percentage) / 100, 2)
+
+    @property
+    def cash_total(self) -> float:
+        return round(float(self.price_cash) + self.iva_amount + self.igtf_amount + self.luxury_tax_amount, 2)
 
 
 class VehicleSale(Base):

@@ -35,6 +35,7 @@ class ConcesionarioService:
                 or term in v.model.lower()
                 or term in v.vin.lower()
                 or term in v.sku.lower()
+                or term in str(v.year)
                 or (v.plate and term in v.plate.lower())
             ]
         return vehicles
@@ -104,6 +105,12 @@ class ConcesionarioService:
             "price_cash",
             "price_financed",
             "cost_price",
+            "price_currency",
+            "iva_percentage",
+            "igtf_percentage",
+            "luxury_tax_percentage",
+            "financing_provider",
+            "financing_external_id",
         ):
             value = getattr(payload, field)
             if value is not None:

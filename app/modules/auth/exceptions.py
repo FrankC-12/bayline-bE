@@ -24,6 +24,15 @@ class InvalidTokenError(UnauthorizedError):
         )
 
 
+class InvalidRefreshTokenError(UnauthorizedError):
+    """Raised when a refresh token is missing, malformed, or expired."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The refresh token is invalid or has expired.", error_code="invalid_refresh_token"
+        )
+
+
 class InsufficientPermissionsError(ForbiddenError):
     """Raised when an authenticated user's scope does not allow the requested action."""
 

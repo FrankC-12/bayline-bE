@@ -1,0 +1,3 @@
+# Daily at 00:00 in the server's configured timezone (set it to America/Caracas).
+# Replace /opt/bayline-backend with the deployed backend directory.
+0 0 * * * cd /opt/bayline-backend && ./venv/bin/python -m scripts.update_bcv_rates >> /var/log/bayline-bcv.log 2>&1

@@ -20,6 +20,12 @@ class Part(Base):
     )
     code: Mapped[str] = mapped_column(String(40), nullable=False)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
+    category: Mapped[str] = mapped_column(String(80), nullable=False, default="Sin categoría")
+    brand: Mapped[str] = mapped_column(String(80), nullable=False, default="Sin marca")
+    application: Mapped[str] = mapped_column(String(180), nullable=False, default="Universal")
+    unit: Mapped[str] = mapped_column(String(30), nullable=False, default="Unidad")
+    # Legacy compatibility fields. Catalog reads no longer expose or trust these;
+    # stock and reference price are derived from part_lots.
     price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     stock_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     min_stock: Mapped[int] = mapped_column(Integer, nullable=False, default=10, server_default="10")

@@ -28,6 +28,7 @@ from app.modules.administracion.models import (
     PurchaseRequest,
     PurchaseRequestLine,
     Supplier,
+    SupplierPaymentAccount,
     SupplierClaim,
 )
 from app.modules.administracion.schemas import (
@@ -42,6 +43,8 @@ from app.modules.administracion.schemas import (
     SupplierClaimCreate,
     SupplierClaimUpdate,
     SupplierCreate,
+    SupplierDetailRead,
+    SupplierRead,
     SupplierUpdate,
 )
 from app.modules.warehouse.enums import MovementType
@@ -110,8 +113,32 @@ class AdministracionService:
             raise SupplierNotFoundError(str(supplier_id))
         return supplier
 
+    async def get_supplier_detail(self, supplier_id: uuid.UUID) -> SupplierDetailRead:
+        result = await self.db.execute(
+            select(Supplier)
+            .options(selectinload(Supplier.payment_accounts))
+            .where(Supplier.id == supplier_id)
+        )
+        supplier = result.scalar_one_or_none()
+        if supplier is None:
+            raise SupplierNotFoundError(str(supplier_id))
+        purchases_result = await self.db.execute(
+            select(PurchaseRequest)
+            .options(selectinload(PurchaseRequest.lines))
+            .where(PurchaseRequest.supplier_id == supplier_id)
+            .order_by(PurchaseRequest.created_at.desc())
+        )
+        data = SupplierRead.model_validate(supplier).model_dump()
+        data["payment_accounts"] = supplier.payment_accounts
+        data["purchase_history"] = [_request_to_read(item) for item in purchases_result.scalars().all()]
+        return SupplierDetailRead.model_validate(data)
+
     async def create_supplier(self, payload: SupplierCreate) -> Supplier:
-        supplier = Supplier(**payload.model_dump())
+        data = payload.model_dump(exclude={"payment_accounts"})
+        supplier = Supplier(**data)
+        supplier.payment_accounts = [
+            SupplierPaymentAccount(**account.model_dump()) for account in payload.payment_accounts
+        ]
         self.db.add(supplier)
         await self.db.commit()
         await self.db.refresh(supplier)

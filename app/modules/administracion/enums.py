@@ -32,6 +32,15 @@ class ClaimStatus(str, enum.Enum):
 class AccountCurrency(str, enum.Enum):
     USD = "usd"
     BS = "bs"
+    EUR = "eur"
+
+
+class SupplierPaymentMethod(str, enum.Enum):
+    TRANSFERENCIA = "transferencia"
+    PAGO_MOVIL = "pago_movil"
+    ZELLE = "zelle"
+    EFECTIVO = "efectivo"
+    OTRO = "otro"
 
 
 class AccountType(str, enum.Enum):
