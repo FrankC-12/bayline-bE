@@ -146,7 +146,7 @@ async def update_part_sale(
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     if payload.status is None:
         return existing
-    return await service.update_sale_status(sale_id, payload.status)
+    return await service.update_sale_status(sale_id, payload.status, payload.dispatched_lines)
 
 
 @router.get("/part-returns", response_model=list[PartReturnRead])

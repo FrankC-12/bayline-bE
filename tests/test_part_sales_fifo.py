@@ -19,8 +19,14 @@ import app.core.models_registry  # noqa: F401
 from app.core.database import Base
 from app.core.exceptions import BadRequestError
 from app.modules.parts.enums import PartSaleStatus
+from app.modules.parts.exceptions import DispatchQuantityMismatchError, DispatchQuantityRequiredError
 from app.modules.parts.models import Part, PartSale, PartSaleLine
-from app.modules.parts.schemas import PartSaleCreate, PartSaleQuoteRead, PartSaleRead
+from app.modules.parts.schemas import (
+    PartSaleCreate,
+    PartSaleLineDispatch,
+    PartSaleQuoteRead,
+    PartSaleRead,
+)
 from app.modules.parts.service import PartsService
 from app.modules.warehouse.exceptions import InsufficientStockError
 from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
@@ -234,3 +240,69 @@ async def test_http_quote_and_create_contract(inventory, monkeypatch):
         del body["warehouse_id"]
         missing = await client.post("/api/v1/part-sales", json=body)
         assert missing.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_dispatch_matching_quantity_advances_to_pedido(inventory):
+    service, _session, data, _lots, _other = inventory
+    sale = await service.create_sale(PartSaleCreate(**data))
+    line = sale.lines[0]
+
+    updated = await service.update_sale_status(
+        sale.id,
+        PartSaleStatus.PEDIDO,
+        [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity)],
+    )
+
+    assert updated.status == PartSaleStatus.PEDIDO
+    assert updated.lines[0].dispatched_quantity == line.quantity
+
+
+@pytest.mark.asyncio
+async def test_dispatch_mismatch_blocks_transition_and_can_be_retried(inventory):
+    service, _session, data, _lots, _other = inventory
+    sale = await service.create_sale(PartSaleCreate(**data))
+    line = sale.lines[0]
+
+    with pytest.raises(DispatchQuantityMismatchError):
+        await service.update_sale_status(
+            sale.id,
+            PartSaleStatus.PEDIDO,
+            [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity - 1)],
+        )
+    sale = await service.get_sale(sale.id)
+    assert sale.status == PartSaleStatus.PENDIENTE
+
+    updated = await service.update_sale_status(
+        sale.id,
+        PartSaleStatus.PEDIDO,
+        [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity)],
+    )
+    assert updated.status == PartSaleStatus.PEDIDO
+
+
+@pytest.mark.asyncio
+async def test_dispatch_missing_lines_is_rejected(inventory):
+    service, _session, data, _lots, _other = inventory
+    sale = await service.create_sale(PartSaleCreate(**data))
+
+    with pytest.raises(DispatchQuantityRequiredError):
+        await service.update_sale_status(sale.id, PartSaleStatus.PEDIDO, None)
+    with pytest.raises(DispatchQuantityRequiredError):
+        await service.update_sale_status(sale.id, PartSaleStatus.PEDIDO, [])
+
+
+@pytest.mark.asyncio
+async def test_pedido_to_completado_still_works(inventory):
+    service, _session, data, _lots, _other = inventory
+    sale = await service.create_sale(PartSaleCreate(**data))
+    line = sale.lines[0]
+    await service.update_sale_status(
+        sale.id,
+        PartSaleStatus.PEDIDO,
+        [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity)],
+    )
+
+    completed = await service.update_sale_status(sale.id, PartSaleStatus.COMPLETADO)
+
+    assert completed.status == PartSaleStatus.COMPLETADO

@@ -107,7 +107,13 @@ class PartSaleLineRead(BaseModel):
     unit_cost: float | None
     warehouse_id: uuid.UUID | None
     line_total: float
+    dispatched_quantity: int | None
     allocations: list[PartSaleAllocationRead]
+
+
+class PartSaleLineDispatch(BaseModel):
+    line_id: uuid.UUID
+    dispatched_quantity: int = Field(ge=0)
 
 
 class PartSaleCreate(PartSaleQuoteInput):
@@ -119,6 +125,7 @@ class PartSaleCreate(PartSaleQuoteInput):
 
 class PartSaleUpdate(BaseModel):
     status: PartSaleStatus | None = None
+    dispatched_lines: list[PartSaleLineDispatch] | None = None
 
 
 class PartSaleRead(BaseModel):

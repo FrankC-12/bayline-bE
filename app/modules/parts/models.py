@@ -109,6 +109,10 @@ class PartSaleLine(Base):
         UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=True
     )
     line_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    # Set by the almacenista when marking the sale as "pedido" — null until
+    # then. Confirms what was actually pulled off the shelf against what was
+    # sold; a mismatch blocks the transition (see PartsService.update_sale_status).
+    dispatched_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     allocations: Mapped[list["PartSaleLotAllocation"]] = relationship(
         cascade="all, delete-orphan", lazy="selectin"
     )

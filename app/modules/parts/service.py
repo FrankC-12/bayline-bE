@@ -8,6 +8,8 @@ from sqlalchemy.orm import selectinload
 from app.core.exceptions import BadRequestError
 from app.modules.parts.enums import PartSaleStatus, ReturnCondition
 from app.modules.parts.exceptions import (
+    DispatchQuantityMismatchError,
+    DispatchQuantityRequiredError,
     InvalidReturnDestinationError,
     InvalidSaleStatusTransitionError,
     MissingReturnPhotoError,
@@ -23,6 +25,7 @@ from app.modules.parts.schemas import (
     PartRead,
     PartReturnCreate,
     PartSaleCreate,
+    PartSaleLineDispatch,
     PartUpdate,
 )
 from app.modules.warehouse.enums import MovementType
@@ -341,7 +344,32 @@ class PartsService:
             await self.db.rollback()
             raise
 
-    async def update_sale_status(self, sale_id: uuid.UUID, new_status: PartSaleStatus) -> PartSale:
+    def _apply_dispatch(
+        self, sale: PartSale, dispatched_lines: list[PartSaleLineDispatch] | None
+    ) -> None:
+        """Records what the almacenista actually pulled for each line and
+        blocks the pendiente -> pedido transition if it doesn't match what
+        was sold — stock was already deducted FIFO at sale creation, so a
+        mismatch here means a real, unresolved inventory discrepancy."""
+        lines_by_id = {line.id: line for line in sale.lines}
+        if dispatched_lines is None or {d.line_id for d in dispatched_lines} != set(lines_by_id):
+            raise DispatchQuantityRequiredError()
+
+        for dispatch in dispatched_lines:
+            lines_by_id[dispatch.line_id].dispatched_quantity = dispatch.dispatched_quantity
+
+        mismatched = [
+            str(line.part_id) for line in sale.lines if line.dispatched_quantity != line.quantity
+        ]
+        if mismatched:
+            raise DispatchQuantityMismatchError(mismatched)
+
+    async def update_sale_status(
+        self,
+        sale_id: uuid.UUID,
+        new_status: PartSaleStatus,
+        dispatched_lines: list[PartSaleLineDispatch] | None = None,
+    ) -> PartSale:
         # Serialize status transitions so cancellation restores allocations only once.
         await self.db.execute(
             select(PartSale)
@@ -353,6 +381,10 @@ class PartsService:
         if new_status != sale.status:
             if new_status not in SALE_TRANSITIONS.get(sale.status, set()):
                 raise InvalidSaleStatusTransitionError(sale.status.value, new_status.value)
+
+            if new_status == PartSaleStatus.PEDIDO:
+                self._apply_dispatch(sale, dispatched_lines)
+
             sale.status = new_status
 
             if new_status == PartSaleStatus.CANCELADO:

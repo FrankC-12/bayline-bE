@@ -41,3 +41,20 @@ class MissingReturnPhotoError(BadRequestError):
             "A part return requires at least one evidence photo.",
             error_code="missing_return_photo",
         )
+
+
+class DispatchQuantityRequiredError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Confirm the dispatched quantity for every line before marking the sale as 'pedido'.",
+            error_code="dispatch_quantity_required",
+        )
+
+
+class DispatchQuantityMismatchError(BadRequestError):
+    def __init__(self, mismatched_part_ids: list[str]) -> None:
+        super().__init__(
+            "Dispatched quantity doesn't match what was sold for part(s): "
+            f"{', '.join(mismatched_part_ids)}.",
+            error_code="dispatch_quantity_mismatch",
+        )
