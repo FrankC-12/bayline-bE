@@ -11,6 +11,9 @@ class ServiceOrderStatus(str, enum.Enum):
 
 class ServiceOrderType(str, enum.Enum):
     REGULAR = "regular"
+    # No Garantías/MPT module or screen exists yet — the frontend's "Nueva
+    # ODS" form deliberately hides this option so it can't be picked with
+    # no workflow behind it. Kept in the API/enum for when that module ships.
     MPT = "mpt"
 
 

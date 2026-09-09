@@ -18,10 +18,6 @@ class TokenResponse(BaseModel):
     refresh_expires_in: int
 
 
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
 class CurrentUser(BaseModel):
     """Claims decoded from the caller's JWT, representing who is making the request."""
 

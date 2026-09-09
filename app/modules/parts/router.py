@@ -1,11 +1,16 @@
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.storage import save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.parts.enums import ReturnCondition, ReturnReason
+from app.modules.parts.exceptions import MissingReturnPhotoError
 from app.modules.parts.schemas import (
     PartBulkCreate,
     PartBulkResult,
@@ -14,6 +19,8 @@ from app.modules.parts.schemas import (
     PartReturnCreate,
     PartReturnRead,
     PartSaleCreate,
+    PartSaleQuoteInput,
+    PartSaleQuoteRead,
     PartSaleRead,
     PartSaleUpdate,
     PartUpdate,
@@ -97,6 +104,16 @@ async def list_part_sales(
     return await service.list_sales(filial_id, search)
 
 
+@router.post("/part-sales/quote", response_model=PartSaleQuoteRead)
+async def quote_part_sale(
+    payload: PartSaleQuoteInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+):
+    await _ensure_access(current_user, payload.filial_id, service.db)
+    return await service.quote_sale(payload)
+
+
 @router.get("/part-sales/{sale_id}", response_model=PartSaleRead)
 async def get_part_sale(
     sale_id: uuid.UUID,
@@ -144,9 +161,43 @@ async def list_part_returns(
 
 @router.post("/part-returns", response_model=PartReturnRead, status_code=status.HTTP_201_CREATED)
 async def create_part_return(
-    payload: PartReturnCreate,
+    filial_id: uuid.UUID = Form(...),
+    part_id: uuid.UUID = Form(...),
+    condition: ReturnCondition = Form(...),
+    origin_warehouse: str = Form(...),
+    destination_warehouse: str = Form(...),
+    quantity: int = Form(...),
+    reason: ReturnReason = Form(...),
+    reason_notes: str | None = Form(None),
+    photos: list[UploadFile] = File(...),
     current_user: CurrentUser = Depends(get_current_user),
     service: PartsService = Depends(get_service),
 ) -> PartReturnRead:
-    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    if not photos:
+        raise MissingReturnPhotoError()
+
+    settings = get_settings()
+    photo_urls = [
+        await save_upload_image(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="part-returns",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        for photo in photos
+    ]
+
+    payload = PartReturnCreate(
+        filial_id=filial_id,
+        part_id=part_id,
+        condition=condition,
+        origin_warehouse=origin_warehouse,
+        destination_warehouse=destination_warehouse,
+        quantity=quantity,
+        reason=reason,
+        reason_notes=reason_notes,
+        photo_urls=photo_urls,
+    )
     return await service.create_return(payload, current_user.user_id)

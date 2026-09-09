@@ -1,8 +1,9 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.modules.parts.pricing import DEFAULT_DISCOUNT, DiscountLabel
 from app.modules.service_orders.enums import (
     ServiceOrderStatus,
     ServiceOrderType,
@@ -31,11 +32,20 @@ class BayRead(BaseModel):
 
 
 class ServiceOrderCreate(BaseModel):
+    discount_label: DiscountLabel = DEFAULT_DISCOUNT
     filial_id: uuid.UUID
     vehicle_id: uuid.UUID
     order_type: ServiceOrderType = ServiceOrderType.REGULAR
+    # Reception data — required at intake. intake_mileage/customer_reason can
+    # be inherited from an unlinked PreliminaryInspection for this vehicle;
+    # advisor_user_id/promised_at have no inspection equivalent and are
+    # always entered by hand.
+    intake_mileage: int = Field(ge=0)
+    customer_reason: str = Field(min_length=1, max_length=2000)
+    advisor_user_id: uuid.UUID
+    promised_at: date
     notes: str | None = None
-    # Used by "Agendar Orden de Servicio" in the Calendario view — all optional
+    # Used by "Agendar Orden de Servicio" in the Calendario view — optional
     # so a normal walk-in ODS (created from the kanban) can omit them.
     scheduled_at: datetime | None = None
     technician_user_id: uuid.UUID | None = None
@@ -43,6 +53,7 @@ class ServiceOrderCreate(BaseModel):
 
 
 class ServiceOrderUpdate(BaseModel):
+    discount_label: DiscountLabel | None = None
     status: ServiceOrderStatus | None = None
     order_type: ServiceOrderType | None = None
     technician_user_id: uuid.UUID | None = None
@@ -58,6 +69,7 @@ class ServiceOrderUpdate(BaseModel):
 
 
 class ServiceOrderRead(BaseModel):
+    discount_label: DiscountLabel
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -71,10 +83,14 @@ class ServiceOrderRead(BaseModel):
     bay_id: uuid.UUID | None
     notes: str | None
     scheduled_at: datetime | None
+    intake_mileage: int | None
+    customer_reason: str | None
+    promised_at: date | None
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None
     total_amount: float | None
+    invoiced_at: datetime | None
 
 
 class TaskCreate(BaseModel):
@@ -104,8 +120,8 @@ class TransferLineRead(BaseModel):
     id: uuid.UUID
     part_id: uuid.UUID
     quantity: int
-    unit_price: float
-    subtotal: float
+    unit_price: float | None
+    subtotal: float | None
 
 
 class TransferRead(BaseModel):
@@ -113,19 +129,24 @@ class TransferRead(BaseModel):
     code: str
     status: TransferStatus
     lines: list[TransferLineRead]
-    subtotal: float
+    subtotal: float | None
     fulfilled_by_user_id: uuid.UUID | None = None
     fulfilled_at: datetime | None = None
     created_at: datetime
 
 
 class OrderSummary(BaseModel):
+    igtf_percentage: float = 0
+    igtf_amount: float = 0
+    pricing_frozen: bool = False
+    pricing_snapshot_available: bool = True
+    discount_label: DiscountLabel
     tasks: list[TaskRead]
     transfers: list[TransferRead]
-    parts_subtotal: float
-    labor_subtotal: float
-    iva_percentage: float
-    iva_amount: float
+    parts_subtotal: float | None
+    labor_subtotal: float | None
+    iva_percentage: float | None
+    iva_amount: float | None
     total: float
 
 

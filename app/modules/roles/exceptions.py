@@ -30,3 +30,15 @@ class PermissionsNotAllowedForScopeError(BadRequestError):
             f"Roles with scope '{scope}' cannot declare module permissions.",
             error_code="permissions_not_allowed_for_scope",
         )
+
+
+class InvalidAccessLevelForRoleError(BadRequestError):
+    """Raised when a role permission is declared as 'sin_acceso' — that value
+    is reserved for per-user overrides; a role represents "no access" by
+    simply omitting the module."""
+
+    def __init__(self, module_id: str) -> None:
+        super().__init__(
+            f"Roles cannot declare 'sin_acceso' for module '{module_id}' — omit the module instead.",
+            error_code="invalid_access_level_for_role",
+        )

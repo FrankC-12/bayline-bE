@@ -1,5 +1,4 @@
 import uuid
-from calendar import month_abbr
 from datetime import date
 
 from sqlalchemy import func, select
@@ -53,7 +52,14 @@ from app.modules.warehouse.schemas import LotLineInput
 from app.modules.warehouse.service import AlmacenService
 from app.modules.concesionario.models import DealershipVehicle, VehicleSale
 from app.modules.parts.models import PartSale, PartSaleLine
-from app.modules.post_ventas.models import LaborSettings
+from app.modules.post_ventas.service import PostVentasService
+
+# Spanish month abbreviations for the finance trend chart — not read from
+# calendar.month_abbr, which is locale-dependent and defaults to English.
+MONTH_ABBR_ES: dict[int, str] = {
+    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+}
 
 PURCHASE_TRANSITIONS: dict[PurchaseRequestStatus, set[PurchaseRequestStatus]] = {
     PurchaseRequestStatus.ENVIADA: {PurchaseRequestStatus.COTIZADA, PurchaseRequestStatus.CANCELADA},
@@ -282,9 +288,8 @@ class AdministracionService:
     # Accounts
 
     async def _get_bcv_rate(self, filial_id: uuid.UUID) -> float:
-        result = await self.db.execute(select(LaborSettings).where(LaborSettings.filial_id == filial_id))
-        settings = result.scalar_one_or_none()
-        return float(settings.bcv_rate) if settings and settings.bcv_rate else 0.0
+        settings = await PostVentasService(self.db).get_labor_settings(filial_id)
+        return float(settings.bcv_rate) if settings.bcv_rate else 0.0
 
     async def _account_balance(self, account: Account, bcv_rate: float) -> tuple[float, float]:
         income_result = await self.db.execute(
@@ -433,7 +438,8 @@ class AdministracionService:
         return amount / bcv_rate if bcv_rate else 0.0
 
     async def get_dashboard(self, filial_id: uuid.UUID) -> FinanceDashboard:
-        bcv_rate = await self._get_bcv_rate(filial_id)
+        settings = await PostVentasService(self.db).get_labor_settings(filial_id)
+        bcv_rate = float(settings.bcv_rate) if settings.bcv_rate else 0.0
         today = date.today()
 
         income_result = await self.db.execute(select(IncomeEntry).where(IncomeEntry.filial_id == filial_id))
@@ -477,13 +483,14 @@ class AdministracionService:
                 for e in expenses
                 if month_key(e.entry_date) == (year, month)
             )
-            trend.append(MonthTrend(label=month_abbr[month].capitalize(), income=m_income, expense=m_expense))
+            trend.append(MonthTrend(label=MONTH_ABBR_ES[month], income=m_income, expense=m_expense))
 
         return FinanceDashboard(
             income_month=income_month,
             expense_month=expense_month,
             net_flow=income_month - expense_month,
             bcv_rate=bcv_rate,
+            bcv_rate_is_stale=settings.bcv_rate_is_stale,
             trend=trend,
         )
 

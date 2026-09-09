@@ -265,6 +265,8 @@ class AlmacenService:
         """Consumes `quantity` units from the oldest lots first. Returns the
         weighted average unit cost of what was consumed. Raises if there isn't
         enough stock at that warehouse for that part."""
+        # Preserve prior consumption in this transaction before refreshing locked lots.
+        await self.db.flush()
         result = await self.db.execute(
             select(PartLot)
             .where(
@@ -272,7 +274,9 @@ class AlmacenService:
                 PartLot.part_id == part_id,
                 PartLot.quantity_remaining > 0,
             )
-            .order_by(PartLot.received_at)
+            .order_by(PartLot.received_at, PartLot.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         lots = list(result.scalars().all())
         available = sum(lot.quantity_remaining for lot in lots)
@@ -423,12 +427,17 @@ class AlmacenService:
 
         totals: dict[tuple[uuid.UUID, uuid.UUID], int] = {}
         latest_location: dict[tuple[uuid.UUID, uuid.UUID], str | None] = {}
+        # `lots` is already ordered oldest-first (received_at asc), so the
+        # first lot seen per key is the active FIFO lot the dashboard's
+        # subtitle promises — not a blended average across all remaining lots.
+        fifo_front_cost: dict[tuple[uuid.UUID, uuid.UUID], float] = {}
         part_ids: set[uuid.UUID] = set()
         for lot in lots:
             key = (lot.part_id, lot.warehouse_id)
             totals[key] = totals.get(key, 0) + lot.quantity_remaining
             if lot.location:
                 latest_location[key] = lot.location
+            fifo_front_cost.setdefault(key, float(lot.unit_cost))
             part_ids.add(lot.part_id)
 
         parts_by_id: dict[uuid.UUID, Part] = {}
@@ -455,7 +464,7 @@ class AlmacenService:
                     warehouse_id=warehouse.id,
                     warehouse_name=warehouse.name,
                     quantity=quantity,
-                    average_cost=await self.get_average_cost(part.id, warehouse.id),
+                    fifo_unit_cost=fifo_front_cost.get((part_id, warehouse_id_)),
                     location=latest_location.get((part_id, warehouse_id_)),
                     min_stock=part.min_stock,
                 )

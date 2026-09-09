@@ -1,17 +1,22 @@
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.modules.parts.enums import PartSaleStatus
+from app.core.exceptions import BadRequestError
+from app.modules.parts.enums import PartSaleStatus, ReturnCondition
 from app.modules.parts.exceptions import (
+    InvalidReturnDestinationError,
     InvalidSaleStatusTransitionError,
+    MissingReturnPhotoError,
     PartCodeAlreadyExistsError,
     PartNotFoundError,
     PartSaleNotFoundError,
 )
-from app.modules.parts.models import Part, PartReturn, PartSale, PartSaleLine
+from app.modules.parts.models import Part, PartReturn, PartSale, PartSaleLine, PartSaleLotAllocation
+from app.modules.parts.pricing import PARTS_MULTIPLIERS
 from app.modules.parts.schemas import (
     PartBulkItem,
     PartCreate,
@@ -20,6 +25,9 @@ from app.modules.parts.schemas import (
     PartSaleCreate,
     PartUpdate,
 )
+from app.modules.warehouse.enums import MovementType
+from app.modules.warehouse.fifo import allocate_fifo, price_allocations
+from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
 
 SALE_TRANSITIONS: dict[PartSaleStatus, set[PartSaleStatus]] = {
     PartSaleStatus.PENDIENTE: {PartSaleStatus.PEDIDO, PartSaleStatus.CANCELADO},
@@ -46,6 +54,12 @@ def _is_write_off_destination(destination: str) -> bool:
     return "merma" in normalized or "baja" in normalized
 
 
+# A damaged part can't go back into stock that gets sold to the next
+# customer — only NUEVO can return to sellable inventory. USADO/DEFECTUOSO
+# must be sent to a write-off destination.
+CONDITIONS_REQUIRING_WRITE_OFF = {ReturnCondition.USADO, ReturnCondition.DEFECTUOSO}
+
+
 class PartsService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -61,15 +75,15 @@ class PartsService:
             .correlate(Part)
             .scalar_subquery()
         )
-        latest_cost = (
+        fifo_cost = (
             select(PartLot.unit_cost)
-            .where(PartLot.part_id == Part.id)
-            .order_by(PartLot.received_at.desc(), PartLot.id.desc())
+            .where(PartLot.part_id == Part.id, PartLot.quantity_remaining > 0)
+            .order_by(PartLot.received_at, PartLot.id)
             .limit(1)
             .correlate(Part)
             .scalar_subquery()
         )
-        query = select(Part, stock_total, latest_cost).where(Part.filial_id == filial_id)
+        query = select(Part, stock_total, fifo_cost).where(Part.filial_id == filial_id)
         if search:
             term = f"%{search.strip()}%"
             query = query.where(Part.code.ilike(term) | Part.name.ilike(term))
@@ -148,7 +162,9 @@ class PartsService:
         return part
 
     async def _ensure_code_available(self, filial_id: uuid.UUID, code: str) -> None:
-        result = await self.db.execute(select(Part).where(Part.filial_id == filial_id, Part.code == code))
+        result = await self.db.execute(
+            select(Part).where(Part.filial_id == filial_id, Part.code == code)
+        )
         if result.scalar_one_or_none() is not None:
             raise PartCodeAlreadyExistsError(code)
 
@@ -158,7 +174,9 @@ class PartsService:
         """Creates every item whose code isn't already taken. Duplicates (against the
         database or repeated within the same batch) are skipped, not rejected —
         bulk imports commonly re-upload the same file more than once."""
-        existing_result = await self.db.execute(select(Part.code).where(Part.filial_id == filial_id))
+        existing_result = await self.db.execute(
+            select(Part.code).where(Part.filial_id == filial_id)
+        )
         existing_codes = {row[0] for row in existing_result.all()}
 
         created: list[Part] = []
@@ -215,43 +233,156 @@ class PartsService:
             raise PartSaleNotFoundError(str(sale_id))
         return sale
 
-    async def create_sale(self, payload: PartSaleCreate) -> PartSale:
-        next_seq = await self._next_sale_sequence(payload.filial_id)
-        sale = PartSale(
-            filial_id=payload.filial_id,
-            client_name=payload.client_name,
-            client_document=payload.client_document,
-            request_reason="Venta de Repuestos",
-            discount_label=payload.discount_label,
-            sequence_number=next_seq,
-        )
-        self.db.add(sale)
-        await self.db.flush()
-
+    async def _sale_plan(self, payload, *, consume=False):
+        warehouse = await self.db.get(Warehouse, payload.warehouse_id)
+        if warehouse is None or warehouse.filial_id != payload.filial_id or not warehouse.is_active:
+            raise BadRequestError("Selecciona un almacén activo de la filial.")
+        if payload.discount_label not in PARTS_MULTIPLIERS:
+            raise BadRequestError("Margen de venta inválido.")
+        quantities = {}
         for line in payload.lines:
-            part = await self.get_part(line.part_id)
-            cost_snapshot = await self.get_latest_cost(part.id)
-            self.db.add(
-                PartSaleLine(
-                    part_sale_id=sale.id,
-                    part_id=part.id,
-                    quantity=line.quantity,
-                    unit_price=round(cost_snapshot * 1.30, 2) if cost_snapshot is not None else 0.0,
-                    unit_cost=cost_snapshot,
+            quantities[line.part_id] = quantities.get(line.part_id, 0) + line.quantity
+        plans = []
+        # Stable lock ordering prevents deadlocks for sales with multiple parts.
+        for part_id, quantity in sorted(quantities.items()):
+            part = await self.get_part(part_id)
+            if part.filial_id != payload.filial_id:
+                raise BadRequestError("El repuesto no pertenece a la filial.")
+            query = (
+                select(PartLot)
+                .where(
+                    PartLot.warehouse_id == payload.warehouse_id,
+                    PartLot.filial_id == payload.filial_id,
+                    PartLot.part_id == part_id,
+                    PartLot.quantity_remaining > 0,
                 )
+                .order_by(PartLot.received_at, PartLot.id)
             )
-            part.stock_quantity = max(0, part.stock_quantity - line.quantity)
-            _sync_availability(part)
+            if consume:
+                query = query.with_for_update().execution_options(populate_existing=True)
+            lots = list((await self.db.execute(query)).scalars().all())
+            allocations = allocate_fifo(lots, quantity)
+            cost, price, total = price_allocations(
+                allocations, quantity, PARTS_MULTIPLIERS[payload.discount_label]
+            )
+            plans.append((part, quantity, allocations, cost, price, total))
+        return plans
 
-        await self.db.commit()
-        return await self.get_sale(sale.id)
+    async def quote_sale(self, payload):
+        plans = await self._sale_plan(payload)
+        return {
+            "lines": [
+                dict(
+                    part_id=part.id,
+                    warehouse_id=payload.warehouse_id,
+                    quantity=quantity,
+                    unit_cost=cost,
+                    unit_price=price,
+                    line_total=total,
+                    allocations=[
+                        dict(lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost)
+                        for lot, take in allocations
+                    ],
+                )
+                for part, quantity, allocations, cost, price, total in plans
+            ],
+            "total": sum((plan[5] for plan in plans), Decimal(0)),
+        }
+
+    async def create_sale(self, payload: PartSaleCreate) -> PartSale:
+        try:
+            plans = await self._sale_plan(payload, consume=True)
+            sale = PartSale(
+                filial_id=payload.filial_id,
+                client_name=payload.client_name,
+                client_document=payload.client_document,
+                request_reason="Venta de Repuestos",
+                discount_label=payload.discount_label,
+                sequence_number=await self._next_sale_sequence(payload.filial_id),
+            )
+            self.db.add(sale)
+            await self.db.flush()
+            for part, quantity, allocations, cost, price, total in plans:
+                self.db.add(
+                    PartSaleLine(
+                        part_sale_id=sale.id,
+                        part_id=part.id,
+                        quantity=quantity,
+                        warehouse_id=payload.warehouse_id,
+                        unit_price=price,
+                        unit_cost=cost,
+                        line_total=total,
+                        allocations=[
+                            PartSaleLotAllocation(
+                                lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost
+                            )
+                            for lot, take in allocations
+                        ],
+                    )
+                )
+                for lot, take in allocations:
+                    lot.quantity_remaining -= take
+                    self.db.add(
+                        StockMovement(
+                            filial_id=payload.filial_id,
+                            warehouse_id=payload.warehouse_id,
+                            part_id=part.id,
+                            movement_type=MovementType.SALIDA,
+                            quantity=take,
+                            unit_cost=lot.unit_cost,
+                            reference=sale.code,
+                        )
+                    )
+                part.stock_quantity = max(0, part.stock_quantity - quantity)
+                _sync_availability(part)
+            await self.db.commit()
+            return await self.get_sale(sale.id)
+        except Exception:
+            await self.db.rollback()
+            raise
 
     async def update_sale_status(self, sale_id: uuid.UUID, new_status: PartSaleStatus) -> PartSale:
+        # Serialize status transitions so cancellation restores allocations only once.
+        await self.db.execute(
+            select(PartSale)
+            .where(PartSale.id == sale_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         sale = await self.get_sale(sale_id)
         if new_status != sale.status:
             if new_status not in SALE_TRANSITIONS.get(sale.status, set()):
                 raise InvalidSaleStatusTransitionError(sale.status.value, new_status.value)
             sale.status = new_status
+
+            if new_status == PartSaleStatus.CANCELADO:
+                for line in sorted(sale.lines, key=lambda line: line.part_id):
+                    for allocation in line.allocations:
+                        lot = (
+                            await self.db.execute(
+                                select(PartLot)
+                                .where(PartLot.id == allocation.lot_id)
+                                .with_for_update()
+                                .execution_options(populate_existing=True)
+                            )
+                        ).scalar_one()
+                        lot.quantity_remaining += allocation.quantity
+                        self.db.add(
+                            StockMovement(
+                                filial_id=sale.filial_id,
+                                warehouse_id=line.warehouse_id,
+                                part_id=line.part_id,
+                                movement_type=MovementType.ENTRADA,
+                                quantity=allocation.quantity,
+                                unit_cost=allocation.unit_cost,
+                                reference=sale.code,
+                                note="Cancelación de venta",
+                            )
+                        )
+                    if line.allocations:
+                        part = await self.get_part(line.part_id)
+                        part.stock_quantity += line.quantity
+                        _sync_availability(part)
 
             if new_status == PartSaleStatus.COMPLETADO:
                 from app.modules.administracion.service import AdministracionService
@@ -284,8 +415,17 @@ class PartsService:
         )
         return list(result.scalars().all())
 
-    async def create_return(self, payload: PartReturnCreate, responsible_user_id: uuid.UUID) -> PartReturn:
+    async def create_return(
+        self, payload: PartReturnCreate, responsible_user_id: uuid.UUID
+    ) -> PartReturn:
         part = await self.get_part(payload.part_id)
+        is_write_off = _is_write_off_destination(payload.destination_warehouse)
+
+        if payload.condition in CONDITIONS_REQUIRING_WRITE_OFF and not is_write_off:
+            raise InvalidReturnDestinationError(payload.condition.value)
+        if not payload.photo_urls:
+            raise MissingReturnPhotoError()
+
         ret = PartReturn(
             filial_id=payload.filial_id,
             part_id=payload.part_id,
@@ -296,10 +436,11 @@ class PartsService:
             reason=payload.reason,
             reason_notes=payload.reason_notes,
             responsible_user_id=responsible_user_id,
+            photo_urls=payload.photo_urls,
         )
         self.db.add(ret)
 
-        if not _is_write_off_destination(payload.destination_warehouse):
+        if not is_write_off:
             part.stock_quantity += payload.quantity
             _sync_availability(part)
 

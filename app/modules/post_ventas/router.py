@@ -7,8 +7,6 @@ from app.core.database import get_db
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.post_ventas.schemas import (
-    LaborSettingsRead,
-    LaborSettingsUpdate,
     TemparioCreate,
     TemparioRead,
     TemparioUpdate,
@@ -33,27 +31,6 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
-
-
-@router.get("/labor-settings", response_model=LaborSettingsRead)
-async def get_labor_settings(
-    filial_id: uuid.UUID = Query(...),
-    current_user: CurrentUser = Depends(get_current_user),
-    service: PostVentasService = Depends(get_service),
-) -> LaborSettingsRead:
-    await _ensure_access(current_user, filial_id, service.db)
-    return await service.get_labor_settings(filial_id)
-
-
-@router.patch("/labor-settings", response_model=LaborSettingsRead)
-async def update_labor_settings(
-    payload: LaborSettingsUpdate,
-    filial_id: uuid.UUID = Query(...),
-    current_user: CurrentUser = Depends(get_current_user),
-    service: PostVentasService = Depends(get_service),
-) -> LaborSettingsRead:
-    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
-    return await service.update_labor_settings(filial_id, payload)
 
 
 @router.get("/temparios", response_model=list[TemparioRead])

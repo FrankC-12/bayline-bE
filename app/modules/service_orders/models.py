@@ -1,7 +1,19 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -22,7 +34,10 @@ class Bay(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(60), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -36,11 +51,17 @@ class ServiceOrder(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     vehicle_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("vehicles.id", ondelete="RESTRICT"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("vehicles.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     status: Mapped[ServiceOrderStatus] = mapped_column(
         Enum(ServiceOrderStatus, name="service_order_status"),
@@ -63,11 +84,22 @@ class ServiceOrder(Base):
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    intake_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    customer_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    promised_at: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    discount_label: Mapped[str] = mapped_column(
+        String(60),
+        nullable=False,
+        default="Costo + 30% (Sin Descuento)",
+        server_default="Costo + 30% (Sin Descuento)",
+    )
+    invoiced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pricing_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     total_amount: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
 
     @property
@@ -85,7 +117,10 @@ class ServiceOrderTask(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     service_order_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_orders.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("service_orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     tempario_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("temparios.id", ondelete="RESTRICT"), nullable=False
@@ -108,11 +143,16 @@ class ServiceOrderTransfer(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     service_order_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_orders.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("service_orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     status: Mapped[TransferStatus] = mapped_column(
-        Enum(TransferStatus, name="transfer_status"), nullable=False, default=TransferStatus.PENDIENTE
+        Enum(TransferStatus, name="transfer_status"),
+        nullable=False,
+        default=TransferStatus.PENDIENTE,
     )
     fulfilled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -143,7 +183,9 @@ class ServiceOrderTransferLine(Base):
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    unit_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, default=0)
+    unit_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
+    cost_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
+    line_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
 
     transfer: Mapped["ServiceOrderTransfer"] = relationship(back_populates="lines")
 
@@ -158,7 +200,10 @@ class Upsell(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     service_order_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_orders.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("service_orders.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     title: Mapped[str] = mapped_column(String(150), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -171,3 +216,24 @@ class Upsell(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ServiceOrderInvoice(Base):
+    __tablename__ = "service_order_invoices"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    service_order_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("service_orders.id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    code: Mapped[str] = mapped_column(String(40), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    issued_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    total_usd: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    document: Mapped[dict] = mapped_column(JSON, nullable=False)

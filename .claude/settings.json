@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"from app.main import app; print\\('IMPORT OK'\\)\")",
+      "Bash(xargs -I{} basename {})",
+      "Bash(python3 -m pytest tests/test_service_order_creation.py -v)"
+    ],
+    "additionalDirectories": [
+      "/Users/frankcaicedo/development/bayline-frontend/src/hooks",
+      "/Users/frankcaicedo/development/bayline-frontend/src/components/service-orders",
+      "/Users/frankcaicedo/development/bayline-frontend/src/app",
+      "/Users/frankcaicedo/development/bayline-frontend/src/components/warehouse",
+      "/Users/frankcaicedo/development/bayline-frontend/src/components/calendar"
+    ]
+  }
+}

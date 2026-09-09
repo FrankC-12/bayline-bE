@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -11,7 +11,7 @@ class LaborSettingsUpdate(BaseModel):
     commission_percentage: float = Field(ge=0, le=100)
     igtf_percentage: float = Field(ge=0, le=100)
     iva_percentage: float = Field(ge=0, le=100)
-    bcv_rate: float = Field(ge=0)
+    bcv_rate: float | None = Field(default=None, gt=0)
 
 
 class LaborSettingsRead(BaseModel):
@@ -23,6 +23,8 @@ class LaborSettingsRead(BaseModel):
     igtf_percentage: float
     iva_percentage: float
     bcv_rate: float
+    bcv_rate_date: date | None
+    bcv_rate_is_stale: bool
     updated_at: datetime
 
 

@@ -1,4 +1,4 @@
-from app.core.exceptions import BadRequestError, NotFoundError
+from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 
 
 class ServiceOrderNotFoundError(NotFoundError):
@@ -28,9 +28,19 @@ class TaskNotFoundError(NotFoundError):
 
 class TransferNotFoundError(NotFoundError):
     def __init__(self, transfer_id: str) -> None:
-        super().__init__(f"Transfer '{transfer_id}' was not found.", error_code="transfer_not_found")
+        super().__init__(
+            f"Transfer '{transfer_id}' was not found.", error_code="transfer_not_found"
+        )
 
 
 class UpsellNotFoundError(NotFoundError):
     def __init__(self, upsell_id: str) -> None:
         super().__init__(f"Upsell '{upsell_id}' was not found.", error_code="upsell_not_found")
+
+
+class ServiceOrderReadOnlyError(ConflictError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Las órdenes facturadas, cerradas o canceladas son de solo lectura.",
+            error_code="service_order_read_only",
+        )

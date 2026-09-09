@@ -1,0 +1,74 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN to your public DNS hostname}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      app:
+        ipv4_address: 172.30.40.10
+    depends_on:
+      - backend
+      - frontend
+
+  backend:
+    build: ..
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      DEBUG: "false"
+      ALLOWED_ORIGINS: '["https://${DOMAIN}"]'
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY}
+      PLATFORM_ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL:?Set PLATFORM_ADMIN_EMAIL}
+      PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD:?Set PLATFORM_ADMIN_PASSWORD}
+      FORWARDED_ALLOW_IPS: "172.30.40.10"
+      ACCESS_TOKEN_EXPIRE_MINUTES: "15"
+      REFRESH_TOKEN_EXPIRE_DAYS: "30"
+    volumes:
+      - backend_uploads:/app/uploads
+    networks: [app]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build: ../../bayline-frontend
+    restart: unless-stopped
+    networks: [app]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bayline}
+      POSTGRES_DB: ${POSTGRES_DB:-bayline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [app]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+networks:
+  app:
+    ipam:
+      config:
+        - subnet: 172.30.40.0/24
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+  backend_uploads:

@@ -71,6 +71,10 @@ class VehicleRead(BaseModel):
     upholstery: str | None
     fuel_type: FuelType | None
     transmission: TransmissionType | None
+    current_mileage: int | None = None
+    current_mileage_visit_date: date | None = None
+    current_mileage_service_order_id: uuid.UUID | None = None
+    current_mileage_service_order_code: str | None = None
 
 
 class ClientBase(BaseModel):

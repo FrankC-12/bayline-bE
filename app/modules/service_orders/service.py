@@ -1,14 +1,22 @@
 import uuid
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.exceptions import BadRequestError
 from app.modules.parts.models import Part
+from app.modules.parts.pricing import price_parts_cost
 from app.modules.parts.service import PartsService, _sync_availability
 from app.modules.post_ventas.models import LaborSettings, Tempario
-from app.modules.service_orders.enums import ServiceOrderStatus, TaskStatus, TransferStatus, UpsellStatus
+from app.modules.service_orders.enums import (
+    ServiceOrderStatus,
+    TaskStatus,
+    TransferStatus,
+    UpsellStatus,
+)
 from app.modules.service_orders.exceptions import (
     BayNotFoundError,
     InvalidStatusTransitionError,
@@ -17,6 +25,7 @@ from app.modules.service_orders.exceptions import (
     TransferNotFoundError,
     UpsellNotFoundError,
 )
+from app.modules.service_orders.guards import require_editable_order
 from app.modules.service_orders.models import (
     Bay,
     ServiceOrder,
@@ -35,7 +44,6 @@ from app.modules.service_orders.schemas import (
     TransferLineRead,
     TransferRead,
     UpsellCreate,
-    UpsellRead,
 )
 
 ALLOWED_TRANSITIONS: dict[ServiceOrderStatus, set[ServiceOrderStatus]] = {
@@ -85,10 +93,15 @@ class ServiceOrderService:
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
             order_type=payload.order_type,
+            discount_label=payload.discount_label,
             notes=payload.notes,
             scheduled_at=payload.scheduled_at,
             technician_user_id=payload.technician_user_id,
+            advisor_user_id=payload.advisor_user_id,
             bay_id=payload.bay_id,
+            intake_mileage=payload.intake_mileage,
+            customer_reason=payload.customer_reason,
+            promised_at=payload.promised_at,
             sequence_number=next_seq,
         )
         self.db.add(order)
@@ -97,29 +110,24 @@ class ServiceOrderService:
         return order
 
     async def update_order(self, order_id: uuid.UUID, payload: ServiceOrderUpdate) -> ServiceOrder:
-        order = await self.get_order(order_id)
+        if payload.status == ServiceOrderStatus.ORDEN_CERRADA:
+            if payload.model_fields_set != {"status"}:
+                raise BadRequestError("Cerrar la orden es una operación separada de la edición.")
+            return await self.close_order(order_id)
+        order = await require_editable_order(self.db, order_id)
+
+        if payload.discount_label is not None and payload.discount_label != order.discount_label:
+            order.discount_label = payload.discount_label
+            for transfer in await self.list_transfers(order_id):
+                for line in transfer.lines:
+                    line.unit_price, line.line_total = price_parts_cost(
+                        Decimal(str(line.cost_total)), line.quantity, order.discount_label
+                    )
 
         if payload.status and payload.status != order.status:
             if payload.status not in ALLOWED_TRANSITIONS.get(order.status, set()):
                 raise InvalidStatusTransitionError(order.status.value, payload.status.value)
             order.status = payload.status
-            if payload.status == ServiceOrderStatus.ORDEN_CERRADA:
-                order.closed_at = datetime.now(timezone.utc)
-                summary = await self.get_order_summary(order_id)
-                order.total_amount = summary.total
-
-                # Deferred import avoids a circular import (administracion also
-                # reads from service_orders for Rentabilidad).
-                from app.modules.administracion.service import AdministracionService
-
-                admin_service = AdministracionService(self.db)
-                await admin_service.record_automatic_income(
-                    order.filial_id,
-                    f"Facturación de orden de servicio · {order.code}",
-                    summary.total,
-                    order.code,
-                )
-
         if payload.order_type is not None:
             order.order_type = payload.order_type
 
@@ -149,14 +157,30 @@ class ServiceOrderService:
         await self.db.refresh(order)
         return order
 
+    async def close_order(self, order_id: uuid.UUID) -> ServiceOrder:
+        order = await require_editable_order(self.db, order_id, allow_invoiced=True)
+        if order.invoiced_at is None:
+            raise BadRequestError(
+                "Primero debes facturar y registrar el cobro.", error_code="invoice_required"
+            )
+        if order.status != ServiceOrderStatus.COMPLETADO:
+            raise BadRequestError("Solo se puede cerrar una orden completada y facturada.")
+        order.status = ServiceOrderStatus.ORDEN_CERRADA
+        order.closed_at = datetime.now(UTC)
+        await self.db.commit()
+        await self.db.refresh(order)
+        return order
+
     async def delete_order(self, order_id: uuid.UUID) -> None:
-        order = await self.get_order(order_id)
+        order = await require_editable_order(self.db, order_id)
         await self.db.delete(order)
         await self.db.commit()
 
     async def _next_sequence_number(self, filial_id: uuid.UUID) -> int:
         result = await self.db.execute(
-            select(func.max(ServiceOrder.sequence_number)).where(ServiceOrder.filial_id == filial_id)
+            select(func.max(ServiceOrder.sequence_number)).where(
+                ServiceOrder.filial_id == filial_id
+            )
         )
         current_max = result.scalar()
         return (current_max or 2000) + 1
@@ -202,7 +226,10 @@ class ServiceOrderService:
         )
         return list(result.scalars().all())
 
-    async def add_task(self, service_order_id: uuid.UUID, tempario_id: uuid.UUID) -> ServiceOrderTask:
+    async def add_task(
+        self, service_order_id: uuid.UUID, tempario_id: uuid.UUID
+    ) -> ServiceOrderTask:
+        await require_editable_order(self.db, service_order_id)
         tempario_result = await self.db.execute(
             select(Tempario).options(selectinload(Tempario.parts)).where(Tempario.id == tempario_id)
         )
@@ -226,8 +253,8 @@ class ServiceOrderService:
             for tp in linked_parts:
                 part = await self.db.get(Part, tp.part_id)
                 if part is not None:
-                    unit_price = await PartsService(self.db).get_reference_price(part.id)
-                    await self._add_line_to_transfer(transfer, part.id, tp.quantity, unit_price)
+                    unit_cost = await PartsService(self.db).get_latest_cost(part.id)
+                    await self._add_line_to_transfer(transfer, part.id, tp.quantity, unit_cost or 0)
 
         await self.db.commit()
         await self.db.refresh(task)
@@ -244,6 +271,7 @@ class ServiceOrderService:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
+        await require_editable_order(self.db, task.service_order_id)
         task.status = status
         await self.db.commit()
         await self.db.refresh(task)
@@ -253,6 +281,7 @@ class ServiceOrderService:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
+        await require_editable_order(self.db, task.service_order_id)
         await self.db.delete(task)
         await self.db.commit()
 
@@ -270,12 +299,13 @@ class ServiceOrderService:
     async def add_transfer_line(
         self, service_order_id: uuid.UUID, part_id: uuid.UUID, quantity: int
     ) -> ServiceOrderTransfer:
+        await require_editable_order(self.db, service_order_id)
         part = await self.db.get(Part, part_id)
         if part is None:
             raise TransferNotFoundError(str(part_id))
         transfer = await self._get_or_create_pending_transfer(service_order_id)
-        unit_price = await PartsService(self.db).get_reference_price(part.id)
-        await self._add_line_to_transfer(transfer, part.id, quantity, unit_price)
+        unit_cost = await PartsService(self.db).get_latest_cost(part.id)
+        await self._add_line_to_transfer(transfer, part.id, quantity, unit_cost or 0)
         await self.db.commit()
         await self.db.refresh(transfer)
         return transfer
@@ -299,6 +329,8 @@ class ServiceOrderService:
         if transfer is None:
             raise TransferNotFoundError(str(transfer_id))
 
+        await require_editable_order(self.db, transfer.service_order_id)
+        await self.db.refresh(transfer, attribute_names=["status"])
         if transfer.status == TransferStatus.PENDIENTE:
             for line in transfer.lines:
                 part = await self.db.get(Part, line.part_id)
@@ -307,7 +339,7 @@ class ServiceOrderService:
                     _sync_availability(part)
             transfer.status = TransferStatus.PEDIDO
             transfer.fulfilled_by_user_id = fulfilled_by_user_id
-            transfer.fulfilled_at = datetime.now(timezone.utc)
+            transfer.fulfilled_at = datetime.now(UTC)
 
         await self.db.commit()
         await self.db.refresh(transfer)
@@ -316,6 +348,7 @@ class ServiceOrderService:
     async def _get_or_create_pending_transfer(
         self, service_order_id: uuid.UUID
     ) -> ServiceOrderTransfer:
+        await require_editable_order(self.db, service_order_id)
         result = await self.db.execute(
             select(ServiceOrderTransfer)
             .where(
@@ -340,8 +373,9 @@ class ServiceOrderService:
         return transfer
 
     async def _add_line_to_transfer(
-        self, transfer: ServiceOrderTransfer, part_id: uuid.UUID, quantity: int, unit_price: float
+        self, transfer: ServiceOrderTransfer, part_id: uuid.UUID, quantity: int, unit_cost: float
     ) -> None:
+        await require_editable_order(self.db, transfer.service_order_id)
         # Query directly instead of touching transfer.lines — for a transfer that
         # was just created in this same call, that relationship isn't loaded yet
         # and accessing it triggers a lazy-load SQLAlchemy's async session can't
@@ -353,20 +387,71 @@ class ServiceOrderService:
             )
         )
         existing = result.scalar_one_or_none()
+        added_cost = Decimal(str(unit_cost)) * quantity
         if existing is not None:
             existing.quantity += quantity
+            existing.cost_total = Decimal(str(existing.cost_total)) + added_cost
         else:
-            self.db.add(
-                ServiceOrderTransferLine(
-                    transfer_id=transfer.id, part_id=part_id, quantity=quantity, unit_price=unit_price
-                )
+            existing = ServiceOrderTransferLine(
+                transfer_id=transfer.id, part_id=part_id, quantity=quantity, cost_total=added_cost
             )
+            self.db.add(existing)
+        order = await self.get_order(transfer.service_order_id)
+        existing.unit_price, existing.line_total = price_parts_cost(
+            Decimal(str(existing.cost_total)), existing.quantity, order.discount_label
+        )
+        # Subsequent additions of this part in the same task must see this line.
+        await self.db.flush()
 
     # Pricing summary
 
     async def get_order_summary(self, service_order_id: uuid.UUID) -> OrderSummary:
         order = await self.get_order(service_order_id)
+        if order.invoiced_at is not None or order.status == ServiceOrderStatus.ORDEN_CERRADA:
+            if order.pricing_snapshot is not None:
+                return OrderSummary.model_validate(order.pricing_snapshot)
+            # Older invoices stored only the final amount. Never reconstruct their
+            # breakdown using current labor/tax rates or potentially edited ODTs.
+            return OrderSummary(
+                discount_label=order.discount_label,
+                tasks=[
+                    TaskRead.model_validate(task, from_attributes=True)
+                    for task in await self.list_tasks(service_order_id)
+                ],
+                transfers=[
+                    TransferRead(
+                        id=tr.id,
+                        code=f"{order.code}-{tr.code}",
+                        status=tr.status,
+                        created_at=tr.created_at,
+                        subtotal=None,
+                        fulfilled_at=tr.fulfilled_at,
+                        fulfilled_by_user_id=tr.fulfilled_by_user_id,
+                        lines=[
+                            TransferLineRead(
+                                id=line.id,
+                                part_id=line.part_id,
+                                quantity=line.quantity,
+                                unit_price=None,
+                                subtotal=None,
+                            )
+                            for line in tr.lines
+                        ],
+                    )
+                    for tr in await self.list_transfers(service_order_id)
+                ],
+                parts_subtotal=None,
+                labor_subtotal=None,
+                iva_percentage=None,
+                iva_amount=None,
+                total=float(order.total_amount) if order.total_amount is not None else 0.0,
+                pricing_frozen=True,
+                pricing_snapshot_available=False,
+            )
+        return await self._build_order_summary(order)
 
+    async def _build_order_summary(self, order: ServiceOrder) -> OrderSummary:
+        service_order_id = order.id
         tasks = await self.list_tasks(service_order_id)
         transfers = await self.list_transfers(service_order_id)
 
@@ -378,13 +463,12 @@ class ServiceOrderService:
         iva_percentage = float(settings.iva_percentage) if settings else 16.0
 
         labor_subtotal = sum(float(t.hours_snapshot) for t in tasks) * hourly_rate
-        parts_subtotal = sum(
-            sum(line.quantity * float(line.unit_price) for line in tr.lines) for tr in transfers
-        )
+        parts_subtotal = sum(sum(float(line.line_total) for line in tr.lines) for tr in transfers)
         iva_amount = (labor_subtotal + parts_subtotal) * iva_percentage / 100
         total = labor_subtotal + parts_subtotal + iva_amount
 
         return OrderSummary(
+            discount_label=order.discount_label,
             tasks=[
                 TaskRead(
                     id=t.id,
@@ -408,11 +492,11 @@ class ServiceOrderService:
                             part_id=line.part_id,
                             quantity=line.quantity,
                             unit_price=float(line.unit_price),
-                            subtotal=line.quantity * float(line.unit_price),
+                            subtotal=float(line.line_total),
                         )
                         for line in tr.lines
                     ],
-                    subtotal=sum(line.quantity * float(line.unit_price) for line in tr.lines),
+                    subtotal=sum(float(line.line_total) for line in tr.lines),
                     created_at=tr.created_at,
                 )
                 for tr in transfers
@@ -444,6 +528,7 @@ class ServiceOrderService:
         return upsell
 
     async def create_upsell(self, service_order_id: uuid.UUID, payload: UpsellCreate) -> Upsell:
+        await require_editable_order(self.db, service_order_id)
         upsell = Upsell(
             service_order_id=service_order_id,
             title=payload.title,
@@ -458,9 +543,10 @@ class ServiceOrderService:
 
     async def update_upsell_status(self, upsell_id: uuid.UUID, status: UpsellStatus) -> Upsell:
         upsell = await self.get_upsell(upsell_id)
+        await require_editable_order(self.db, upsell.service_order_id)
         upsell.status = status
         if status != UpsellStatus.PENDIENTE:
-            upsell.resolved_at = datetime.now(timezone.utc)
+            upsell.resolved_at = datetime.now(UTC)
         else:
             upsell.resolved_at = None
         await self.db.commit()

@@ -10,6 +10,7 @@ from app.modules.inspections.exceptions import (
 )
 from app.modules.inspections.models import PreliminaryInspection
 from app.modules.inspections.schemas import InspectionCreate, InspectionUpdate
+from app.modules.service_orders.guards import require_editable_order
 
 
 class InspectionService:
@@ -60,6 +61,9 @@ class InspectionService:
         self, inspection_id: uuid.UUID, payload: InspectionUpdate
     ) -> PreliminaryInspection:
         inspection = await self.get_inspection(inspection_id)
+        order_ids = {inspection.service_order_id, payload.service_order_id} - {None}
+        for order_id in sorted(order_ids):
+            await require_editable_order(self.db, order_id)
 
         if payload.mileage is not None:
             inspection.mileage = payload.mileage

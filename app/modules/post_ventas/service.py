@@ -1,9 +1,11 @@
 import uuid
+from datetime import date
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.post_ventas.enums import CATEGORY_PREFIXES, TemparioCategory
 from app.modules.post_ventas.exceptions import TemparioCodeAlreadyExistsError, TemparioNotFoundError
 from app.modules.post_ventas.models import LaborSettings, Tempario, TemparioPart
@@ -66,9 +68,27 @@ class PostVentasService:
     async def get_labor_settings(self, filial_id: uuid.UUID) -> LaborSettings:
         result = await self.db.execute(select(LaborSettings).where(LaborSettings.filial_id == filial_id))
         settings = result.scalar_one_or_none()
+        changed = False
         if settings is None:
             settings = LaborSettings(filial_id=filial_id)
             self.db.add(settings)
+            changed = True
+
+        latest_usd = await self.db.execute(
+            select(ExchangeRate)
+            .where(ExchangeRate.currency == "USD")
+            .order_by(ExchangeRate.value_date.desc())
+            .limit(1)
+        )
+        rate_row = latest_usd.scalar_one_or_none()
+        if rate_row is not None and (
+            settings.bcv_rate_date is None or rate_row.value_date > settings.bcv_rate_date
+        ):
+            settings.bcv_rate = rate_row.rate_ves
+            settings.bcv_rate_date = rate_row.value_date
+            changed = True
+
+        if changed:
             await self.db.commit()
             await self.db.refresh(settings)
         return settings
@@ -81,7 +101,9 @@ class PostVentasService:
         settings.commission_percentage = payload.commission_percentage
         settings.igtf_percentage = payload.igtf_percentage
         settings.iva_percentage = payload.iva_percentage
-        settings.bcv_rate = payload.bcv_rate
+        if payload.bcv_rate is not None:
+            settings.bcv_rate = payload.bcv_rate
+            settings.bcv_rate_date = date.today()
         await self.db.commit()
         await self.db.refresh(settings)
         return settings

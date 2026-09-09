@@ -1,7 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import JSON, Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -31,9 +31,16 @@ class LaborSettings(Base):
         Numeric(5, 2), nullable=False, default=16, server_default="16"
     )
     bcv_rate: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False, default=0)
+    bcv_rate_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    @property
+    def bcv_rate_is_stale(self) -> bool:
+        """True once the stored rate isn't today's — mirrors billing.py's
+        same-day requirement for charging in Bs."""
+        return self.bcv_rate_date is None or self.bcv_rate_date < date.today()
 
 
 class Tempario(Base):

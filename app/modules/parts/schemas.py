@@ -4,6 +4,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.modules.parts.enums import PartSaleStatus, ReturnCondition, ReturnReason
+from app.modules.parts.pricing import DEFAULT_DISCOUNT, DiscountLabel
 
 
 class PartCreate(BaseModel):
@@ -66,6 +67,36 @@ class PartSaleLineInput(BaseModel):
     quantity: int = Field(ge=1)
 
 
+class PartSaleAllocationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    lot_id: uuid.UUID
+    quantity: int
+    unit_cost: float
+
+
+class PartSaleQuoteLine(BaseModel):
+    part_id: uuid.UUID
+    warehouse_id: uuid.UUID
+    quantity: int
+    unit_price: float
+    unit_cost: float
+    line_total: float
+    allocations: list[PartSaleAllocationRead]
+
+
+class PartSaleQuoteRead(BaseModel):
+    lines: list[PartSaleQuoteLine]
+    total: float
+
+
+class PartSaleQuoteInput(BaseModel):
+    filial_id: uuid.UUID
+    warehouse_id: uuid.UUID
+    discount_label: DiscountLabel = DEFAULT_DISCOUNT
+    lines: list[PartSaleLineInput] = Field(min_length=1)
+
+
 class PartSaleLineRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -74,13 +105,15 @@ class PartSaleLineRead(BaseModel):
     quantity: int
     unit_price: float
     unit_cost: float | None
+    warehouse_id: uuid.UUID | None
+    line_total: float
+    allocations: list[PartSaleAllocationRead]
 
 
-class PartSaleCreate(BaseModel):
-    filial_id: uuid.UUID
+class PartSaleCreate(PartSaleQuoteInput):
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None
-    discount_label: str = Field(default="Costo + 30% (Sin Descuento)", max_length=60)
+    discount_label: DiscountLabel = DEFAULT_DISCOUNT
     lines: list[PartSaleLineInput] = Field(min_length=1)
 
 
@@ -114,6 +147,7 @@ class PartReturnCreate(BaseModel):
     quantity: int = Field(ge=1)
     reason: ReturnReason
     reason_notes: str | None = None
+    photo_urls: list[str] = Field(default_factory=list)
 
 
 class PartReturnRead(BaseModel):
@@ -129,4 +163,5 @@ class PartReturnRead(BaseModel):
     reason: ReturnReason
     reason_notes: str | None
     responsible_user_id: uuid.UUID
+    photo_urls: list[str]
     created_at: datetime

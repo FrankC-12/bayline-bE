@@ -9,6 +9,7 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
+from app.modules.service_orders.billing_schemas import BillingInput, InvoiceCreate
 from app.modules.service_orders.enums import ServiceOrderStatus
 from app.modules.service_orders.schemas import (
     BayCreate,
@@ -27,7 +28,11 @@ from app.modules.service_orders.schemas import (
     UpsellRead,
     UpsellStatusUpdate,
 )
-from app.modules.service_orders.service import ACTIVE_STATUSES, HISTORY_STATUSES, ServiceOrderService
+from app.modules.service_orders.service import (
+    ACTIVE_STATUSES,
+    HISTORY_STATUSES,
+    ServiceOrderService,
+)
 
 MODULE_ID = "asesor-servicios"
 
@@ -79,7 +84,9 @@ async def get_service_order(
     return order
 
 
-@router.post("/service-orders", response_model=ServiceOrderRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/service-orders", response_model=ServiceOrderRead, status_code=status.HTTP_201_CREATED
+)
 async def create_service_order(
     payload: ServiceOrderCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -263,11 +270,11 @@ async def mark_transfer_ordered(
                 "part_id": line.part_id,
                 "quantity": line.quantity,
                 "unit_price": float(line.unit_price),
-                "subtotal": line.quantity * float(line.unit_price),
+                "subtotal": float(line.line_total),
             }
             for line in transfer.lines
         ],
-        subtotal=sum(line.quantity * float(line.unit_price) for line in transfer.lines),
+        subtotal=sum(float(line.line_total) for line in transfer.lines),
         fulfilled_by_user_id=transfer.fulfilled_by_user_id,
         fulfilled_at=transfer.fulfilled_at,
         created_at=transfer.created_at,
@@ -301,7 +308,9 @@ async def list_upsells(
 
 
 @router.post(
-    "/service-orders/{order_id}/upsells", response_model=UpsellRead, status_code=status.HTTP_201_CREATED
+    "/service-orders/{order_id}/upsells",
+    response_model=UpsellRead,
+    status_code=status.HTTP_201_CREATED,
 )
 async def create_upsell(
     order_id: uuid.UUID,
@@ -347,3 +356,110 @@ async def update_upsell_status(
         created_at=u.created_at,
         resolved_at=u.resolved_at,
     )
+
+
+@router.get("/service-orders/{order_id}/billing")
+async def billing_context(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.billing import BillingService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    return await BillingService(service.db).context(order_id)
+
+
+@router.post("/service-orders/{order_id}/billing/quote")
+async def billing_quote(
+    order_id: uuid.UUID,
+    payload: BillingInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.billing import BillingService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    return await BillingService(service.db).quote(order_id, payload)
+
+
+@router.post("/service-orders/{order_id}/billing/refresh-rate")
+async def refresh_billing_rate(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    import subprocess
+
+    from app.core.exceptions import BadRequestError
+    from app.modules.exchange_rates.service import ExchangeRateService
+    from app.modules.service_orders.billing import BillingService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    from app.modules.service_orders.guards import require_editable_order
+
+    await require_editable_order(service.db, order_id)
+    try:
+        await ExchangeRateService(service.db).refresh()
+    except (ValueError, subprocess.SubprocessError, OSError) as exc:
+        raise BadRequestError(
+            "No se pudo actualizar la tasa desde BCV. Intenta nuevamente."
+        ) from exc
+    return await BillingService(service.db).context(order_id)
+
+
+@router.post("/service-orders/{order_id}/invoice", status_code=status.HTTP_201_CREATED)
+async def issue_invoice(
+    order_id: uuid.UUID,
+    payload: InvoiceCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.billing import BillingService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    invoice = await BillingService(service.db).issue(order_id, payload, current_user.user_id)
+    return invoice.document
+
+
+@router.get("/service-orders/{order_id}/invoice")
+async def read_invoice(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.billing import BillingService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    return (await BillingService(service.db).get_invoice(order_id)).document
+
+
+@router.get("/service-orders/{order_id}/invoice/document")
+async def invoice_document(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.billing import BillingService
+    from app.modules.service_orders.invoice_document import render_invoice
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    invoice = await BillingService(service.db).get_invoice(order_id)
+    return {"filename": f"{invoice.code}.html", "html": render_invoice(invoice.document)}
+
+
+@router.post("/service-orders/{order_id}/close", response_model=ServiceOrderRead)
+async def close_service_order(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.close_order(order_id)

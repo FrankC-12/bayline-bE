@@ -9,7 +9,7 @@ from app.modules.roles.models import Role, RoleModulePermission
 ALL_MODULES = [
     "asesor-servicios", "tecnico-servicio", "administracion", "usuarios-accesos",
     "post-ventas", "kpis", "clientes-vehiculos", "repuestos", "almacen",
-    "concesionario", "ventas",
+    "concesionario", "ventas", "ajustes",
 ]
 
 ROLES_SEED = [
@@ -63,6 +63,7 @@ ROLES_SEED = [
         "permissions": [
             {"module_id": "administracion", "access": AccessLevel.EDITAR},
             {"module_id": "post-ventas", "access": AccessLevel.EDITAR},
+            {"module_id": "ajustes", "access": AccessLevel.EDITAR},
             {"module_id": "kpis", "access": AccessLevel.VER},
         ],
     },

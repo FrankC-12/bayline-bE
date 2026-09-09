@@ -10,4 +10,5 @@ MODULE_CATALOG: list[str] = [
     "almacen",
     "concesionario",
     "ventas",
+    "ajustes",
 ]

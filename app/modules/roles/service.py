@@ -4,8 +4,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.modules.roles.enums import RoleScope
+from app.modules.roles.enums import AccessLevel, RoleScope
 from app.modules.roles.exceptions import (
+    InvalidAccessLevelForRoleError,
     InvalidModuleIdError,
     PermissionsNotAllowedForScopeError,
     RoleNotFoundError,
@@ -88,6 +89,8 @@ class RoleService:
         for perm in permissions:
             if perm.module_id not in MODULE_CATALOG:
                 raise InvalidModuleIdError(perm.module_id)
+            if perm.access == AccessLevel.SIN_ACCESO:
+                raise InvalidAccessLevelForRoleError(perm.module_id)
 
     async def _ensure_slug_is_available(self, slug: str) -> None:
         result = await self.db.execute(select(Role).where(Role.slug == slug))

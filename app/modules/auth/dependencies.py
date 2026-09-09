@@ -1,23 +1,22 @@
 import uuid
 
 import jwt
-from fastapi import Depends
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Depends, Request
 
 from app.core.security import decode_access_token
+from app.modules.auth.cookies import ACCESS_COOKIE
 from app.modules.auth.exceptions import InsufficientPermissionsError, InvalidTokenError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import RoleScope
 
-bearer_scheme = HTTPBearer(auto_error=True)
 
-
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-) -> CurrentUser:
-    """Decode and validate the Bearer token, returning the authenticated caller's claims."""
+def get_current_user(request: Request) -> CurrentUser:
+    """Validate the access cookie; Authorization headers are not session credentials."""
+    token = request.cookies.get(ACCESS_COOKIE)
+    if not token:
+        raise InvalidTokenError()
     try:
-        payload = decode_access_token(credentials.credentials)
+        payload = decode_access_token(token)
     except jwt.PyJWTError as exc:
         raise InvalidTokenError() from exc
 

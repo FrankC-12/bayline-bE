@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 from app.modules.clients.exceptions import ClientNotFoundError, DocumentAlreadyExistsError
 from app.modules.clients.models import Client, Vehicle
 from app.modules.clients.schemas import ClientCreate, ClientUpdate, VehicleInput
+from app.modules.inspections.models import PreliminaryInspection
 
 
 class ClientService:
@@ -37,6 +38,7 @@ class ClientService:
                     for v in c.vehicles
                 )
             ]
+        await self._attach_current_mileage(clients)
         return clients
 
     async def get_client(self, client_id: uuid.UUID) -> Client:
@@ -45,7 +47,70 @@ class ClientService:
         client = result.scalar_one_or_none()
         if client is None:
             raise ClientNotFoundError(str(client_id))
+        await self._attach_current_mileage([client])
         return client
+
+    async def _attach_current_mileage(self, clients: list[Client]) -> None:
+        """Sets current_mileage/_visit_date/_service_order_id/_code as plain
+        attributes on each Vehicle, sourced from the most recent
+        PreliminaryInspection that recorded a mileage for it. These aren't
+        mapped columns — VehicleRead picks them up via from_attributes, same
+        as any other field. The registration `mileage` field itself is never
+        touched here.
+
+        If the latest such inspection isn't linked to a service order yet,
+        the order id/code are left None instead of falling back to an older,
+        order-linked inspection — mixing mileage/date from one visit with a
+        link to a different one would be wrong.
+        """
+        vehicle_ids = [v.id for c in clients for v in c.vehicles]
+        latest = await self._latest_mileage_inspections(vehicle_ids)
+
+        order_ids = {i.service_order_id for i in latest.values() if i.service_order_id}
+        orders_by_id: dict[uuid.UUID, int] = {}
+        if order_ids:
+            from app.modules.service_orders.models import ServiceOrder
+
+            rows = await self.db.execute(
+                select(ServiceOrder.id, ServiceOrder.sequence_number).where(
+                    ServiceOrder.id.in_(order_ids)
+                )
+            )
+            orders_by_id = {row.id: row.sequence_number for row in rows}
+
+        for client in clients:
+            for vehicle in client.vehicles:
+                inspection = latest.get(vehicle.id)
+                vehicle.current_mileage = inspection.mileage if inspection else None
+                vehicle.current_mileage_visit_date = (
+                    inspection.created_at.date() if inspection else None
+                )
+                vehicle.current_mileage_service_order_id = (
+                    inspection.service_order_id if inspection else None
+                )
+                sequence_number = orders_by_id.get(inspection.service_order_id) if inspection else None
+                vehicle.current_mileage_service_order_code = (
+                    f"ODS-{sequence_number}" if sequence_number is not None else None
+                )
+
+    async def _latest_mileage_inspections(
+        self, vehicle_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, PreliminaryInspection]:
+        if not vehicle_ids:
+            return {}
+        query = (
+            select(PreliminaryInspection)
+            .where(
+                PreliminaryInspection.vehicle_id.in_(vehicle_ids),
+                PreliminaryInspection.mileage.isnot(None),
+            )
+            .order_by(PreliminaryInspection.vehicle_id, PreliminaryInspection.created_at.desc())
+        )
+        result = await self.db.execute(query)
+        latest: dict[uuid.UUID, PreliminaryInspection] = {}
+        for inspection in result.scalars():
+            latest.setdefault(inspection.vehicle_id, inspection)
+        return latest
 
     async def create_client(self, payload: ClientCreate) -> Client:
         await self._ensure_document_is_available(payload.filial_id, payload.document_number)

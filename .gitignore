@@ -128,3 +128,5 @@ storage/
 *.key
 *.crt
 secrets/
+# Public production configuration template (no real secrets).
+!deploy/.env.production.example

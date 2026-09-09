@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -16,7 +16,10 @@ class Part(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     code: Mapped[str] = mapped_column(String(40), nullable=False)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
@@ -27,7 +30,9 @@ class Part(Base):
     # Legacy compatibility fields. Catalog reads no longer expose or trust these;
     # stock and reference price are derived from part_lots.
     price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
-    stock_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    stock_quantity: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     min_stock: Mapped[int] = mapped_column(Integer, nullable=False, default=10, server_default="10")
     availability: Mapped[PartAvailability] = mapped_column(
         Enum(PartAvailability, name="part_availability"),
@@ -47,17 +52,24 @@ class PartSale(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     client_name: Mapped[str] = mapped_column(String(150), nullable=False)
     client_document: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    request_reason: Mapped[str] = mapped_column(String(150), nullable=False, default="Venta de Repuestos")
+    request_reason: Mapped[str] = mapped_column(
+        String(150), nullable=False, default="Venta de Repuestos"
+    )
     discount_label: Mapped[str] = mapped_column(
         String(60), nullable=False, default="Costo + 30% (Sin Descuento)"
     )
     status: Mapped[PartSaleStatus] = mapped_column(
-        Enum(PartSaleStatus, name="part_sale_status"), nullable=False, default=PartSaleStatus.PENDIENTE
+        Enum(PartSaleStatus, name="part_sale_status"),
+        nullable=False,
+        default=PartSaleStatus.PENDIENTE,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -74,7 +86,7 @@ class PartSale(Base):
 
     @property
     def total(self) -> float:
-        return sum(float(line.unit_price) * line.quantity for line in self.lines)
+        return sum(float(line.line_total) for line in self.lines)
 
 
 class PartSaleLine(Base):
@@ -82,14 +94,24 @@ class PartSaleLine(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     part_sale_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("part_sales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("part_sales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
-    unit_price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
-    unit_cost: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    unit_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+    unit_cost: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+    warehouse_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=True
+    )
+    line_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
+    allocations: Mapped[list["PartSaleLotAllocation"]] = relationship(
+        cascade="all, delete-orphan", lazy="selectin"
+    )
 
     sale: Mapped["PartSale"] = relationship(back_populates="lines")
 
@@ -101,20 +123,42 @@ class PartReturn(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
     )
     condition: Mapped[ReturnCondition] = mapped_column(
-        Enum(ReturnCondition, name="return_condition"), nullable=False, default=ReturnCondition.NUEVO
+        Enum(ReturnCondition, name="return_condition"),
+        nullable=False,
+        default=ReturnCondition.NUEVO,
     )
     origin_warehouse: Mapped[str] = mapped_column(String(60), nullable=False)
     destination_warehouse: Mapped[str] = mapped_column(String(60), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
-    reason: Mapped[ReturnReason] = mapped_column(Enum(ReturnReason, name="return_reason"), nullable=False)
+    reason: Mapped[ReturnReason] = mapped_column(
+        Enum(ReturnReason, name="return_reason"), nullable=False
+    )
     reason_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     responsible_user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    photo_urls: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PartSaleLotAllocation(Base):
+    __tablename__ = "part_sale_lot_allocations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    part_sale_line_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_sale_lines.id", ondelete="CASCADE"), index=True
+    )
+    lot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_lots.id", ondelete="RESTRICT")
+    )
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)

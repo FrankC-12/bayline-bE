@@ -153,6 +153,6 @@ class InventoryRow(BaseModel):
     warehouse_id: uuid.UUID
     warehouse_name: str
     quantity: int
-    average_cost: float | None
+    fifo_unit_cost: float | None
     location: str | None
     min_stock: int

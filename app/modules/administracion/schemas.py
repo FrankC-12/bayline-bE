@@ -261,6 +261,7 @@ class FinanceDashboard(BaseModel):
     expense_month: float
     net_flow: float
     bcv_rate: float
+    bcv_rate_is_stale: bool
     trend: list[MonthTrend]
 
 
