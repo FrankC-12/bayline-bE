@@ -1,15 +1,24 @@
 import uuid
+from datetime import date
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.modules.auth.dependencies import get_current_user, require_platform_user
+from app.modules.administracion.schemas import ProfitabilityReport
+from app.modules.auth.dependencies import get_current_user, require_holding_user, require_platform_user
+from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.holdings.schemas import HoldingCreate, HoldingRead, HoldingUpdate
 from app.modules.holdings.service import HoldingService
+from app.modules.service_orders.billing_schemas import HoldingWarrantyReceivablesReport
 
 router = APIRouter(prefix="/holdings", tags=["Holdings"])
+
+
+def _ensure_owns_holding(current_user: CurrentUser, holding_id: uuid.UUID) -> None:
+    if current_user.holding_id != holding_id:
+        raise InsufficientPermissionsError()
 
 
 def get_holding_service(db: AsyncSession = Depends(get_db)) -> HoldingService:
@@ -77,3 +86,34 @@ async def deactivate_holding(
 ) -> HoldingRead:
     """Deactivate a holding without deleting its historical data. Platform-only."""
     return await service.set_active_status(holding_id, is_active=False)
+
+
+@router.get("/{holding_id}/garantias-consolidado", response_model=HoldingWarrantyReceivablesReport)
+async def get_warranty_receivables_report(
+    holding_id: uuid.UUID,
+    current_user: CurrentUser = Depends(require_holding_user),
+    db: AsyncSession = Depends(get_db),
+) -> HoldingWarrantyReceivablesReport:
+    """Per-filial cuentas por cobrar for invoices billed to the holding's own
+    client record (factory-warranty work). Only the owning Holding may view it."""
+    from app.modules.service_orders.billing import BillingService
+
+    _ensure_owns_holding(current_user, holding_id)
+    return await BillingService(db).get_holding_warranty_receivables(holding_id)
+
+
+@router.get("/{holding_id}/finance/profitability", response_model=ProfitabilityReport)
+async def get_holding_profitability(
+    holding_id: uuid.UUID,
+    date_from: date = Query(...),
+    date_to: date = Query(...),
+    current_user: CurrentUser = Depends(require_holding_user),
+    db: AsyncSession = Depends(get_db),
+) -> ProfitabilityReport:
+    """Rentabilidad consolidated across every filial in the holding. Only the
+    owning Holding may view it — not gated by ensure_module_access, which is
+    filial-scoped by construction and always rejects a holding-scope caller."""
+    from app.modules.administracion.service import AdministracionService
+
+    _ensure_owns_holding(current_user, holding_id)
+    return await AdministracionService(db).get_profitability_for_holding(holding_id, date_from, date_to)

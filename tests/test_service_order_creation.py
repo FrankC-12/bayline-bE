@@ -1,5 +1,9 @@
-"""Reception data (mileage, customer reason, advisor, promised date) is
-required to open a service order — the API rejects creation without it."""
+"""Reception data (customer reason, advisor, promised date) is required to
+open a service order — the API rejects creation without it. intake_mileage
+is the one exception: a walk-in ODS collects it right away since the
+vehicle is physically present, but one scheduled ahead of time via
+"Agendar Orden de Servicio" can't know it yet — it's optional at creation
+and gets filled in later via ServiceOrderUpdate once the vehicle arrives."""
 
 import os
 import uuid
@@ -15,7 +19,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
-from app.modules.service_orders.schemas import ServiceOrderCreate, ServiceOrderRead
+from app.modules.service_orders.schemas import ServiceOrderCreate, ServiceOrderRead, ServiceOrderUpdate
 from app.modules.service_orders.service import ServiceOrderService
 
 
@@ -70,3 +74,27 @@ async def test_create_order_persists_reception_data(env):
     read = ServiceOrderRead.model_validate(order)
     assert read.intake_mileage == 15000
     assert read.promised_at == date(2026, 9, 10)
+
+
+@pytest.mark.asyncio
+async def test_intake_mileage_is_optional_when_scheduling_ahead(env):
+    service, _session = env
+    filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    payload = _valid_payload(filial_id, vehicle_id, advisor_id).model_copy(update={"intake_mileage": None})
+
+    order = await service.create_order(payload)
+
+    assert order.intake_mileage is None
+
+
+@pytest.mark.asyncio
+async def test_intake_mileage_can_be_recorded_later_once_the_vehicle_arrives(env):
+    service, _session = env
+    filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    payload = _valid_payload(filial_id, vehicle_id, advisor_id).model_copy(update={"intake_mileage": None})
+    order = await service.create_order(payload)
+    assert order.intake_mileage is None
+
+    updated = await service.update_order(order.id, ServiceOrderUpdate(intake_mileage=18500))
+
+    assert updated.intake_mileage == 18500

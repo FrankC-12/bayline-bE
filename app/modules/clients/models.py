@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Enum, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,6 +42,12 @@ class Client(Base):
     address_type: Mapped[AddressType | None] = mapped_column(
         Enum(AddressType, name="address_type"), nullable=True
     )
+    # Marks the client record that stands in for the holding when factory-
+    # warranty work gets billed to it instead of the vehicle's owner — lets
+    # the holding-scoped consolidated report find the right invoices per
+    # filial. At most one such client is expected per filial, but this isn't
+    # enforced at the DB level (same as everything else about this client).
+    is_holding_billing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -74,6 +80,27 @@ class Vehicle(Base):
     fuel_type: Mapped[FuelType | None] = mapped_column(Enum(FuelType, name="fuel_type"), nullable=True)
     transmission: Mapped[TransmissionType | None] = mapped_column(
         Enum(TransmissionType, name="transmission_type"), nullable=True
+    )
+    # Advisor-entered "next visit suggested" date, set when closing a Service
+    # Order — drives the "mantenimiento por vencer" list in Torre de Control.
+    # Not auto-computed from any fixed interval: each closed order can suggest
+    # its own next date, since what was serviced varies.
+    next_maintenance_due_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # The specific plan task (Tempario) the advisor flagged as pending for
+    # this vehicle's next visit — lets a new ODS offer to load that exact
+    # task (and its linked parts) instead of searching the catalog again.
+    # SET NULL (not RESTRICT like ServiceOrderTask.tempario_id) because this
+    # is just a live suggestion, not billed history.
+    next_maintenance_tempario_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("temparios.id", ondelete="SET NULL"), nullable=True
+    )
+    # The manufacturer maintenance plan (MPT) this vehicle follows — assigned
+    # explicitly (suggested by brand match, confirmed by the advisor), never
+    # auto-assigned, since a vehicle could legitimately follow a different
+    # plan than its brand's default. SET NULL since it's a live pointer, not
+    # billed history.
+    maintenance_plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("maintenance_plans.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

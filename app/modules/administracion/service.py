@@ -1,5 +1,5 @@
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,18 +7,39 @@ from sqlalchemy.orm import selectinload
 
 from app.modules.administracion.enums import (
     AccountCurrency,
+    ClaimResolution,
+    ClaimStatus,
     ExpenseCategory,
+    IncomeConcept,
     IncomeSource,
+    MovementSourceType,
     PurchaseRequestStatus,
+    WarrantySubmissionStatus,
 )
 from app.modules.administracion.exceptions import (
     AccountNotFoundError,
+    AttachmentRequiredError,
+    ClaimAccountRequiredError,
+    ClaimAmountRequiredError,
+    ClaimClientRequiredError,
+    ClaimCurrencyMismatchError,
+    ClaimMustBeResolvedThroughResolveEndpointError,
     ClaimNotFoundError,
+    ClaimNotRejectedError,
+    ClosedPeriodEntryDateError,
+    EntryAlreadyReversedError,
+    EntryNotFoundError,
+    ExchangeRateRequiredError,
+    FutureEntryDateError,
     InvalidPurchaseStatusTransitionError,
     PurchaseRequestNotFoundError,
     QuoteRequiredError,
     SupplierNotFoundError,
     WarehouseRequiredError,
+    WarrantySubmissionAlreadyExistsError,
+    WarrantySubmissionEmptyError,
+    WarrantySubmissionNotEditableError,
+    WarrantySubmissionNotFoundError,
 )
 from app.modules.administracion.models import (
     Account,
@@ -29,30 +50,54 @@ from app.modules.administracion.models import (
     Supplier,
     SupplierPaymentAccount,
     SupplierClaim,
+    WarrantySubmission,
 )
 from app.modules.administracion.schemas import (
     AccountCreate,
     AccountUpdate,
+    ExpenseEntryCreate,
     FinanceDashboard,
+    IncomeEntryCreate,
     MonthTrend,
+    ProfitabilityAdjustmentRow,
+    ProfitabilityDepartmentRow,
     ProfitabilityReport,
     PurchaseRequestCreate,
     PurchaseRequestLineRead,
     PurchaseRequestRead,
     SupplierClaimCreate,
+    SupplierClaimResolveInput,
     SupplierClaimUpdate,
     SupplierCreate,
     SupplierDetailRead,
     SupplierRead,
     SupplierUpdate,
+    WarrantySubmissionClaimRead,
+    WarrantySubmissionCreate,
+    WarrantySubmissionPayInput,
+    WarrantySubmissionRead,
 )
 from app.modules.warehouse.enums import MovementType
 from app.modules.warehouse.models import StockMovement
 from app.modules.warehouse.schemas import LotLineInput
 from app.modules.warehouse.service import AlmacenService
+from app.modules.concesionario.enums import VehicleCondition
 from app.modules.concesionario.models import DealershipVehicle, VehicleSale
+from app.modules.filiales.models import Filial
+from app.modules.parts.enums import PartSaleStatus
 from app.modules.parts.models import PartSale, PartSaleLine
+from app.modules.post_ventas.models import Tempario
 from app.modules.post_ventas.service import PostVentasService
+from app.modules.clients.models import Client
+from app.modules.service_orders.enums import TransferStatus
+from app.modules.service_orders.models import (
+    ReworkClaim,
+    ServiceOrder,
+    ServiceOrderInvoice,
+    ServiceOrderTransfer,
+    ServiceOrderTransferLine,
+    ServiceOrderTransferLotAllocation,
+)
 
 # Spanish month abbreviations for the finance trend chart — not read from
 # calendar.month_abbr, which is locale-dependent and defaults to English.
@@ -94,6 +139,15 @@ def _request_to_read(request: PurchaseRequest) -> PurchaseRequestRead:
         total_quoted=total,
         created_at=request.created_at,
         updated_at=request.updated_at,
+    )
+
+
+def _profitability_department_row(key: str, label: str, net_sales: float, direct_cost: float) -> ProfitabilityDepartmentRow:
+    gross_profit = net_sales - direct_cost
+    margin = gross_profit / net_sales if net_sales else 0.0
+    return ProfitabilityDepartmentRow(
+        key=key, label=label, net_sales=net_sales, direct_cost=direct_cost,
+        gross_profit=gross_profit, margin=margin,
     )
 
 
@@ -244,7 +298,12 @@ class AdministracionService:
                     await almacen._create_single_lot(
                         request.filial_id,
                         warehouse_id,
-                        LotLineInput(part_id=line.part_id, quantity=line.quantity, unit_cost=float(line.unit_cost)),
+                        LotLineInput(
+                            part_id=line.part_id,
+                            quantity=line.quantity,
+                            unit_cost=float(line.unit_cost),
+                            purchase_request_id=request.id,
+                        ),
                         note=f"Compra {request.code}",
                     )
                 request.warehouse_id = warehouse_id
@@ -262,7 +321,9 @@ class AdministracionService:
             .where(SupplierClaim.filial_id == filial_id)
             .order_by(SupplierClaim.created_at.desc())
         )
-        return list(result.scalars().all())
+        claims = list(result.scalars().all())
+        await self._attach_client_name(claims)
+        return claims
 
     async def get_claim(self, claim_id: uuid.UUID) -> SupplierClaim:
         claim = await self.db.get(SupplierClaim, claim_id)
@@ -270,20 +331,311 @@ class AdministracionService:
             raise ClaimNotFoundError(str(claim_id))
         return claim
 
+    async def _attach_client_name(self, claims: list[SupplierClaim]) -> None:
+        client_ids = {claim.client_id for claim in claims if claim.client_id is not None}
+        names: dict[uuid.UUID, str] = {}
+        if client_ids:
+            result = await self.db.execute(select(Client).where(Client.id.in_(client_ids)))
+            names = {client.id: client.full_name for client in result.scalars().all()}
+        for claim in claims:
+            claim.client_name = names.get(claim.client_id) if claim.client_id else None
+
     async def create_claim(self, payload: SupplierClaimCreate) -> SupplierClaim:
         claim = SupplierClaim(**payload.model_dump())
         self.db.add(claim)
         await self.db.commit()
         await self.db.refresh(claim)
+        await self._attach_client_name([claim])
         return claim
 
     async def update_claim(self, claim_id: uuid.UUID, payload: SupplierClaimUpdate) -> SupplierClaim:
         claim = await self.get_claim(claim_id)
+        if payload.status == ClaimStatus.RESUELTO:
+            raise ClaimMustBeResolvedThroughResolveEndpointError()
         for field, value in payload.model_dump(exclude_unset=True).items():
             setattr(claim, field, value)
         await self.db.commit()
         await self.db.refresh(claim)
+        await self._attach_client_name([claim])
         return claim
+
+    async def resolve_claim(
+        self, claim_id: uuid.UUID, payload: SupplierClaimResolveInput, resolved_by_user_id: uuid.UUID | None
+    ) -> SupplierClaim:
+        claim = await self.get_claim(claim_id)
+        if claim.status != ClaimStatus.RECHAZADO:
+            raise ClaimNotRejectedError()
+        if claim.claimed_amount is None or claim.currency is None:
+            raise ClaimAmountRequiredError()
+
+        if payload.client_id is not None:
+            claim.client_id = payload.client_id
+
+        if payload.resolution == ClaimResolution.CARGO_CLIENTE:
+            if claim.client_id is None:
+                raise ClaimClientRequiredError()
+        else:
+            if payload.account_id is None:
+                raise ClaimAccountRequiredError()
+            account = await self.get_account(payload.account_id)
+            if account.currency != claim.currency:
+                raise ClaimCurrencyMismatchError()
+
+            supplier = await self.db.get(Supplier, claim.supplier_id)
+            expense = ExpenseEntry(
+                filial_id=claim.filial_id,
+                entry_date=date.today(),
+                category=ExpenseCategory.GARANTIA_RECHAZADA,
+                beneficiary=supplier.business_name if supplier else "Importador",
+                description=f"Factura rechazada por el importador — reclamo {claim.id}",
+                amount=claim.claimed_amount,
+                currency=claim.currency,
+                account_id=account.id,
+                registered_by_user_id=resolved_by_user_id,
+                source_type=MovementSourceType.SUPPLIER_CLAIM,
+                source_id=claim.id,
+            )
+            self.db.add(expense)
+            await self.db.flush()
+            claim.expense_entry_id = expense.id
+
+        claim.resolution = payload.resolution
+        claim.resolution_note = payload.note
+        claim.resolved_by_user_id = resolved_by_user_id
+        claim.resolved_at = datetime.now(timezone.utc)
+        claim.status = ClaimStatus.RESUELTO
+
+        await self.db.commit()
+        await self.db.refresh(claim)
+        await self._attach_client_name([claim])
+        return claim
+
+    # Warranty submissions (monthly presentación to the holding)
+
+    @staticmethod
+    def _month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
+        start = datetime(year, month, 1, tzinfo=timezone.utc)
+        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12 else datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        return start, end
+
+    async def _next_warranty_submission_sequence(self, filial_id: uuid.UUID) -> int:
+        result = await self.db.execute(
+            select(func.max(WarrantySubmission.sequence_number)).where(WarrantySubmission.filial_id == filial_id)
+        )
+        current_max = result.scalar()
+        return (current_max or 0) + 1
+
+    async def _unclaimed_costo_taller_claims(
+        self, filial_id: uuid.UUID, period_year: int, period_month: int, currency: AccountCurrency
+    ) -> list[SupplierClaim]:
+        start, end = self._month_bounds(period_year, period_month)
+        result = await self.db.execute(
+            select(SupplierClaim).where(
+                SupplierClaim.filial_id == filial_id,
+                SupplierClaim.resolution == ClaimResolution.COSTO_TALLER,
+                SupplierClaim.currency == currency,
+                SupplierClaim.warranty_submission_id.is_(None),
+                SupplierClaim.resolved_at >= start,
+                SupplierClaim.resolved_at < end,
+            )
+        )
+        return list(result.scalars().all())
+
+    def _submission_to_read(self, submission: WarrantySubmission) -> WarrantySubmissionRead:
+        total = sum(float(c.claimed_amount or 0) for c in submission.claims)
+        return WarrantySubmissionRead(
+            id=submission.id,
+            filial_id=submission.filial_id,
+            code=submission.code,
+            period_year=submission.period_year,
+            period_month=submission.period_month,
+            currency=submission.currency,
+            status=submission.status,
+            claims=[WarrantySubmissionClaimRead.model_validate(c) for c in submission.claims],
+            total_claimed_amount=total,
+            submitted_at=submission.submitted_at,
+            submitted_by_user_id=submission.submitted_by_user_id,
+            withholding_amount=float(submission.withholding_amount) if submission.withholding_amount is not None else None,
+            net_amount_received=float(submission.net_amount_received) if submission.net_amount_received is not None else None,
+            account_id=submission.account_id,
+            income_entry_id=submission.income_entry_id,
+            paid_at=submission.paid_at,
+            paid_by_user_id=submission.paid_by_user_id,
+            created_at=submission.created_at,
+            updated_at=submission.updated_at,
+        )
+
+    async def _get_submission_model(self, submission_id: uuid.UUID) -> WarrantySubmission:
+        # populate_existing forces a refresh of `claims` even when this
+        # WarrantySubmission is already in the identity map from an earlier
+        # query in the same session — otherwise claims just re-attached by
+        # create/refresh wouldn't show up (see PostVentasService._get_plan_model
+        # for the same fix applied to MaintenancePlan.entries).
+        result = await self.db.execute(
+            select(WarrantySubmission)
+            .options(selectinload(WarrantySubmission.claims))
+            .where(WarrantySubmission.id == submission_id)
+            .execution_options(populate_existing=True)
+        )
+        submission = result.scalar_one_or_none()
+        if submission is None:
+            raise WarrantySubmissionNotFoundError(str(submission_id))
+        return submission
+
+    async def list_warranty_submissions(self, filial_id: uuid.UUID) -> list[WarrantySubmissionRead]:
+        result = await self.db.execute(
+            select(WarrantySubmission)
+            .options(selectinload(WarrantySubmission.claims))
+            .where(WarrantySubmission.filial_id == filial_id)
+            .order_by(WarrantySubmission.period_year.desc(), WarrantySubmission.period_month.desc())
+        )
+        submissions = list(result.scalars().unique().all())
+        return [self._submission_to_read(s) for s in submissions]
+
+    async def get_warranty_submission(self, submission_id: uuid.UUID) -> WarrantySubmissionRead:
+        return self._submission_to_read(await self._get_submission_model(submission_id))
+
+    async def create_warranty_submission(self, payload: WarrantySubmissionCreate) -> WarrantySubmissionRead:
+        existing = await self.db.execute(
+            select(WarrantySubmission).where(
+                WarrantySubmission.filial_id == payload.filial_id,
+                WarrantySubmission.period_year == payload.period_year,
+                WarrantySubmission.period_month == payload.period_month,
+                WarrantySubmission.currency == payload.currency,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise WarrantySubmissionAlreadyExistsError()
+
+        sequence_number = await self._next_warranty_submission_sequence(payload.filial_id)
+        submission = WarrantySubmission(
+            filial_id=payload.filial_id,
+            sequence_number=sequence_number,
+            period_year=payload.period_year,
+            period_month=payload.period_month,
+            currency=payload.currency,
+        )
+        self.db.add(submission)
+        await self.db.flush()
+
+        claims = await self._unclaimed_costo_taller_claims(
+            payload.filial_id, payload.period_year, payload.period_month, payload.currency
+        )
+        for claim in claims:
+            claim.warranty_submission_id = submission.id
+
+        await self.db.commit()
+        return await self.get_warranty_submission(submission.id)
+
+    async def refresh_warranty_submission(self, submission_id: uuid.UUID) -> WarrantySubmissionRead:
+        submission = await self._get_submission_model(submission_id)
+        if submission.status != WarrantySubmissionStatus.BORRADOR:
+            raise WarrantySubmissionNotEditableError()
+
+        claims = await self._unclaimed_costo_taller_claims(
+            submission.filial_id, submission.period_year, submission.period_month, submission.currency
+        )
+        for claim in claims:
+            claim.warranty_submission_id = submission.id
+
+        await self.db.commit()
+        return await self.get_warranty_submission(submission_id)
+
+    async def submit_warranty_submission(
+        self, submission_id: uuid.UUID, submitted_by_user_id: uuid.UUID | None
+    ) -> WarrantySubmissionRead:
+        submission = await self._get_submission_model(submission_id)
+        if submission.status != WarrantySubmissionStatus.BORRADOR:
+            raise WarrantySubmissionNotEditableError()
+        if not submission.claims:
+            raise WarrantySubmissionEmptyError()
+
+        submission.status = WarrantySubmissionStatus.PRESENTADA
+        submission.submitted_at = datetime.now(timezone.utc)
+        submission.submitted_by_user_id = submitted_by_user_id
+
+        await self.db.commit()
+        return await self.get_warranty_submission(submission_id)
+
+    async def mark_warranty_submission_paid(
+        self, submission_id: uuid.UUID, payload: WarrantySubmissionPayInput, paid_by_user_id: uuid.UUID | None
+    ) -> WarrantySubmissionRead:
+        submission = await self._get_submission_model(submission_id)
+        if submission.status != WarrantySubmissionStatus.PRESENTADA:
+            raise WarrantySubmissionNotEditableError()
+
+        account = await self.get_account(payload.account_id)
+        if account.currency != submission.currency:
+            raise ClaimCurrencyMismatchError()
+
+        income = IncomeEntry(
+            filial_id=submission.filial_id,
+            entry_date=date.today(),
+            source=IncomeSource.MANUAL,
+            origin_reference=submission.code,
+            description=f"Reembolso de garantías del holding — {submission.code}",
+            amount=payload.net_amount_received,
+            currency=submission.currency,
+            account_id=account.id,
+            registered_by_user_id=paid_by_user_id,
+            source_type=MovementSourceType.WARRANTY_SUBMISSION,
+            source_id=submission.id,
+        )
+        self.db.add(income)
+        await self.db.flush()
+
+        submission.withholding_amount = payload.withholding_amount
+        submission.net_amount_received = payload.net_amount_received
+        submission.account_id = account.id
+        submission.income_entry_id = income.id
+        submission.paid_at = datetime.now(timezone.utc)
+        submission.paid_by_user_id = paid_by_user_id
+        submission.status = WarrantySubmissionStatus.PAGADA
+
+        await self.db.commit()
+        return await self.get_warranty_submission(submission_id)
+
+    async def delete_warranty_submission(self, submission_id: uuid.UUID) -> None:
+        submission = await self._get_submission_model(submission_id)
+        if submission.status != WarrantySubmissionStatus.BORRADOR:
+            raise WarrantySubmissionNotEditableError()
+        for claim in submission.claims:
+            claim.warranty_submission_id = None
+        await self.db.delete(submission)
+        await self.db.commit()
+
+    async def export_warranty_submission_csv(self, submission_id: uuid.UUID) -> tuple[str, str]:
+        submission = await self._get_submission_model(submission_id)
+        supplier_ids = {c.supplier_id for c in submission.claims}
+        part_ids = {c.part_id for c in submission.claims}
+        suppliers: dict[uuid.UUID, str] = {}
+        parts: dict[uuid.UUID, str] = {}
+        if supplier_ids:
+            result = await self.db.execute(select(Supplier).where(Supplier.id.in_(supplier_ids)))
+            suppliers = {s.id: s.business_name for s in result.scalars().all()}
+        if part_ids:
+            from app.modules.parts.models import Part
+
+            result = await self.db.execute(select(Part).where(Part.id.in_(part_ids)))
+            parts = {p.id: p.name for p in result.scalars().all()}
+
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["Fecha resolución", "Proveedor", "Repuesto", "Cantidad", "Monto", "Moneda", "Nota"])
+        for claim in submission.claims:
+            writer.writerow([
+                claim.resolved_at.date().isoformat() if claim.resolved_at else "",
+                suppliers.get(claim.supplier_id, ""),
+                parts.get(claim.part_id, ""),
+                claim.quantity,
+                float(claim.claimed_amount or 0),
+                claim.currency.value if claim.currency else "",
+                claim.resolution_note or "",
+            ])
+        return buffer.getvalue(), f"{submission.code}.csv"
 
     # Accounts
 
@@ -302,9 +654,29 @@ class AdministracionService:
                 ExpenseEntry.account_id == account.id, ExpenseEntry.currency == account.currency
             )
         )
-        balance = float(income_result.scalar() or 0) - float(expense_result.scalar() or 0)
+        balance = (
+            float(account.opening_balance)
+            + float(income_result.scalar() or 0)
+            - float(expense_result.scalar() or 0)
+        )
         balance_usd = balance if account.currency == AccountCurrency.USD else (balance / bcv_rate if bcv_rate else 0.0)
         return balance, balance_usd
+
+    async def _account_row(self, account: Account, bcv_rate: float) -> dict:
+        balance, balance_usd = await self._account_balance(account, bcv_rate)
+        return {
+            "id": account.id,
+            "filial_id": account.filial_id,
+            "name": account.name,
+            "bank": account.bank,
+            "currency": account.currency,
+            "account_type": account.account_type,
+            "opening_balance": float(account.opening_balance),
+            "is_active": account.is_active,
+            "balance": balance,
+            "balance_usd": balance_usd,
+            "created_at": account.created_at,
+        }
 
     async def list_accounts(self, filial_id: uuid.UUID) -> list[dict]:
         result = await self.db.execute(
@@ -312,24 +684,76 @@ class AdministracionService:
         )
         accounts = list(result.scalars().all())
         bcv_rate = await self._get_bcv_rate(filial_id)
-        rows = []
-        for account in accounts:
-            balance, balance_usd = await self._account_balance(account, bcv_rate)
-            rows.append(
-                {
-                    "id": account.id,
-                    "filial_id": account.filial_id,
-                    "name": account.name,
-                    "bank": account.bank,
-                    "currency": account.currency,
-                    "account_type": account.account_type,
-                    "is_active": account.is_active,
-                    "balance": balance,
-                    "balance_usd": balance_usd,
-                    "created_at": account.created_at,
-                }
-            )
-        return rows
+        return [await self._account_row(account, bcv_rate) for account in accounts]
+
+    async def get_account_detail(self, account_id: uuid.UUID) -> dict:
+        account = await self.get_account(account_id)
+        bcv_rate = await self._get_bcv_rate(account.filial_id)
+        return await self._account_row(account, bcv_rate)
+
+    async def get_account_movements(self, account_id: uuid.UUID, limit: int = 50) -> list[dict]:
+        """The account's own income/expense entries, most recent first —
+        merged into one feed so the account-detail screen can show a single
+        chronological list instead of two separate tables."""
+        income_result = await self.db.execute(
+            select(IncomeEntry)
+            .where(IncomeEntry.account_id == account_id)
+            .order_by(IncomeEntry.entry_date.desc(), IncomeEntry.created_at.desc())
+            .limit(limit)
+        )
+        expense_result = await self.db.execute(
+            select(ExpenseEntry)
+            .where(ExpenseEntry.account_id == account_id)
+            .order_by(ExpenseEntry.entry_date.desc(), ExpenseEntry.created_at.desc())
+            .limit(limit)
+        )
+        movements = [
+            {
+                "id": e.id,
+                "movement_type": "ingreso",
+                "entry_date": e.entry_date,
+                "description": e.description,
+                "amount": float(e.amount),
+                "currency": e.currency,
+                "concept": e.concept,
+                "category": None,
+                "counterparty_type": e.counterparty_type,
+                "counterparty_client_id": e.counterparty_client_id,
+                "counterparty_supplier_id": e.counterparty_supplier_id,
+                "counterparty_name": e.counterparty_name,
+                "reference": e.reference,
+                "attachment_url": e.attachment_url,
+                "reverses_entry_id": e.reverses_entry_id,
+                "source_type": e.source_type,
+                "source_id": e.source_id,
+                "created_at": e.created_at,
+            }
+            for e in income_result.scalars().all()
+        ] + [
+            {
+                "id": e.id,
+                "movement_type": "egreso",
+                "entry_date": e.entry_date,
+                "description": e.description,
+                "amount": float(e.amount),
+                "currency": e.currency,
+                "concept": None,
+                "category": e.category,
+                "counterparty_type": e.counterparty_type,
+                "counterparty_client_id": e.counterparty_client_id,
+                "counterparty_supplier_id": e.counterparty_supplier_id,
+                "counterparty_name": e.counterparty_name,
+                "reference": e.reference,
+                "attachment_url": e.attachment_url,
+                "reverses_entry_id": e.reverses_entry_id,
+                "source_type": e.source_type,
+                "source_id": e.source_id,
+                "created_at": e.created_at,
+            }
+            for e in expense_result.scalars().all()
+        ]
+        movements.sort(key=lambda m: (m["entry_date"], m["created_at"]), reverse=True)
+        return movements[:limit]
 
     async def get_account(self, account_id: uuid.UUID) -> Account:
         account = await self.db.get(Account, account_id)
@@ -338,7 +762,13 @@ class AdministracionService:
         return account
 
     async def record_automatic_income(
-        self, filial_id: uuid.UUID, description: str, amount: float, origin_reference: str
+        self,
+        filial_id: uuid.UUID,
+        description: str,
+        amount: float,
+        origin_reference: str,
+        source_type: MovementSourceType | None = None,
+        source_id: uuid.UUID | None = None,
     ) -> IncomeEntry | None:
         """Called by other modules (Servicios, Repuestos, Concesionario) when they
         close something billable. Posts to the filial's first active USD account.
@@ -370,6 +800,8 @@ class AdministracionService:
             amount=amount,
             currency=AccountCurrency.USD,
             account_id=account.id,
+            source_type=source_type,
+            source_id=source_id,
         )
         self.db.add(entry)
         await self.db.commit()
@@ -402,12 +834,117 @@ class AdministracionService:
             entries = [e for e in entries if term in e.description.lower() or (e.origin_reference and term in e.origin_reference.lower())]
         return entries
 
-    async def create_income(self, payload, responsible_user_id: uuid.UUID | None) -> IncomeEntry:
-        entry = IncomeEntry(**payload.model_dump(), registered_by_user_id=responsible_user_id)
+    def _assert_open_period(self, entry_date: date) -> None:
+        """"Open period" = the current calendar month, no future dates — no
+        Período entity, no close/reopen screen; a month is "closed" purely
+        by no longer being the current one."""
+        today = date.today()
+        if entry_date > today:
+            raise FutureEntryDateError()
+        if (entry_date.year, entry_date.month) != (today.year, today.month):
+            raise ClosedPeriodEntryDateError()
+
+    async def _freeze_rate(
+        self, currency: AccountCurrency, entry_date: date, amount: float
+    ) -> tuple[float | None, float, float | None]:
+        """Returns (exchange_rate, amount_usd, amount_bs) using the BCV rate
+        on/before entry_date — frozen at save time, never re-derived from a
+        rate that later moves. Required (blocking) only when the movement's
+        own currency isn't USD; best-effort otherwise."""
+        from app.modules.exchange_rates.service import ExchangeRateService
+
+        rate_row = await ExchangeRateService(self.db).as_of("USD", entry_date)
+        # rate_ves is a Numeric column — SQLAlchemy hands back a real
+        # decimal.Decimal for it on a genuinely fresh row load (every
+        # request in production), which float can't be divided/multiplied
+        # against directly; must cast before doing arithmetic with `amount`.
+        rate = float(rate_row.rate_ves) if rate_row else None
+        if currency == AccountCurrency.USD:
+            amount_bs = amount * rate if rate else None
+            return rate, amount, amount_bs
+        if rate is None:
+            raise ExchangeRateRequiredError()
+        return rate, amount / rate, amount
+
+    async def _require_attachment_if_needed(
+        self, filial_id: uuid.UUID, amount_usd: float, attachment
+    ) -> str | None:
+        settings = await PostVentasService(self.db).get_labor_settings(filial_id)
+        threshold = float(settings.manual_movement_attachment_threshold_usd)
+        if attachment is None or not getattr(attachment, "filename", None):
+            if amount_usd >= threshold:
+                raise AttachmentRequiredError(threshold)
+            return None
+
+        from pathlib import Path
+
+        from app.core.config import get_settings
+        from app.core.storage import save_upload_attachment
+
+        settings_app = get_settings()
+        return await save_upload_attachment(
+            attachment,
+            directory=Path(settings_app.uploads_dir),
+            subdir="manual-movements",
+            url_prefix=f"{settings_app.api_v1_prefix}/uploads",
+            max_mb=settings_app.max_upload_mb,
+        )
+
+    async def create_income(self, payload: IncomeEntryCreate, attachment, responsible_user_id: uuid.UUID | None) -> IncomeEntry:
+        self._assert_open_period(payload.entry_date)
+        await self.get_account(payload.account_id)
+        exchange_rate, amount_usd, amount_bs = await self._freeze_rate(
+            payload.currency, payload.entry_date, payload.amount
+        )
+        attachment_url = await self._require_attachment_if_needed(payload.filial_id, amount_usd, attachment)
+        entry = IncomeEntry(
+            **payload.model_dump(),
+            source=IncomeSource.MANUAL,
+            exchange_rate=exchange_rate,
+            amount_usd=amount_usd,
+            amount_bs=amount_bs,
+            attachment_url=attachment_url,
+            registered_by_user_id=responsible_user_id,
+        )
         self.db.add(entry)
         await self.db.commit()
         await self.db.refresh(entry)
         return entry
+
+    async def reverse_income(self, entry_id: uuid.UUID, user_id: uuid.UUID | None) -> IncomeEntry:
+        original = await self.db.get(IncomeEntry, entry_id)
+        if original is None:
+            raise EntryNotFoundError(str(entry_id))
+        existing = await self.db.execute(
+            select(IncomeEntry).where(IncomeEntry.reverses_entry_id == entry_id)
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise EntryAlreadyReversedError()
+
+        reversal = IncomeEntry(
+            filial_id=original.filial_id,
+            entry_date=date.today(),
+            source=IncomeSource.MANUAL,
+            concept=original.concept,
+            description=f"Reverso de: {original.description}",
+            amount=-original.amount,
+            currency=original.currency,
+            account_id=original.account_id,
+            counterparty_type=original.counterparty_type,
+            counterparty_client_id=original.counterparty_client_id,
+            counterparty_supplier_id=original.counterparty_supplier_id,
+            counterparty_name=original.counterparty_name,
+            reference=original.reference,
+            exchange_rate=original.exchange_rate,
+            amount_usd=-original.amount_usd if original.amount_usd is not None else None,
+            amount_bs=-original.amount_bs if original.amount_bs is not None else None,
+            reverses_entry_id=original.id,
+            registered_by_user_id=user_id,
+        )
+        self.db.add(reversal)
+        await self.db.commit()
+        await self.db.refresh(reversal)
+        return reversal
 
     async def list_expenses(self, filial_id: uuid.UUID, search: str | None = None) -> list[ExpenseEntry]:
         result = await self.db.execute(
@@ -423,12 +960,62 @@ class AdministracionService:
             ]
         return entries
 
-    async def create_expense(self, payload, responsible_user_id: uuid.UUID | None) -> ExpenseEntry:
-        entry = ExpenseEntry(**payload.model_dump(), registered_by_user_id=responsible_user_id)
+    async def create_expense(
+        self, payload: ExpenseEntryCreate, attachment, responsible_user_id: uuid.UUID | None
+    ) -> ExpenseEntry:
+        self._assert_open_period(payload.entry_date)
+        await self.get_account(payload.account_id)
+        exchange_rate, amount_usd, amount_bs = await self._freeze_rate(
+            payload.currency, payload.entry_date, payload.amount
+        )
+        attachment_url = await self._require_attachment_if_needed(payload.filial_id, amount_usd, attachment)
+        entry = ExpenseEntry(
+            **payload.model_dump(),
+            exchange_rate=exchange_rate,
+            amount_usd=amount_usd,
+            amount_bs=amount_bs,
+            attachment_url=attachment_url,
+            registered_by_user_id=responsible_user_id,
+        )
         self.db.add(entry)
         await self.db.commit()
         await self.db.refresh(entry)
         return entry
+
+    async def reverse_expense(self, entry_id: uuid.UUID, user_id: uuid.UUID | None) -> ExpenseEntry:
+        original = await self.db.get(ExpenseEntry, entry_id)
+        if original is None:
+            raise EntryNotFoundError(str(entry_id))
+        existing = await self.db.execute(
+            select(ExpenseEntry).where(ExpenseEntry.reverses_entry_id == entry_id)
+        )
+        if existing.scalar_one_or_none() is not None:
+            raise EntryAlreadyReversedError()
+
+        reversal = ExpenseEntry(
+            filial_id=original.filial_id,
+            entry_date=date.today(),
+            category=original.category,
+            beneficiary=original.beneficiary,
+            description=f"Reverso de: {original.description}",
+            amount=-original.amount,
+            currency=original.currency,
+            account_id=original.account_id,
+            counterparty_type=original.counterparty_type,
+            counterparty_client_id=original.counterparty_client_id,
+            counterparty_supplier_id=original.counterparty_supplier_id,
+            counterparty_name=original.counterparty_name,
+            reference=original.reference,
+            exchange_rate=original.exchange_rate,
+            amount_usd=-original.amount_usd if original.amount_usd is not None else None,
+            amount_bs=-original.amount_bs if original.amount_bs is not None else None,
+            reverses_entry_id=original.id,
+            registered_by_user_id=user_id,
+        )
+        self.db.add(reversal)
+        await self.db.commit()
+        await self.db.refresh(reversal)
+        return reversal
 
     # Reports
 
@@ -494,98 +1081,385 @@ class AdministracionService:
             trend=trend,
         )
 
-    async def get_profitability(
-        self, filial_id: uuid.UUID, date_from: date, date_to: date
-    ) -> ProfitabilityReport:
-        bcv_rate = await self._get_bcv_rate(filial_id)
+    async def _bcv_rate_as_of(self, value_date: date) -> tuple[float, date | None]:
+        """The period's own closing rate — a single, national, date-specific
+        rate (ExchangeRate has no filial_id), unlike the per-filial "current"
+        rate the finance dashboard still uses. This is what makes a holding-
+        wide consolidated report internally consistent."""
+        from app.modules.exchange_rates.service import ExchangeRateService
+
+        rate_row = await ExchangeRateService(self.db).as_of("USD", value_date)
+        if rate_row is None:
+            return 0.0, None
+        return float(rate_row.rate_ves), rate_row.value_date
+
+    def _entry_usd_amount(self, entry: "IncomeEntry | ExpenseEntry", bcv_rate: float) -> float:
+        """Prefer the entry's own frozen amount_usd (populated by the manual-
+        movements flow, at the entry's own date) over re-deriving it with one
+        current/period rate — automatic entries never set amount_usd, so
+        those still fall back to the plain conversion."""
+        if entry.amount_usd is not None:
+            return float(entry.amount_usd)
+        return self._usd_equivalent(float(entry.amount), entry.currency, bcv_rate)
+
+    async def _vehicle_department(
+        self,
+        filial_ids: list[uuid.UUID],
+        date_from: date,
+        date_to: date,
+        condition: "VehicleCondition",
+        key: str,
+        label: str,
+    ) -> tuple[ProfitabilityDepartmentRow, int, int]:
+        result = await self.db.execute(
+            select(VehicleSale, DealershipVehicle)
+            .join(DealershipVehicle, DealershipVehicle.id == VehicleSale.vehicle_id)
+            .where(
+                VehicleSale.filial_id.in_(filial_ids),
+                VehicleSale.created_at >= date_from,
+                VehicleSale.created_at <= date_to,
+                DealershipVehicle.condition == condition,
+            )
+        )
+        pairs = result.all()
+        net_sales = sum(float(sale.final_price) for sale, _ in pairs)
+        direct_cost = sum(float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0 for _, vehicle in pairs)
+        estimated_count = sum(1 for _, vehicle in pairs if vehicle.cost_is_estimated)
+        return _profitability_department_row(key, label, net_sales, direct_cost), len(pairs), estimated_count
+
+    async def _parts_department(
+        self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
+    ) -> ProfitabilityDepartmentRow:
+        # Mostrador only (parts consumed by a service order are folded into
+        # "Taller · mano de obra" instead, matching the shop's actual
+        # one-document-per-order billing). Cancelled sales are excluded from
+        # both sides — the existing cost calc didn't exclude them either,
+        # a real (low-risk) fix bundled in here.
+        result = await self.db.execute(
+            select(PartSaleLine)
+            .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
+            .where(
+                PartSale.filial_id.in_(filial_ids),
+                PartSale.created_at >= date_from,
+                PartSale.created_at <= date_to,
+                PartSale.status != PartSaleStatus.CANCELADO,
+            )
+        )
+        lines = list(result.scalars().all())
+        almacen = AlmacenService(self.db)
+        net_sales = sum(float(line.line_total) for line in lines)
+        direct_cost = 0.0
+        for line in lines:
+            cost = float(line.unit_cost) if line.unit_cost is not None else (await almacen.get_average_cost(line.part_id) or 0.0)
+            direct_cost += line.quantity * cost
+        return _profitability_department_row("repuestos", "Repuestos", net_sales, direct_cost)
+
+    async def _taller_department(
+        self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
+    ) -> ProfitabilityDepartmentRow:
+        # Revenue = the full invoiced total at issuance — accrual, not cash
+        # collected — so a pending receivable still counts in the period it
+        # was actually billed in. ServiceOrderInvoice has no filial_id of its
+        # own; join through ServiceOrder for it.
+        result = await self.db.execute(
+            select(ServiceOrderInvoice)
+            .join(ServiceOrder, ServiceOrder.id == ServiceOrderInvoice.service_order_id)
+            .where(
+                ServiceOrder.filial_id.in_(filial_ids),
+                ServiceOrderInvoice.issued_at >= date_from,
+                ServiceOrderInvoice.issued_at <= date_to,
+            )
+        )
+        invoices = list(result.scalars().all())
+        net_sales = sum(float(invoice.total_usd) for invoice in invoices)
+
+        direct_cost = 0.0
+        if invoices:
+            order_ids = [invoice.service_order_id for invoice in invoices]
+            lines_result = await self.db.execute(
+                select(ServiceOrderTransferLine)
+                .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                .where(
+                    ServiceOrderTransfer.service_order_id.in_(order_ids),
+                    ServiceOrderTransfer.status == TransferStatus.PEDIDO,
+                )
+            )
+            lines = list(lines_result.scalars().all())
+            line_ids = [line.id for line in lines]
+            allocation_cost_by_line: dict[uuid.UUID, float] = {}
+            if line_ids:
+                allocation_result = await self.db.execute(
+                    select(ServiceOrderTransferLotAllocation).where(
+                        ServiceOrderTransferLotAllocation.transfer_line_id.in_(line_ids)
+                    )
+                )
+                for allocation in allocation_result.scalars().all():
+                    allocation_cost_by_line[allocation.transfer_line_id] = allocation_cost_by_line.get(
+                        allocation.transfer_line_id, 0.0
+                    ) + allocation.quantity * float(allocation.unit_cost)
+            for line in lines:
+                line_cost = allocation_cost_by_line.get(line.id, 0.0)
+                # Dispatched before F0-01 (or otherwise never allocated to a
+                # lot) — the line's own recorded cost is the best real number
+                # available; never guess a quantity that isn't there.
+                direct_cost += line_cost if line_cost > 0 else float(line.cost_total)
+
+        return _profitability_department_row("taller_mano_obra", "Taller · mano de obra", net_sales, direct_cost)
+
+    async def _manual_income_department(
+        self,
+        filial_ids: list[uuid.UUID],
+        date_from: date,
+        date_to: date,
+        concept: IncomeConcept,
+        bcv_rate: float,
+        key: str,
+        label: str,
+    ) -> ProfitabilityDepartmentRow:
+        result = await self.db.execute(
+            select(IncomeEntry).where(
+                IncomeEntry.filial_id.in_(filial_ids),
+                IncomeEntry.entry_date >= date_from,
+                IncomeEntry.entry_date <= date_to,
+                IncomeEntry.concept == concept,
+            )
+        )
+        net_sales = sum(self._entry_usd_amount(entry, bcv_rate) for entry in result.scalars().all())
+        return _profitability_department_row(key, label, net_sales, 0.0)
+
+    async def _fx_reexpression_adjustment(
+        self, filial_ids: list[uuid.UUID], date_from: date, date_to: date, closing_rate: float
+    ) -> float:
+        """FX gain/(loss) for the period: re-express every Bs-denominated
+        entry's amount at the period's closing rate and diff it against the
+        USD equivalent frozen at the entry's own date. Only covers entries
+        with a frozen rate — i.e. ones created through the manual-movements
+        form; an automatic Bs-denominated entry (e.g. a Bs payment on an ODS
+        invoice) never freezes a baseline, so it's excluded here (surfaced as
+        a caveat in the UI, not silently wrong)."""
+        if not closing_rate:
+            return 0.0
+
+        def _diff(entry: "IncomeEntry | ExpenseEntry") -> float:
+            reexpressed = float(entry.amount_bs) / closing_rate
+            return reexpressed - float(entry.amount_usd)
 
         income_result = await self.db.execute(
             select(IncomeEntry).where(
-                IncomeEntry.filial_id == filial_id,
+                IncomeEntry.filial_id.in_(filial_ids),
                 IncomeEntry.entry_date >= date_from,
                 IncomeEntry.entry_date <= date_to,
+                IncomeEntry.currency == AccountCurrency.BS,
+                IncomeEntry.amount_usd.is_not(None),
+                IncomeEntry.amount_bs.is_not(None),
             )
         )
-        total_income = sum(
-            self._usd_equivalent(float(e.amount), e.currency, bcv_rate) for e in income_result.scalars().all()
+        expense_result = await self.db.execute(
+            select(ExpenseEntry).where(
+                ExpenseEntry.filial_id.in_(filial_ids),
+                ExpenseEntry.entry_date >= date_from,
+                ExpenseEntry.entry_date <= date_to,
+                ExpenseEntry.currency == AccountCurrency.BS,
+                ExpenseEntry.amount_usd.is_not(None),
+                ExpenseEntry.amount_bs.is_not(None),
+            )
         )
+        income_diff = sum(_diff(e) for e in income_result.scalars().all())
+        expense_diff = sum(_diff(e) for e in expense_result.scalars().all())
+        return income_diff - expense_diff
+
+    async def _compute_profitability(
+        self,
+        filial_ids: list[uuid.UUID],
+        date_from: date,
+        date_to: date,
+        report_filial_id: uuid.UUID | None,
+    ) -> ProfitabilityReport:
+        bcv_rate, bcv_rate_date = await self._bcv_rate_as_of(date_to)
+        today = date.today()
+        period_is_closed = (date_to.year, date_to.month) != (today.year, today.month)
+
+        nuevos_row, nuevos_count, nuevos_estimated = await self._vehicle_department(
+            filial_ids, date_from, date_to, VehicleCondition.NUEVO, "vehiculos_nuevos", "Vehículos nuevos"
+        )
+        usados_row, usados_count, usados_estimated = await self._vehicle_department(
+            filial_ids, date_from, date_to, VehicleCondition.USADO, "vehiculos_usados", "Vehículos usados"
+        )
+        repuestos_row = await self._parts_department(filial_ids, date_from, date_to)
+        taller_row = await self._taller_department(filial_ids, date_from, date_to)
+        garantia_marca_row = await self._manual_income_department(
+            filial_ids, date_from, date_to, IncomeConcept.GARANTIA_MARCA, bcv_rate,
+            "garantia_marca", "Garantía · marca",
+        )
+        fi_row = await self._manual_income_department(
+            filial_ids, date_from, date_to, IncomeConcept.FI_INTERMEDIACION, bcv_rate,
+            "fi_intermediacion", "F&I · intermediación",
+        )
+
+        departments = [nuevos_row, usados_row, repuestos_row, taller_row, garantia_marca_row, fi_row]
+        net_sales_total = sum(d.net_sales for d in departments)
+        direct_cost_total = sum(d.direct_cost for d in departments)
+        gross_profit_total = net_sales_total - direct_cost_total
+        gross_margin = gross_profit_total / net_sales_total if net_sales_total else 0.0
 
         expense_result = await self.db.execute(
             select(ExpenseEntry).where(
-                ExpenseEntry.filial_id == filial_id,
+                ExpenseEntry.filial_id.in_(filial_ids),
                 ExpenseEntry.entry_date >= date_from,
                 ExpenseEntry.entry_date <= date_to,
             )
         )
         expenses = list(expense_result.scalars().all())
         operating_expenses = sum(
-            self._usd_equivalent(float(e.amount), e.currency, bcv_rate)
+            self._entry_usd_amount(e, bcv_rate)
             for e in expenses
             if e.category not in (ExpenseCategory.COMPRAS_PROVEEDORES, ExpenseCategory.NOMINA_COMISIONES)
         )
         commissions_paid = sum(
-            self._usd_equivalent(float(e.amount), e.currency, bcv_rate)
-            for e in expenses
-            if e.category == ExpenseCategory.NOMINA_COMISIONES
+            self._entry_usd_amount(e, bcv_rate) for e in expenses if e.category == ExpenseCategory.NOMINA_COMISIONES
         )
 
-        # Parts cost: uses the cost snapshotted on each line at the moment of
-        # sale. Older sales made before this snapshot existed fall back to
-        # Almacén's current average cost (best guess we have for those).
-        sale_lines_result = await self.db.execute(
-            select(PartSaleLine)
-            .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
-            .where(PartSale.filial_id == filial_id, PartSale.created_at >= date_from, PartSale.created_at <= date_to)
-        )
-        sale_lines = list(sale_lines_result.scalars().all())
-        almacen = AlmacenService(self.db)
-        parts_cost = 0.0
-        for line in sale_lines:
-            if line.unit_cost is not None:
-                cost = float(line.unit_cost)
-            else:
-                cost = await almacen.get_average_cost(line.part_id) or 0.0
-            parts_cost += line.quantity * cost
-
-        # Vehicle cost: sum of each sold vehicle's own cost_price, if set.
-        vehicle_sales_result = await self.db.execute(
-            select(VehicleSale).where(
-                VehicleSale.filial_id == filial_id,
-                VehicleSale.created_at >= date_from,
-                VehicleSale.created_at <= date_to,
-            )
-        )
-        vehicle_sales = list(vehicle_sales_result.scalars().all())
-        vehicles_cost = 0.0
-        for sale in vehicle_sales:
-            vehicle = await self.db.get(DealershipVehicle, sale.vehicle_id)
-            if vehicle is not None and vehicle.cost_price is not None:
-                vehicles_cost += float(vehicle.cost_price)
-
-        # Shrinkage: stock written off as a supplier return/loss, valued at its FIFO cost.
         movements_result = await self.db.execute(
             select(StockMovement).where(
-                StockMovement.filial_id == filial_id,
+                StockMovement.filial_id.in_(filial_ids),
                 StockMovement.movement_type == MovementType.DEVOLUCION,
                 StockMovement.created_at >= date_from,
                 StockMovement.created_at <= date_to,
             )
         )
-        shrinkage_losses = sum(
-            m.quantity * float(m.unit_cost or 0) for m in movements_result.scalars().all()
-        )
+        shrinkage_losses = sum(m.quantity * float(m.unit_cost or 0) for m in movements_result.scalars().all())
 
-        gross_profit = total_income - parts_cost - vehicles_cost
-        net_profit = gross_profit - operating_expenses - commissions_paid - shrinkage_losses
+        fx_adjustment = await self._fx_reexpression_adjustment(filial_ids, date_from, date_to, bcv_rate)
+
+        warranty_cost = 0.0
+        for filial_id in filial_ids:
+            warranty_cost += await self._warranty_cost(filial_id, date_from, date_to)
+
+        adjustments = [
+            ProfitabilityAdjustmentRow(
+                key="gastos_operacionales", label="Gastos operacionales",
+                origin="Egresos clasificados", amount=-operating_expenses,
+            ),
+            ProfitabilityAdjustmentRow(
+                key="comisiones", label="Comisiones",
+                origin="Nómina y comisiones", amount=-commissions_paid,
+            ),
+            ProfitabilityAdjustmentRow(
+                key="mermas_inventario", label="Mermas de inventario",
+                origin="Ajustes de almacén", amount=-shrinkage_losses,
+            ),
+            ProfitabilityAdjustmentRow(
+                key="diferencia_cambio", label="Diferencia en cambio",
+                origin="Reexpresión de saldos", amount=fx_adjustment,
+            ),
+            ProfitabilityAdjustmentRow(
+                key="costo_garantia_taller", label="Costo de garantía (taller)",
+                origin="Retrabajos cubiertos por el taller", amount=-warranty_cost,
+            ),
+        ]
+        net_profit = gross_profit_total + sum(a.amount for a in adjustments)
+        net_margin = net_profit / net_sales_total if net_sales_total else 0.0
+
+        from app.modules.kpis.service import KpiService
+
+        kpi_service = KpiService(self.db)
+        manual_count = 0
+        manual_total = 0
+        for filial_id in filial_ids:
+            rate = await kpi_service.get_manual_movements_rate(filial_id, date_from, date_to)
+            manual_count += rate.manual_count
+            manual_total += rate.total_count
+        manual_movements_rate = manual_count / manual_total if manual_total else 0.0
 
         return ProfitabilityReport(
             period_label=f"{date_from.isoformat()} – {date_to.isoformat()}",
-            total_income=total_income,
-            parts_cost=parts_cost,
-            vehicles_cost=vehicles_cost,
-            gross_profit=gross_profit,
-            operating_expenses=operating_expenses,
-            commissions_paid=commissions_paid,
-            shrinkage_losses=shrinkage_losses,
+            filial_id=report_filial_id,
+            date_from=date_from,
+            date_to=date_to,
+            bcv_rate=bcv_rate,
+            bcv_rate_date=bcv_rate_date,
+            period_is_closed=period_is_closed,
+            departments=departments,
+            net_sales_total=net_sales_total,
+            direct_cost_total=direct_cost_total,
+            gross_profit_total=gross_profit_total,
+            gross_margin=gross_margin,
+            adjustments=adjustments,
             net_profit=net_profit,
+            net_margin=net_margin,
+            vehicles_sold_count=nuevos_count + usados_count,
+            vehicles_with_estimated_cost_count=nuevos_estimated + usados_estimated,
+            manual_movements_rate=manual_movements_rate,
+            manual_movements_count=manual_count,
+            manual_movements_total_count=manual_total,
         )
+
+    async def get_profitability(
+        self, filial_id: uuid.UUID, date_from: date, date_to: date
+    ) -> ProfitabilityReport:
+        return await self._compute_profitability([filial_id], date_from, date_to, filial_id)
+
+    async def get_profitability_for_holding(
+        self, holding_id: uuid.UUID, date_from: date, date_to: date
+    ) -> ProfitabilityReport:
+        result = await self.db.execute(select(Filial.id).where(Filial.holding_id == holding_id))
+        filial_ids = list(result.scalars().all())
+        return await self._compute_profitability(filial_ids, date_from, date_to, None)
+
+    async def _warranty_cost(self, filial_id: uuid.UUID, date_from: date, date_to: date) -> float:
+        """What rework claims actually cost the workshop: the real FIFO cost
+        of parts consumed (traced via ServiceOrderTransferLotAllocation —
+        F0-01) plus the labor of the flagged service, at the current hourly
+        rate. Free to the client, but not to the shop — parts leave
+        inventory and the technician's hours are paid regardless."""
+        claims_result = await self.db.execute(
+            select(ReworkClaim).where(
+                ReworkClaim.filial_id == filial_id,
+                ReworkClaim.claimed_at >= date_from,
+                ReworkClaim.claimed_at <= date_to,
+            )
+        )
+        claims = list(claims_result.scalars().all())
+        if not claims:
+            return 0.0
+
+        settings = await PostVentasService(self.db).get_labor_settings(filial_id)
+        hourly_rate = float(settings.hourly_rate)
+
+        total = 0.0
+        for claim in claims:
+            if claim.part_id is not None:
+                line_result = await self.db.execute(
+                    select(ServiceOrderTransferLine)
+                    .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                    .where(
+                        ServiceOrderTransfer.service_order_id == claim.service_order_id,
+                        ServiceOrderTransferLine.part_id == claim.part_id,
+                    )
+                )
+                lines = list(line_result.scalars().all())
+                line_ids = [line.id for line in lines]
+                allocation_cost = 0.0
+                if line_ids:
+                    allocation_result = await self.db.execute(
+                        select(ServiceOrderTransferLotAllocation).where(
+                            ServiceOrderTransferLotAllocation.transfer_line_id.in_(line_ids)
+                        )
+                    )
+                    allocation_cost = sum(
+                        a.quantity * float(a.unit_cost) for a in allocation_result.scalars().all()
+                    )
+                if allocation_cost > 0:
+                    total += allocation_cost
+                else:
+                    # Dispatched before F0-01 (or otherwise never allocated to a
+                    # lot) — the line's own recorded cost is the best real
+                    # number available; never guess a quantity that isn't there.
+                    total += sum(float(line.cost_total) for line in lines)
+
+            if claim.tempario_id is not None:
+                tempario = await self.db.get(Tempario, claim.tempario_id)
+                if tempario is not None:
+                    total += float(tempario.estimated_hours) * hourly_rate
+
+        return total

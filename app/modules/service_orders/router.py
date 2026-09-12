@@ -7,26 +7,41 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.post_ventas.schemas import VehicleWarrantyRead
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
-from app.modules.service_orders.billing_schemas import BillingInput, InvoiceCreate
+from app.modules.service_orders.billing_schemas import (
+    BillingInput,
+    CollectInvoicePaymentInput,
+    InvoiceCreate,
+    ReceivableRead,
+)
 from app.modules.service_orders.enums import ServiceOrderStatus
 from app.modules.service_orders.schemas import (
     BayCreate,
     BayRead,
     BayUpdate,
     OrderSummary,
+    ReworkClaimAuthorizationInput,
+    ReworkClaimCloseInput,
+    ReworkClaimCreate,
+    ReworkClaimRead,
+    ServiceOrderCloseInput,
     ServiceOrderCreate,
     ServiceOrderRead,
     ServiceOrderUpdate,
     TaskCreate,
+    TaskPayerUpdate,
     TaskRead,
     TaskStatusUpdate,
     TransferLineInput,
+    TransferLinePayerUpdate,
     TransferRead,
     UpsellCreate,
     UpsellRead,
     UpsellStatusUpdate,
+    WarrantyClaimCreate,
+    WarrantyClaimRead,
 )
 from app.modules.service_orders.service import (
     ACTIVE_STATUSES,
@@ -182,6 +197,7 @@ async def list_tasks(
             name_snapshot=t.name_snapshot,
             hours_snapshot=float(t.hours_snapshot),
             status=t.status,
+            payer=t.payer,
             created_at=t.created_at,
         )
         for t in tasks
@@ -199,7 +215,7 @@ async def add_task(
     (the tempario's linked parts may have just been added to a pending ODT)."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    await service.add_task(order_id, payload.tempario_id)
+    await service.add_task(order_id, payload.tempario_id, payer=payload.payer)
     return await service.get_order_summary(order_id)
 
 
@@ -220,8 +236,23 @@ async def update_task_status(
         name_snapshot=task.name_snapshot,
         hours_snapshot=float(task.hours_snapshot),
         status=task.status,
+        payer=task.payer,
         created_at=task.created_at,
     )
+
+
+@router.patch("/service-orders/{order_id}/tasks/{task_id}/payer")
+async def update_task_payer(
+    order_id: uuid.UUID,
+    task_id: uuid.UUID,
+    payload: TaskPayerUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> OrderSummary:
+    filial_id = await service.get_task_filial(task_id)
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    await service.update_task_payer(task_id, payload.payer)
+    return await service.get_order_summary(order_id)
 
 
 @router.delete("/service-order-tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -246,7 +277,21 @@ async def add_transfer_line(
     returns the refreshed summary."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    await service.add_transfer_line(order_id, payload.part_id, payload.quantity)
+    await service.add_transfer_line(order_id, payload.part_id, payload.quantity, payer=payload.payer)
+    return await service.get_order_summary(order_id)
+
+
+@router.patch("/service-orders/{order_id}/transfers/lines/{line_id}/payer")
+async def update_transfer_line_payer(
+    order_id: uuid.UUID,
+    line_id: uuid.UUID,
+    payload: TransferLinePayerUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> OrderSummary:
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    await service.update_transfer_line_payer(line_id, payload.payer)
     return await service.get_order_summary(order_id)
 
 
@@ -271,6 +316,7 @@ async def mark_transfer_ordered(
                 "quantity": line.quantity,
                 "unit_price": float(line.unit_price),
                 "subtotal": float(line.line_total),
+                "payer": line.payer,
             }
             for line in transfer.lines
         ],
@@ -454,12 +500,149 @@ async def invoice_document(
     return {"filename": f"{invoice.code}.html", "html": render_invoice(invoice.document)}
 
 
+# Cuentas por cobrar — top-level paths (not nested under /service-orders/{order_id})
+# since a receivable belongs to an invoice, not to a single order lookup.
+
+
+@router.get("/receivables", response_model=list[ReceivableRead])
+async def list_receivables(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> list[ReceivableRead]:
+    from app.modules.service_orders.billing import BillingService
+
+    await _ensure_access(current_user, filial_id, service.db)
+    return await BillingService(service.db).list_receivables(filial_id)
+
+
+@router.post("/receivables/{invoice_id}/collect", response_model=ReceivableRead)
+async def collect_receivable(
+    invoice_id: uuid.UUID,
+    payload: CollectInvoicePaymentInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ReceivableRead:
+    from app.modules.service_orders.billing import BillingService
+
+    billing = BillingService(service.db)
+    invoice = await billing.get_invoice_by_id(invoice_id)
+    order = await service.get_order(invoice.service_order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await billing.collect_invoice(invoice_id, payload, current_user.user_id)
+
+
+# Rework claims (garantía de taller) — feeds the Torre de Control rework-rate metric.
+
+
+@router.post(
+    "/service-orders/{order_id}/rework-claims",
+    response_model=ReworkClaimRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_rework_claim(
+    order_id: uuid.UUID,
+    payload: ReworkClaimCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ReworkClaimRead:
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_rework_claim(order_id, payload, current_user.user_id)
+
+
+@router.get("/service-orders/{order_id}/rework-claims", response_model=list[ReworkClaimRead])
+async def list_rework_claims(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> list[ReworkClaimRead]:
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    return await service.list_rework_claims(order_id)
+
+
+@router.post(
+    "/service-orders/{order_id}/rework-claims/{claim_id}/close",
+    response_model=ReworkClaimRead,
+)
+async def close_rework_claim(
+    order_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    payload: ReworkClaimCloseInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ReworkClaimRead:
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.close_rework_claim(claim_id, payload, current_user.user_id)
+
+
+@router.post(
+    "/service-orders/{order_id}/rework-claims/{claim_id}/authorize",
+    response_model=ReworkClaimRead,
+)
+async def authorize_rework_claim(
+    order_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    payload: ReworkClaimAuthorizationInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ReworkClaimRead:
+    # Deliberately gated by the "administracion" module (jefe de
+    # taller/gerente territory — reclamos are already its stated job, see
+    # seed_roles.py), NOT "asesor-servicios" like the sibling endpoints
+    # above — an asesor can create and close a claim, but cannot approve
+    # or reject its own warranty request.
+    order = await service.get_order(order_id)
+    await ensure_module_access(service.db, current_user, order.filial_id, "administracion", AccessLevel.EDITAR)
+    return await service.authorize_rework_claim(claim_id, payload, current_user.user_id)
+
+
 @router.post("/service-orders/{order_id}/close", response_model=ServiceOrderRead)
 async def close_service_order(
     order_id: uuid.UUID,
+    payload: ServiceOrderCloseInput = ServiceOrderCloseInput(),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ):
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.close_order(order_id)
+    return await service.close_order(
+        order_id, payload.next_maintenance_due_at, payload.next_maintenance_tempario_id
+    )
+
+
+@router.get("/warranty-claims", response_model=list[WarrantyClaimRead])
+async def list_warranty_claims(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> list[WarrantyClaimRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_warranty_claims(filial_id)
+
+
+@router.get(
+    "/warranty-claims/vehicles/{vehicle_id}/warranties",
+    response_model=list[VehicleWarrantyRead],
+)
+async def get_vehicle_warranties_for_claim(
+    vehicle_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> list[VehicleWarrantyRead]:
+    filial_id, warranties = await service.get_vehicle_warranties_for_claim(vehicle_id)
+    await _ensure_access(current_user, filial_id, service.db)
+    return warranties
+
+
+@router.post("/warranty-claims", response_model=WarrantyClaimRead, status_code=status.HTTP_201_CREATED)
+async def create_warranty_claim(
+    payload: WarrantyClaimCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> WarrantyClaimRead:
+    filial_id, _ = await service.get_vehicle_warranties_for_claim(payload.vehicle_id)
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_warranty_claim(payload, current_user.user_id)

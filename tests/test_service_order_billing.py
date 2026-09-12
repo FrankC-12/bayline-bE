@@ -102,7 +102,9 @@ async def test_mismatch_stale_quote_and_duplicate_are_atomic(ready):
     await prepare(ready)
     _, session, order, _, _, billing, accounts, settings = ready
     payload = await invoice_payload(billing, order, accounts)
-    bad = payload.model_copy(update={"paid_usd": Decimal("1")})
+    # Underpayment is allowed now (it creates a receivable) — only
+    # overpayment is still rejected as a mismatch.
+    bad = payload.model_copy(update={"paid_usd": payload.paid_usd + Decimal("1")})
     with pytest.raises(BadRequestError):
         await billing.issue(order.id, bad, None)
     assert order.invoiced_at is None

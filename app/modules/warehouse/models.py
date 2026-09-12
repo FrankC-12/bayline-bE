@@ -45,6 +45,12 @@ class PartLot(Base):
     unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, default=0)
     location: Mapped[str | None] = mapped_column(String(30), nullable=True)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which purchase this lot was received against, if any — lets a claim
+    # trace part -> lot -> purchase order -> supplier automatically. Null for
+    # a lot received without a PO (a manual/direct stock-in).
+    purchase_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("purchase_requests.id", ondelete="SET NULL"), nullable=True
+    )
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     @property

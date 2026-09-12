@@ -20,14 +20,15 @@ from app.core.database import Base
 from app.core.exceptions import BadRequestError
 from app.modules.parts.enums import PartSaleStatus
 from app.modules.parts.exceptions import DispatchQuantityMismatchError, DispatchQuantityRequiredError
-from app.modules.parts.models import Part, PartSale, PartSaleLine
+from app.modules.parts.models import Part, PartSale, PartSaleLine, PartWarranty
 from app.modules.parts.schemas import (
     PartSaleCreate,
     PartSaleLineDispatch,
     PartSaleQuoteRead,
     PartSaleRead,
 )
-from app.modules.parts.service import PartsService
+from app.modules.parts.service import DEFAULT_PART_WARRANTY_DAYS, PartsService
+from app.modules.post_ventas.models import LaborSettings
 from app.modules.warehouse.exceptions import InsufficientStockError
 from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
 
@@ -41,11 +42,14 @@ class AsyncAdapter:
     async def execute(self, query):
         return self.session.execute(query)
 
-    async def get(self, model, key):
-        return self.session.get(model, key)
+    async def get(self, model, key, **kwargs):
+        return self.session.get(model, key, **kwargs)
 
     def add(self, value):
         self.session.add(value)
+
+    async def delete(self, value):
+        self.session.delete(value)
 
     async def flush(self):
         self.session.flush()
@@ -306,3 +310,74 @@ async def test_pedido_to_completado_still_works(inventory):
     completed = await service.update_sale_status(sale.id, PartSaleStatus.COMPLETADO)
 
     assert completed.status == PartSaleStatus.COMPLETADO
+
+
+@pytest.mark.asyncio
+async def test_completado_creates_counter_warranty_with_default_days(inventory):
+    service, session, data, _lots, _other = inventory
+    sale = await service.create_sale(PartSaleCreate(**data))
+    line = sale.lines[0]
+    await service.update_sale_status(
+        sale.id,
+        PartSaleStatus.PEDIDO,
+        [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity)],
+    )
+
+    completed = await service.update_sale_status(sale.id, PartSaleStatus.COMPLETADO)
+
+    warranties = session.scalars(
+        select(PartWarranty).where(PartWarranty.part_sale_line_id == completed.lines[0].id)
+    ).all()
+    assert len(warranties) == 1
+    warranty = warranties[0]
+    assert warranty.warranty_days == DEFAULT_PART_WARRANTY_DAYS
+    assert warranty.quantity == line.quantity
+    assert warranty.lot_id == line.allocations[0].lot_id
+    assert warranty.expires_at - warranty.starts_at == timedelta(days=DEFAULT_PART_WARRANTY_DAYS)
+    assert warranty.is_active
+
+
+@pytest.mark.asyncio
+async def test_completado_creates_one_warranty_per_lot_allocation(inventory):
+    service, session, data, _lots, _other = inventory
+    data["lines"][0]["quantity"] = 15  # Spans two lots: 10 @ $10 + 5 @ $20.
+    sale = await service.create_sale(PartSaleCreate(**data))
+    line = sale.lines[0]
+    await service.update_sale_status(
+        sale.id,
+        PartSaleStatus.PEDIDO,
+        [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity)],
+    )
+
+    completed = await service.update_sale_status(sale.id, PartSaleStatus.COMPLETADO)
+
+    warranties = session.scalars(
+        select(PartWarranty).where(PartWarranty.part_sale_line_id == completed.lines[0].id)
+    ).all()
+    assert len(warranties) == 2
+    assert {w.lot_id for w in warranties} == {a.lot_id for a in line.allocations}
+    assert sum(w.quantity for w in warranties) == 15
+
+
+@pytest.mark.asyncio
+async def test_completado_uses_configured_warranty_days(inventory):
+    service, session, data, _lots, _other = inventory
+    filial_id = data["filial_id"]
+    session.add(LaborSettings(filial_id=filial_id, part_warranty_days=30))
+    session.commit()
+
+    sale = await service.create_sale(PartSaleCreate(**data))
+    line = sale.lines[0]
+    await service.update_sale_status(
+        sale.id,
+        PartSaleStatus.PEDIDO,
+        [PartSaleLineDispatch(line_id=line.id, dispatched_quantity=line.quantity)],
+    )
+
+    completed = await service.update_sale_status(sale.id, PartSaleStatus.COMPLETADO)
+
+    warranty = session.scalars(
+        select(PartWarranty).where(PartWarranty.part_sale_line_id == completed.lines[0].id)
+    ).one()
+    assert warranty.warranty_days == 30
+    assert warranty.expires_at - warranty.starts_at == timedelta(days=30)

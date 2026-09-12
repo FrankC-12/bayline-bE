@@ -21,7 +21,7 @@ class SameWarehouseError(BadRequestError):
 class InsufficientStockError(BadRequestError):
     def __init__(self, available: int, requested: int) -> None:
         super().__init__(
-            f"Only {available} units available at the origin warehouse, requested {requested}.",
+            f"Solo hay {available} unidades disponibles en el almacén de origen, se pidieron {requested}.",
             error_code="insufficient_stock",
         )
 

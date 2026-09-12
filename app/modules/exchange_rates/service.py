@@ -69,6 +69,18 @@ class ExchangeRateService:
             latest.setdefault(row.currency, row)
         return list(latest.values())
 
+    async def as_of(self, currency: str, value_date: date) -> ExchangeRate | None:
+        """The last known rate on or before value_date — used to freeze the
+        rate a manual movement is priced at, instead of always reading
+        "today's" rate regardless of which date the movement is dated."""
+        result = await self.db.execute(
+            select(ExchangeRate)
+            .where(ExchangeRate.currency == currency, ExchangeRate.value_date <= value_date)
+            .order_by(ExchangeRate.value_date.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def refresh(self) -> list[ExchangeRate]:
         document = await asyncio.to_thread(_download_bcv_html)
         value_date, rates = parse_bcv_html(document)

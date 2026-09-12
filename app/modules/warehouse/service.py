@@ -129,6 +129,7 @@ class AlmacenService:
             unit_cost=line.unit_cost,
             location=line.location,
             note=note,
+            purchase_request_id=line.purchase_request_id,
         )
         self.db.add(lot)
 

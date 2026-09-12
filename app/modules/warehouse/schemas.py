@@ -31,6 +31,7 @@ class LotLineInput(BaseModel):
     quantity: int = Field(ge=1)
     unit_cost: float = Field(ge=0)
     location: str | None = None
+    purchase_request_id: uuid.UUID | None = None
 
 
 class StockInCreate(BaseModel):

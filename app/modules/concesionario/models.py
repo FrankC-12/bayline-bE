@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -49,6 +49,11 @@ class DealershipVehicle(Base):
     price_cash: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     price_financed: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     cost_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Whether cost_price is an actual acquisition cost or a stand-in guess —
+    # there's no purchase-record subsystem behind vehicle cost yet, so this
+    # is the cheapest honest signal for "trust this margin or not" on the
+    # Rentabilidad screen's vehicle departments.
+    cost_is_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     price_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     iva_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=16)
     igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=3)

@@ -28,6 +28,7 @@ class VehicleCreate(BaseModel):
     price_cash: float = Field(ge=0)
     price_financed: float = Field(ge=0)
     cost_price: float = Field(gt=0)
+    cost_is_estimated: bool = False
     price_currency: str = Field(default="USD", pattern="^(USD|VES)$")
     iva_percentage: float = Field(default=16, ge=0, le=100)
     igtf_percentage: float = Field(default=3, ge=0, le=100)
@@ -56,6 +57,7 @@ class VehicleUpdate(BaseModel):
     price_cash: float | None = Field(default=None, ge=0)
     price_financed: float | None = Field(default=None, ge=0)
     cost_price: float | None = Field(default=None, ge=0)
+    cost_is_estimated: bool | None = None
     price_currency: str | None = Field(default=None, pattern="^(USD|VES)$")
     iva_percentage: float | None = Field(default=None, ge=0, le=100)
     igtf_percentage: float | None = Field(default=None, ge=0, le=100)
@@ -85,6 +87,7 @@ class VehicleRead(BaseModel):
     price_cash: float
     price_financed: float
     cost_price: float | None
+    cost_is_estimated: bool
     price_currency: str
     iva_percentage: float
     igtf_percentage: float

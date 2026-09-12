@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
@@ -116,6 +116,9 @@ class PartSaleLine(Base):
     allocations: Mapped[list["PartSaleLotAllocation"]] = relationship(
         cascade="all, delete-orphan", lazy="selectin"
     )
+    warranties: Mapped[list["PartWarranty"]] = relationship(
+        cascade="all, delete-orphan", lazy="selectin"
+    )
 
     sale: Mapped["PartSale"] = relationship(back_populates="lines")
 
@@ -166,3 +169,48 @@ class PartSaleLotAllocation(Base):
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+
+
+class PartWarranty(Base):
+    """Warranty on a part sold at the counter and picked up without a
+    workshop install — covers the part only, never labor. Created per lot
+    allocation (not per sale line) so the exact lot survives even when a
+    line's quantity was pulled from more than one lot, keeping the supplier
+    trail intact for a claim."""
+
+    __tablename__ = "part_warranties"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filial_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    part_sale_line_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_sale_lines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    part_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
+    )
+    lot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_lots.id", ondelete="RESTRICT"), nullable=False
+    )
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    warranty_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    lot: Mapped["PartLot"] = relationship(lazy="selectin")
+
+    @property
+    def lot_code(self) -> str:
+        return self.lot.code
+
+    @property
+    def is_active(self) -> bool:
+        # SQLite (used in tests) drops tzinfo on read-back even for a
+        # timezone-aware column; Postgres never does. Treat a naive value as
+        # UTC, matching how it was written.
+        expires_at = self.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) <= expires_at

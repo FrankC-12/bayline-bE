@@ -9,7 +9,7 @@ from app.modules.roles.models import Role, RoleModulePermission
 ALL_MODULES = [
     "asesor-servicios", "tecnico-servicio", "administracion", "usuarios-accesos",
     "post-ventas", "kpis", "clientes-vehiculos", "repuestos", "almacen",
-    "concesionario", "ventas", "ajustes",
+    "concesionario", "ventas", "ajustes", "movimientos-manuales",
 ]
 
 ROLES_SEED = [

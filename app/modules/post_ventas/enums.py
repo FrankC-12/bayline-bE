@@ -1,6 +1,16 @@
 import enum
 
 
+class VehicleWarrantySource(str, enum.Enum):
+    VENTA = "venta"
+    MANUAL = "manual"
+
+
+class WorkshopWarrantyCoverage(str, enum.Enum):
+    MANO_DE_OBRA = "mano_de_obra"
+    REPUESTO = "repuesto"
+
+
 class TemparioCategory(str, enum.Enum):
     MANTENIMIENTO_PREVENTIVO = "mantenimiento_preventivo"
     FRENOS = "frenos"

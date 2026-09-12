@@ -11,4 +11,8 @@ MODULE_CATALOG: list[str] = [
     "concesionario",
     "ventas",
     "ajustes",
+    # Manual Ingresos/Egresos movements — deliberately separate from
+    # "administracion" so general Finanzas access doesn't imply it; granted
+    # per-user via a permission override, not seeded to any role by default.
+    "movimientos-manuales",
 ]

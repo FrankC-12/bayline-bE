@@ -97,6 +97,20 @@ class PartSaleQuoteInput(BaseModel):
     lines: list[PartSaleLineInput] = Field(min_length=1)
 
 
+class PartWarrantyRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    part_id: uuid.UUID
+    lot_id: uuid.UUID
+    lot_code: str
+    quantity: int
+    warranty_days: int
+    starts_at: datetime
+    expires_at: datetime
+    is_active: bool
+
+
 class PartSaleLineRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -109,6 +123,7 @@ class PartSaleLineRead(BaseModel):
     line_total: float
     dispatched_quantity: int | None
     allocations: list[PartSaleAllocationRead]
+    warranties: list[PartWarrantyRead]
 
 
 class PartSaleLineDispatch(BaseModel):

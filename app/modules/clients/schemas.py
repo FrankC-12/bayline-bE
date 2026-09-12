@@ -10,6 +10,7 @@ from app.modules.clients.enums import (
     ContactPreference,
     DocumentType,
     FuelType,
+    MaintenancePlanEntryStatus,
     TransmissionType,
 )
 
@@ -75,6 +76,39 @@ class VehicleRead(BaseModel):
     current_mileage_visit_date: date | None = None
     current_mileage_service_order_id: uuid.UUID | None = None
     current_mileage_service_order_code: str | None = None
+    next_maintenance_due_at: date | None = None
+    next_maintenance_tempario_id: uuid.UUID | None = None
+    next_maintenance_tempario_code: str | None = None
+    next_maintenance_tempario_name: str | None = None
+    maintenance_plan_id: uuid.UUID | None = None
+    maintenance_plan_brand: str | None = None
+    maintenance_plan_name: str | None = None
+
+
+class VehicleMaintenancePlanAssign(BaseModel):
+    plan_id: uuid.UUID | None = None
+
+
+class VehiclePlanEntryStatusRead(BaseModel):
+    entry_id: uuid.UUID
+    tempario_id: uuid.UUID
+    tempario_code: str
+    tempario_name: str
+    interval_km: int | None
+    interval_months: int | None
+    status: MaintenancePlanEntryStatus
+    completed_at: datetime | None = None
+    completed_service_order_code: str | None = None
+
+
+class VehiclePlanStatusRead(BaseModel):
+    vehicle_id: uuid.UUID
+    plan_id: uuid.UUID | None
+    plan_brand: str | None
+    plan_name: str | None
+    current_mileage: int | None
+    reference_date: date | None
+    entries: list[VehiclePlanEntryStatusRead]
 
 
 class ClientBase(BaseModel):
@@ -88,6 +122,7 @@ class ClientBase(BaseModel):
     contact_preference: ContactPreference | None = None
     address: str = Field(min_length=3, max_length=255)
     address_type: AddressType | None = None
+    is_holding_billing: bool = False
 
     @field_validator("document_number")
     @classmethod
@@ -132,6 +167,7 @@ class ClientUpdate(BaseModel):
     contact_preference: ContactPreference | None = None
     address: str | None = Field(default=None, min_length=3, max_length=255)
     address_type: AddressType | None = None
+    is_holding_billing: bool | None = None
     vehicles: list[VehicleInput] | None = None
 
     @field_validator("document_number")
@@ -180,6 +216,7 @@ class ClientRead(BaseModel):
     contact_preference: ContactPreference | None
     address: str
     address_type: AddressType | None
+    is_holding_billing: bool
     vehicles: list[VehicleRead]
     created_at: datetime
     updated_at: datetime

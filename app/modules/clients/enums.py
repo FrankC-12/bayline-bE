@@ -36,3 +36,14 @@ class FuelType(str, enum.Enum):
 class TransmissionType(str, enum.Enum):
     MANUAL = "manual"
     AUTOMATICA = "automatica"
+
+
+class MaintenancePlanEntryStatus(str, enum.Enum):
+    """A plan entry's status for one specific vehicle — always computed live
+    from the vehicle's current mileage/age and its Service Order history,
+    never stored, so it can't drift out of sync."""
+
+    PENDIENTE = "pendiente"
+    VENCIDO = "vencido"
+    CUMPLIDO = "cumplido"
+    OMITIDO = "omitido"

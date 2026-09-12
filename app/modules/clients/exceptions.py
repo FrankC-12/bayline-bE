@@ -8,6 +8,13 @@ class ClientNotFoundError(NotFoundError):
         super().__init__(f"Client '{client_id}' was not found.", error_code="client_not_found")
 
 
+class VehicleNotFoundError(NotFoundError):
+    """Raised when a vehicle does not exist."""
+
+    def __init__(self, vehicle_id: str) -> None:
+        super().__init__(f"Vehicle '{vehicle_id}' was not found.", error_code="vehicle_not_found")
+
+
 class DocumentAlreadyExistsError(ConflictError):
     """Raised when a document number is already registered within the same filial."""
 

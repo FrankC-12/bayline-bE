@@ -1,13 +1,35 @@
+import calendar
 import uuid
+from datetime import date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.modules.clients.exceptions import ClientNotFoundError, DocumentAlreadyExistsError
+from app.core.exceptions import BadRequestError
+from app.modules.clients.enums import MaintenancePlanEntryStatus
+from app.modules.clients.exceptions import (
+    ClientNotFoundError,
+    DocumentAlreadyExistsError,
+    VehicleNotFoundError,
+)
 from app.modules.clients.models import Client, Vehicle
-from app.modules.clients.schemas import ClientCreate, ClientUpdate, VehicleInput
+from app.modules.clients.schemas import (
+    ClientCreate,
+    ClientUpdate,
+    VehicleInput,
+    VehiclePlanEntryStatusRead,
+    VehiclePlanStatusRead,
+)
 from app.modules.inspections.models import PreliminaryInspection
+
+
+def _add_months(base: date, months: int) -> date:
+    total = base.month - 1 + months
+    year = base.year + total // 12
+    month = total % 12 + 1
+    day = min(base.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
 
 
 class ClientService:
@@ -39,6 +61,7 @@ class ClientService:
                 )
             ]
         await self._attach_current_mileage(clients)
+        await self._attach_next_maintenance_plan(clients)
         return clients
 
     async def get_client(self, client_id: uuid.UUID) -> Client:
@@ -48,6 +71,7 @@ class ClientService:
         if client is None:
             raise ClientNotFoundError(str(client_id))
         await self._attach_current_mileage([client])
+        await self._attach_next_maintenance_plan([client])
         return client
 
     async def _attach_current_mileage(self, clients: list[Client]) -> None:
@@ -93,6 +117,46 @@ class ClientService:
                     f"ODS-{sequence_number}" if sequence_number is not None else None
                 )
 
+    async def _attach_next_maintenance_plan(self, clients: list[Client]) -> None:
+        """Denormalizes the advisor-suggested next-visit tempario (set at ODS
+        close time, see ServiceOrderService.close_order) and the assigned
+        MaintenancePlan's brand/name onto each Vehicle as plain attributes —
+        lets the frontend show both without a second round trip per vehicle."""
+        from app.modules.post_ventas.models import MaintenancePlan, Tempario
+
+        tempario_ids = {
+            v.next_maintenance_tempario_id
+            for c in clients
+            for v in c.vehicles
+            if v.next_maintenance_tempario_id is not None
+        }
+        temparios_by_id: dict[uuid.UUID, Tempario] = {}
+        if tempario_ids:
+            rows = await self.db.execute(select(Tempario).where(Tempario.id.in_(tempario_ids)))
+            temparios_by_id = {t.id: t for t in rows.scalars()}
+
+        plan_ids = {
+            v.maintenance_plan_id
+            for c in clients
+            for v in c.vehicles
+            if v.maintenance_plan_id is not None
+        }
+        plans_by_id: dict[uuid.UUID, MaintenancePlan] = {}
+        if plan_ids:
+            rows = await self.db.execute(
+                select(MaintenancePlan).where(MaintenancePlan.id.in_(plan_ids))
+            )
+            plans_by_id = {p.id: p for p in rows.scalars()}
+
+        for client in clients:
+            for vehicle in client.vehicles:
+                tempario = temparios_by_id.get(vehicle.next_maintenance_tempario_id)
+                vehicle.next_maintenance_tempario_code = tempario.code if tempario else None
+                vehicle.next_maintenance_tempario_name = tempario.name if tempario else None
+                plan = plans_by_id.get(vehicle.maintenance_plan_id)
+                vehicle.maintenance_plan_brand = plan.brand if plan else None
+                vehicle.maintenance_plan_name = plan.name if plan else None
+
     async def _latest_mileage_inspections(
         self, vehicle_ids: list[uuid.UUID]
     ) -> dict[uuid.UUID, PreliminaryInspection]:
@@ -112,6 +176,11 @@ class ClientService:
             latest.setdefault(inspection.vehicle_id, inspection)
         return latest
 
+    async def get_current_mileage(self, vehicle_id: uuid.UUID) -> int | None:
+        latest = await self._latest_mileage_inspections([vehicle_id])
+        inspection = latest.get(vehicle_id)
+        return inspection.mileage if inspection else None
+
     async def create_client(self, payload: ClientCreate) -> Client:
         await self._ensure_document_is_available(payload.filial_id, payload.document_number)
 
@@ -127,6 +196,7 @@ class ClientService:
             contact_preference=payload.contact_preference,
             address=payload.address,
             address_type=payload.address_type,
+            is_holding_billing=payload.is_holding_billing,
         )
         self.db.add(client)
         await self.db.flush()
@@ -154,6 +224,7 @@ class ClientService:
             "contact_preference",
             "address",
             "address_type",
+            "is_holding_billing",
         ):
             value = getattr(payload, field)
             if value is not None:
@@ -223,3 +294,143 @@ class ClientService:
         )
         if result.scalar_one_or_none() is not None:
             raise DocumentAlreadyExistsError(document_number)
+
+    # Vehicle maintenance plan
+
+    async def get_vehicle(self, vehicle_id: uuid.UUID) -> Vehicle:
+        vehicle = await self.db.get(Vehicle, vehicle_id)
+        if vehicle is None:
+            raise VehicleNotFoundError(str(vehicle_id))
+        return vehicle
+
+    async def assign_maintenance_plan(
+        self, vehicle_id: uuid.UUID, plan_id: uuid.UUID | None
+    ) -> VehiclePlanStatusRead:
+        vehicle = await self.get_vehicle(vehicle_id)
+
+        if plan_id is not None:
+            from app.modules.post_ventas.models import MaintenancePlan
+
+            client = await self.db.get(Client, vehicle.client_id)
+            plan = await self.db.get(MaintenancePlan, plan_id)
+            if plan is None or client is None or plan.filial_id != client.filial_id:
+                raise BadRequestError("El plan no pertenece a la filial de este vehículo.")
+
+        vehicle.maintenance_plan_id = plan_id
+        await self.db.commit()
+        return await self.get_vehicle_plan_status(vehicle_id)
+
+    async def get_vehicle_plan_status(self, vehicle_id: uuid.UUID) -> VehiclePlanStatusRead:
+        """Computes each plan entry's status live — never stored — from the
+        vehicle's current mileage/age and its Service Order history, so it
+        can never drift out of sync with reality."""
+        from app.modules.post_ventas.models import MaintenancePlan, MaintenancePlanEntry
+        from app.modules.service_orders.enums import TaskStatus
+        from app.modules.service_orders.models import ServiceOrder, ServiceOrderTask
+
+        vehicle = await self.get_vehicle(vehicle_id)
+
+        current_mileage = (await self._latest_mileage_inspections([vehicle.id])).get(vehicle.id)
+        current_mileage = current_mileage.mileage if current_mileage else vehicle.mileage
+        reference_date = vehicle.purchase_date or vehicle.created_at.date()
+
+        if vehicle.maintenance_plan_id is None:
+            return VehiclePlanStatusRead(
+                vehicle_id=vehicle.id,
+                plan_id=None,
+                plan_brand=None,
+                plan_name=None,
+                current_mileage=current_mileage,
+                reference_date=reference_date,
+                entries=[],
+            )
+
+        plan = await self.db.get(
+            MaintenancePlan,
+            vehicle.maintenance_plan_id,
+            options=[selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario)],
+        )
+        if plan is None:
+            return VehiclePlanStatusRead(
+                vehicle_id=vehicle.id,
+                plan_id=None,
+                plan_brand=None,
+                plan_name=None,
+                current_mileage=current_mileage,
+                reference_date=reference_date,
+                entries=[],
+            )
+
+        sort_key = lambda e: (  # noqa: E731
+            e.interval_km if e.interval_km is not None else 10**9,
+            e.interval_months if e.interval_months is not None else 10**9,
+        )
+        entries = sorted(plan.entries, key=sort_key)
+        tempario_ids = {e.tempario_id for e in entries}
+
+        completions: dict[uuid.UUID, tuple[int, datetime | None]] = {}
+        if tempario_ids:
+            rows = await self.db.execute(
+                select(ServiceOrderTask, ServiceOrder.sequence_number, ServiceOrder.closed_at)
+                .join(ServiceOrder, ServiceOrder.id == ServiceOrderTask.service_order_id)
+                .where(
+                    ServiceOrder.vehicle_id == vehicle.id,
+                    ServiceOrderTask.tempario_id.in_(tempario_ids),
+                    ServiceOrderTask.status == TaskStatus.COMPLETADA,
+                )
+                .order_by(ServiceOrderTask.created_at.desc())
+            )
+            for task, sequence_number, closed_at in rows.all():
+                # Keep the most recent completion per tempario.
+                completions.setdefault(task.tempario_id, (sequence_number, closed_at))
+
+        today = date.today()
+        results: list[VehiclePlanEntryStatusRead] = []
+        cumplido_flags = [entry.tempario_id in completions for entry in entries]
+
+        for i, entry in enumerate(entries):
+            completion = completions.get(entry.tempario_id)
+            if cumplido_flags[i]:
+                status = MaintenancePlanEntryStatus.CUMPLIDO
+            elif any(cumplido_flags[i + 1 :]):
+                status = MaintenancePlanEntryStatus.OMITIDO
+            else:
+                overdue_km = (
+                    entry.interval_km is not None
+                    and current_mileage is not None
+                    and current_mileage >= entry.interval_km
+                )
+                overdue_date = entry.interval_months is not None and today >= _add_months(
+                    reference_date, entry.interval_months
+                )
+                status = (
+                    MaintenancePlanEntryStatus.VENCIDO
+                    if (overdue_km or overdue_date)
+                    else MaintenancePlanEntryStatus.PENDIENTE
+                )
+
+            results.append(
+                VehiclePlanEntryStatusRead(
+                    entry_id=entry.id,
+                    tempario_id=entry.tempario_id,
+                    tempario_code=entry.tempario.code,
+                    tempario_name=entry.tempario.name,
+                    interval_km=entry.interval_km,
+                    interval_months=entry.interval_months,
+                    status=status,
+                    completed_at=completion[1] if completion else None,
+                    completed_service_order_code=(
+                        f"ODS-{completion[0]}" if completion else None
+                    ),
+                )
+            )
+
+        return VehiclePlanStatusRead(
+            vehicle_id=vehicle.id,
+            plan_id=plan.id,
+            plan_brand=plan.brand,
+            plan_name=plan.name,
+            current_mileage=current_mileage,
+            reference_date=reference_date,
+            entries=results,
+        )

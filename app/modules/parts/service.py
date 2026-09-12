@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -17,7 +18,14 @@ from app.modules.parts.exceptions import (
     PartNotFoundError,
     PartSaleNotFoundError,
 )
-from app.modules.parts.models import Part, PartReturn, PartSale, PartSaleLine, PartSaleLotAllocation
+from app.modules.parts.models import (
+    Part,
+    PartReturn,
+    PartSale,
+    PartSaleLine,
+    PartSaleLotAllocation,
+    PartWarranty,
+)
 from app.modules.parts.pricing import PARTS_MULTIPLIERS
 from app.modules.parts.schemas import (
     PartBulkItem,
@@ -28,9 +36,12 @@ from app.modules.parts.schemas import (
     PartSaleLineDispatch,
     PartUpdate,
 )
+from app.modules.post_ventas.models import LaborSettings
 from app.modules.warehouse.enums import MovementType
 from app.modules.warehouse.fifo import allocate_fifo, price_allocations
 from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
+
+DEFAULT_PART_WARRANTY_DAYS = 90
 
 SALE_TRANSITIONS: dict[PartSaleStatus, set[PartSaleStatus]] = {
     PartSaleStatus.PENDIENTE: {PartSaleStatus.PEDIDO, PartSaleStatus.CANCELADO},
@@ -364,6 +375,32 @@ class PartsService:
         if mismatched:
             raise DispatchQuantityMismatchError(mismatched)
 
+    async def _create_counter_warranties(self, sale: PartSale) -> None:
+        """A part picked up at the counter without a workshop install still
+        gets a warranty — on the part only, never labor — one row per lot
+        allocation so a defective part can be traced back to the exact lot
+        (and from there, the supplier) for a claim."""
+        days_result = await self.db.execute(
+            select(LaborSettings.part_warranty_days).where(LaborSettings.filial_id == sale.filial_id)
+        )
+        warranty_days = days_result.scalar_one_or_none() or DEFAULT_PART_WARRANTY_DAYS
+        starts_at = datetime.now(timezone.utc)
+        expires_at = starts_at + timedelta(days=warranty_days)
+        for line in sale.lines:
+            for allocation in line.allocations:
+                self.db.add(
+                    PartWarranty(
+                        filial_id=sale.filial_id,
+                        part_sale_line_id=line.id,
+                        part_id=line.part_id,
+                        lot_id=allocation.lot_id,
+                        quantity=allocation.quantity,
+                        warranty_days=warranty_days,
+                        starts_at=starts_at,
+                        expires_at=expires_at,
+                    )
+                )
+
     async def update_sale_status(
         self,
         sale_id: uuid.UUID,
@@ -417,6 +454,7 @@ class PartsService:
                         _sync_availability(part)
 
             if new_status == PartSaleStatus.COMPLETADO:
+                from app.modules.administracion.enums import MovementSourceType
                 from app.modules.administracion.service import AdministracionService
 
                 admin_service = AdministracionService(self.db)
@@ -425,7 +463,10 @@ class PartsService:
                     f"Cierre de venta de repuestos · {sale.client_name}",
                     sale.total,
                     sale.code,
+                    source_type=MovementSourceType.PART_SALE,
+                    source_id=sale.id,
                 )
+                await self._create_counter_warranties(sale)
 
         await self.db.commit()
         return await self.get_sale(sale.id)

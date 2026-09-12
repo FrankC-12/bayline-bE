@@ -5,6 +5,7 @@ from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 from test_part_sales_fifo import inventory as fifo_inventory
 
 from app.modules.parts.pricing import PARTS_MULTIPLIERS
@@ -13,6 +14,7 @@ from app.modules.service_orders.enums import ServiceOrderStatus
 from app.modules.service_orders.models import ServiceOrder, ServiceOrderTask, ServiceOrderTransfer
 from app.modules.service_orders.schemas import ServiceOrderUpdate
 from app.modules.service_orders.service import ServiceOrderService
+from app.modules.warehouse.models import PartLot
 
 inventory = fifo_inventory
 
@@ -40,7 +42,14 @@ async def test_counter_sale_all_discount_levels(inventory, label, unit_price):
 
 @pytest.fixture
 def order_inventory(inventory):
-    parts, session, data, lots, _ = inventory
+    parts, session, data, lots, other_warehouse = inventory
+    # Service-order pricing now draws on real FIFO across every lot/warehouse
+    # in the filial — deplete every lot except the last one so these tests'
+    # hardcoded expected numbers keep meaning "the cost used is lots[-1]'s."
+    for lot in lots[:-1]:
+        lot.quantity_remaining = 0
+    other_lot = session.scalar(select(PartLot).where(PartLot.warehouse_id == other_warehouse.id))
+    other_lot.quantity_remaining = 0
     # ODS snapshots the current catalog cost; changing margins must never read it again.
     lots[-1].unit_cost = 12
     order = ServiceOrder(
@@ -98,7 +107,7 @@ async def test_one_order_discount_applies_to_every_odt_and_future_parts(order_in
     second = ServiceOrderTransfer(service_order_id=order.id, sequence_number=2)
     session.add(second)
     session.flush()
-    await service._add_line_to_transfer(second, part_id, 2, 12)
+    await service._add_line_to_transfer(second, part_id, 2)
     session.commit()
     label = "Costo + 20% (Descuento 10%)"
     await service.update_order(order.id, ServiceOrderUpdate(discount_label=label))

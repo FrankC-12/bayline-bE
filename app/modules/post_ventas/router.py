@@ -7,9 +7,17 @@ from app.core.database import get_db
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.post_ventas.schemas import (
+    MaintenancePlanCreate,
+    MaintenancePlanRead,
+    MaintenancePlanUpdate,
     TemparioCreate,
     TemparioRead,
     TemparioUpdate,
+    VehicleWarrantyBulkCreate,
+    VehicleWarrantyBulkResult,
+    VehicleWarrantyCreate,
+    VehicleWarrantyRead,
+    WorkshopWarrantyRead,
 )
 from app.modules.post_ventas.service import PostVentasService
 from app.modules.roles.enums import AccessLevel
@@ -75,3 +83,118 @@ async def update_tempario(
     existing = await service.get_tempario(tempario_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_tempario(tempario_id, payload)
+
+
+@router.get("/maintenance-plans", response_model=list[MaintenancePlanRead])
+async def list_maintenance_plans(
+    filial_id: uuid.UUID = Query(...),
+    search: str | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> list[MaintenancePlanRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_plans(filial_id, search)
+
+
+@router.get("/maintenance-plans/{plan_id}", response_model=MaintenancePlanRead)
+async def get_maintenance_plan(
+    plan_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> MaintenancePlanRead:
+    plan = await service.get_plan(plan_id)
+    await _ensure_access(current_user, plan.filial_id, service.db)
+    return plan
+
+
+@router.post("/maintenance-plans", response_model=MaintenancePlanRead, status_code=status.HTTP_201_CREATED)
+async def create_maintenance_plan(
+    payload: MaintenancePlanCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> MaintenancePlanRead:
+    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_plan(payload)
+
+
+@router.patch("/maintenance-plans/{plan_id}", response_model=MaintenancePlanRead)
+async def update_maintenance_plan(
+    plan_id: uuid.UUID,
+    payload: MaintenancePlanUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> MaintenancePlanRead:
+    existing = await service.get_plan(plan_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.update_plan(plan_id, payload)
+
+
+# Vehicle warranties (garantía de fábrica)
+
+
+@router.get("/vehicle-warranties", response_model=list[VehicleWarrantyRead])
+async def list_vehicle_warranties(
+    filial_id: uuid.UUID = Query(...),
+    search: str | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> list[VehicleWarrantyRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_vehicle_warranties(filial_id, search)
+
+
+@router.get("/vehicle-warranties/by-vin/{vin}", response_model=VehicleWarrantyRead)
+async def get_vehicle_warranty_by_vin(
+    vin: str,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> VehicleWarrantyRead:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.get_vehicle_warranty_by_vin(filial_id, vin)
+
+
+@router.post(
+    "/vehicle-warranties", response_model=VehicleWarrantyRead, status_code=status.HTTP_201_CREATED
+)
+async def create_vehicle_warranty(
+    payload: VehicleWarrantyCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> VehicleWarrantyRead:
+    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_vehicle_warranty(payload, current_user.user_id)
+
+
+@router.post(
+    "/vehicle-warranties/bulk",
+    response_model=VehicleWarrantyBulkResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def bulk_create_vehicle_warranties(
+    payload: VehicleWarrantyBulkCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> VehicleWarrantyBulkResult:
+    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    created, skipped = await service.bulk_create_vehicle_warranties(
+        payload.filial_id, payload.items, current_user.user_id
+    )
+    return VehicleWarrantyBulkResult(
+        created=[service.warranty_to_read(w) for w in created], skipped=skipped
+    )
+
+
+# Workshop warranties (garantía de taller) — created automatically when an
+# order is invoiced (BillingService.issue), never by hand.
+
+
+@router.get("/workshop-warranties/by-vin/{vin}", response_model=list[WorkshopWarrantyRead])
+async def list_workshop_warranties_by_vin(
+    vin: str,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> list[WorkshopWarrantyRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_workshop_warranties_by_vin(filial_id, vin)

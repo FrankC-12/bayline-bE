@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,8 +70,10 @@ class ConcesionarioService:
             )
             next_sequence = (sequence_result.scalar() or 0) + 1
 
+            sale_id = uuid.uuid4()
             self.db.add(
                 VehicleSale(
+                    id=sale_id,
                     filial_id=vehicle.filial_id,
                     sequence_number=next_sequence,
                     vehicle_id=vehicle.id,
@@ -82,6 +85,7 @@ class ConcesionarioService:
                 )
             )
 
+            from app.modules.administracion.enums import MovementSourceType
             from app.modules.administracion.service import AdministracionService
 
             admin_service = AdministracionService(self.db)
@@ -90,6 +94,19 @@ class ConcesionarioService:
                 f"Venta de vehículo pagada · {payload.sale.client_name}",
                 payload.sale.final_price,
                 f"CV-{next_sequence:04d}",
+                source_type=MovementSourceType.VEHICLE_SALE,
+                source_id=sale_id,
+            )
+
+            from app.modules.post_ventas.service import PostVentasService
+
+            await PostVentasService(self.db).create_or_renew_warranty_from_sale(
+                vehicle.filial_id,
+                vehicle.vin,
+                vehicle.brand,
+                vehicle.model,
+                date.today(),
+                vehicle.id,
             )
 
         for field in (
@@ -105,6 +122,7 @@ class ConcesionarioService:
             "price_cash",
             "price_financed",
             "cost_price",
+            "cost_is_estimated",
             "price_currency",
             "iva_percentage",
             "igtf_percentage",
