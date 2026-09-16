@@ -18,6 +18,7 @@ from app.modules.clients.schemas import (
     ClientCreate,
     ClientUpdate,
     VehicleInput,
+    VehicleMileageHistoryEntry,
     VehiclePlanEntryStatusRead,
     VehiclePlanStatusRead,
 )
@@ -180,6 +181,48 @@ class ClientService:
         latest = await self._latest_mileage_inspections([vehicle_id])
         inspection = latest.get(vehicle_id)
         return inspection.mileage if inspection else None
+
+    async def list_mileage_history(self, vehicle_id: uuid.UUID) -> list[VehicleMileageHistoryEntry]:
+        """Every recorded odometer reading for this vehicle, newest first —
+        one entry per PreliminaryInspection that captured a mileage. Nothing
+        is ever overwritten here, so this is simply the full history."""
+        await self.get_vehicle(vehicle_id)
+        result = await self.db.execute(
+            select(PreliminaryInspection)
+            .where(
+                PreliminaryInspection.vehicle_id == vehicle_id,
+                PreliminaryInspection.mileage.isnot(None),
+            )
+            .order_by(PreliminaryInspection.created_at.desc())
+        )
+        inspections = list(result.scalars().all())
+
+        order_ids = {i.service_order_id for i in inspections if i.service_order_id}
+        orders_by_id: dict[uuid.UUID, int] = {}
+        if order_ids:
+            from app.modules.service_orders.models import ServiceOrder
+
+            rows = await self.db.execute(
+                select(ServiceOrder.id, ServiceOrder.sequence_number).where(
+                    ServiceOrder.id.in_(order_ids)
+                )
+            )
+            orders_by_id = {row.id: row.sequence_number for row in rows}
+
+        return [
+            VehicleMileageHistoryEntry(
+                inspection_id=i.id,
+                mileage=i.mileage,
+                recorded_at=i.created_at,
+                service_order_id=i.service_order_id,
+                service_order_code=(
+                    f"ODS-{orders_by_id[i.service_order_id]}"
+                    if i.service_order_id in orders_by_id
+                    else None
+                ),
+            )
+            for i in inspections
+        ]
 
     async def create_client(self, payload: ClientCreate) -> Client:
         await self._ensure_document_is_available(payload.filial_id, payload.document_number)

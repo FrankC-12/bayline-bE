@@ -37,7 +37,7 @@ def env():
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Taller", slug="taller"))
 
         warehouse = Warehouse(filial_id=filial_id, name="Principal")
-        part = Part(filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=0)
+        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=0)
         session.add_all([warehouse, part])
 
         client = Client(

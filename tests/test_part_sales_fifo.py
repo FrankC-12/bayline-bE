@@ -74,6 +74,7 @@ def inventory():
         other = Warehouse(id=uuid.uuid4(), filial_id=filial, name="Otro")
         part = Part(
             id=uuid.uuid4(),
+            category_id=uuid.uuid4(),
             filial_id=filial,
             code="FIFO",
             name="Repuesto",

@@ -73,7 +73,7 @@ async def test_rework_rate_and_breakdown(env):
     order3, _ = make_invoiced_order(session, filial_id, client_id, tech_b, now)
 
     tempario = Tempario(filial_id=filial_id, category=TemparioCategory.MOTOR, sequence_number=1, name="Cambio de aceite", estimated_hours=1)
-    part = Part(filial_id=filial_id, code="P-1", name="Filtro de aceite", price=10)
+    part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro de aceite", price=10)
     session.add_all([tempario, part])
     session.commit()
 

@@ -137,6 +137,9 @@ class PurchaseRequestStatusUpdate(BaseModel):
     status: PurchaseRequestStatus
     quotes: list[QuoteLineInput] | None = None  # required moving to COTIZADA
     warehouse_id: uuid.UUID | None = None  # required moving to RECIBIDA
+    # Optional — the shelf/bin location applied to every lot this receipt
+    # creates. Omitted, a lot is received with no location (same as today).
+    location: str | None = Field(default=None, max_length=30)
 
 
 class PurchaseRequestLineRead(BaseModel):

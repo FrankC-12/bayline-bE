@@ -215,8 +215,10 @@ async def add_task(
     (the tempario's linked parts may have just been added to a pending ODT)."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    await service.add_task(order_id, payload.tempario_id, payer=payload.payer)
-    return await service.get_order_summary(order_id)
+    task = await service.add_task(order_id, payload.tempario_id, payer=payload.payer)
+    summary = await service.get_order_summary(order_id)
+    summary.warnings = getattr(task, "stock_warnings", [])
+    return summary
 
 
 @router.patch("/service-order-tasks/{task_id}", response_model=TaskRead)
@@ -277,8 +279,10 @@ async def add_transfer_line(
     returns the refreshed summary."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    await service.add_transfer_line(order_id, payload.part_id, payload.quantity, payer=payload.payer)
-    return await service.get_order_summary(order_id)
+    transfer = await service.add_transfer_line(order_id, payload.part_id, payload.quantity, payer=payload.payer)
+    summary = await service.get_order_summary(order_id)
+    summary.warnings = getattr(transfer, "stock_warnings", [])
+    return summary
 
 
 @router.patch("/service-orders/{order_id}/transfers/lines/{line_id}/payer")

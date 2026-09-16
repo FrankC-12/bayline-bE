@@ -273,6 +273,7 @@ class AdministracionService:
         new_status: PurchaseRequestStatus,
         quotes: list | None,
         warehouse_id: uuid.UUID | None,
+        location: str | None = None,
     ) -> PurchaseRequestRead:
         request = await self._get_request_model(request_id)
         if new_status != request.status:
@@ -303,6 +304,7 @@ class AdministracionService:
                             quantity=line.quantity,
                             unit_cost=float(line.unit_cost),
                             purchase_request_id=request.id,
+                            location=location,
                         ),
                         note=f"Compra {request.code}",
                     )

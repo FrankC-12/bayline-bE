@@ -54,7 +54,7 @@ def env():
             filial_id=filial_id, category=TemparioCategory.MOTOR, sequence_number=1,
             name="Cambio de aceite", estimated_hours=2,
         )
-        part = Part(filial_id=filial_id, code="P-1", name="Filtro", price=10, stock_quantity=0)
+        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro", price=10, stock_quantity=0)
         session.add_all([tempario, part])
         session.commit()
 
@@ -170,3 +170,27 @@ async def test_update_transfer_line_payer_moves_amount_between_totals(env):
     after = await service.get_order_summary(order.id)
     assert after.parts_subtotal == 0
     assert after.non_client_subtotal == before.parts_subtotal
+
+
+@pytest.mark.asyncio
+async def test_payer_breakdown_matches_client_and_covered_totals(env):
+    service, _session, order, tempario, part = env
+    await service.add_task(order.id, tempario.id, payer=ServiceOrderPayer.GARANTIA_TALLER)
+    await service.add_transfer_line(order.id, part.id, 2, payer=ServiceOrderPayer.PROVEEDOR)
+    await service.add_transfer_line(order.id, part.id, 1, payer=ServiceOrderPayer.CLIENTE)
+    summary = await service.get_order_summary(order.id)
+    breakdown = {row.payer: row for row in summary.payer_breakdown}
+    assert set(breakdown) == set(ServiceOrderPayer)
+    assert breakdown[ServiceOrderPayer.GARANTIA_TALLER].labor_subtotal == 50
+    assert breakdown[ServiceOrderPayer.PROVEEDOR].parts_subtotal > 0
+    assert breakdown[ServiceOrderPayer.CLIENTE].subtotal == pytest.approx(
+        summary.parts_subtotal + summary.labor_subtotal
+    )
+    assert sum(row.subtotal for row in summary.payer_breakdown if row.payer != ServiceOrderPayer.CLIENTE) == pytest.approx(summary.non_client_subtotal)
+    # The complete breakdown survives invoice snapshot serialization.
+    from app.modules.service_orders.schemas import OrderSummary
+    restored = OrderSummary.model_validate(summary.model_dump(mode="json"))
+    assert restored.payer_breakdown == summary.payer_breakdown
+    legacy = summary.model_dump(mode="json")
+    legacy.pop("payer_breakdown")
+    assert OrderSummary.model_validate(legacy).payer_breakdown is None

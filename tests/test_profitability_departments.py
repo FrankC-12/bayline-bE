@@ -101,7 +101,7 @@ async def test_vehicles_split_by_condition_and_estimated_cost_count(env):
 @pytest.mark.asyncio
 async def test_repuestos_excludes_cancelled_sales(env):
     admin, session, filial_id, _holding_id, _client = env
-    part = Part(filial_id=filial_id, code="P-1", name="Filtro", price=10)
+    part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro", price=10)
     session.add(part)
     session.commit()
 
@@ -152,7 +152,7 @@ async def test_taller_revenue_recognized_at_issuance_not_collection(env):
 async def test_taller_direct_cost_uses_fifo_allocation_for_dispatched_lines(env):
     admin, session, filial_id, _holding_id, client = env
     warehouse = Warehouse(filial_id=filial_id, name="Principal")
-    part = Part(filial_id=filial_id, code="P-2", name="Alternador", price=10)
+    part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-2", name="Alternador", price=10)
     session.add_all([warehouse, part])
     session.commit()
     lot = PartLot(

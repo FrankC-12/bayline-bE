@@ -50,7 +50,7 @@ def env():
         )
         session.add(supplier)
 
-        part = Part(filial_id=filial_id, code="P-1", name="Alternador", price=100)
+        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Alternador", price=100)
         session.add(part)
 
         account = Account(

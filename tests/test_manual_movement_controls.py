@@ -273,7 +273,7 @@ async def test_record_automatic_income_still_works_untagged(env):
 @pytest.mark.asyncio
 async def test_resolve_claim_costo_taller_still_works_untagged(env):
     service, session, filial_id, usd_account, _, _ = env
-    part = Part(filial_id=filial_id, code="P-1", name="Repuesto", price=10)
+    part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Repuesto", price=10)
     supplier = Supplier(filial_id=filial_id, business_name="Proveedor S", rif="J-1", supplier_type=SupplierType.IMPORTADOR)
     session.add_all([part, supplier])
     session.commit()

@@ -73,7 +73,7 @@ async def test_resolve_claim_stores_source(env):
     account = await service.create_account(
         AccountCreate(filial_id=filial_id, name="Caja", currency=AccountCurrency.USD, account_type=AccountType.CAJA)
     )
-    part = Part(filial_id=filial_id, code="P-1", name="Repuesto", price=10)
+    part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Repuesto", price=10)
     supplier = Supplier(filial_id=filial_id, business_name="Proveedor S", rif="J-1", supplier_type=SupplierType.IMPORTADOR)
     session.add_all([part, supplier])
     session.commit()

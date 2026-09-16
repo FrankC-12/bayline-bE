@@ -22,7 +22,11 @@ from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
-from app.modules.service_orders.models import ServiceOrder, ServiceOrderTransferLotAllocation
+from app.modules.service_orders.models import (
+    ServiceOrder,
+    ServiceOrderTransferLine,
+    ServiceOrderTransferLotAllocation,
+)
 from app.modules.service_orders.service import ServiceOrderService
 from app.modules.warehouse.exceptions import InsufficientStockError
 from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
@@ -38,7 +42,7 @@ def env():
 
         warehouse = Warehouse(filial_id=filial_id, name="Principal")
         other_warehouse = Warehouse(filial_id=filial_id, name="Otro")
-        part = Part(filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=0)
+        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=0)
         session.add_all([warehouse, other_warehouse, part])
 
         client = Client(
@@ -117,12 +121,24 @@ async def test_dispatch_splits_across_lots_oldest_first(env):
 
 
 @pytest.mark.asyncio
-async def test_add_line_with_insufficient_lot_stock_raises(env):
+async def test_add_line_with_insufficient_lot_stock_warns_but_still_creates_the_line(env):
+    """Adding a line is never blocked by stock — a client may bring their own
+    part, or it may get requested from another branch later. Only dispatch
+    ("pedir a almacén", mark_transfer_ordered) actually blocks on stock."""
     service, session, filial_id, order, part, warehouse, _other = env
     make_lot(session, filial_id, warehouse, part, quantity=1)
 
+    transfer = await service.add_transfer_line(order.id, part.id, 5)
+
+    assert len(transfer.stock_warnings) == 1
+    assert "insuficiente" in transfer.stock_warnings[0].lower()
+    line = session.scalars(
+        select(ServiceOrderTransferLine).where(ServiceOrderTransferLine.transfer_id == transfer.id)
+    ).one()
+    assert line.quantity == 5
+
     with pytest.raises(InsufficientStockError):
-        await service.add_transfer_line(order.id, part.id, 5)
+        await service.mark_transfer_ordered(transfer.id)
 
 
 @pytest.mark.asyncio

@@ -72,7 +72,7 @@ from app.modules.service_orders.schemas import (
     WarrantyClaimRead,
 )
 from app.modules.warehouse.enums import MovementType
-from app.modules.warehouse.fifo import allocate_fifo
+from app.modules.warehouse.fifo import allocate_fifo, allocate_fifo_preview
 from app.modules.warehouse.models import PartLot, StockMovement
 from app.modules.administracion.models import PurchaseRequest, SupplierClaim
 
@@ -118,6 +118,26 @@ class ServiceOrderService:
         return order
 
     async def create_order(self, payload: ServiceOrderCreate) -> ServiceOrder:
+        from app.modules.inspections.models import PreliminaryInspection
+
+        # intake_mileage is always a view inherited from a PreliminaryInspection,
+        # never entered by hand. A walk-in ODS (no scheduled_at — the vehicle is
+        # physically present) must reference one; an order scheduled ahead of
+        # time can't know it yet, so it's linked later from the order detail
+        # screen once the vehicle arrives (see InspectionService.update_inspection).
+        inspection: PreliminaryInspection | None = None
+        if payload.inspection_id is not None:
+            inspection = await self.db.get(PreliminaryInspection, payload.inspection_id)
+            if inspection is None or inspection.vehicle_id != payload.vehicle_id:
+                raise BadRequestError("La inspección preliminar no corresponde a este vehículo.")
+            if inspection.service_order_id is not None:
+                raise BadRequestError("Esta inspección preliminar ya está vinculada a otra orden.")
+        elif payload.scheduled_at is None:
+            raise BadRequestError(
+                "Se requiere una inspección preliminar para crear la orden.",
+                error_code="inspection_required",
+            )
+
         next_seq = await self._next_sequence_number(payload.filial_id)
         order = ServiceOrder(
             filial_id=payload.filial_id,
@@ -129,12 +149,15 @@ class ServiceOrderService:
             technician_user_id=payload.technician_user_id,
             advisor_user_id=payload.advisor_user_id,
             bay_id=payload.bay_id,
-            intake_mileage=payload.intake_mileage,
+            intake_mileage=inspection.mileage if inspection else None,
             customer_reason=payload.customer_reason,
             promised_at=payload.promised_at,
             sequence_number=next_seq,
         )
         self.db.add(order)
+        await self.db.flush()
+        if inspection is not None:
+            inspection.service_order_id = order.id
         await self.db.commit()
         await self.db.refresh(order)
         return order
@@ -182,9 +205,6 @@ class ServiceOrderService:
 
         if payload.notes is not None:
             order.notes = payload.notes
-
-        if payload.intake_mileage is not None:
-            order.intake_mileage = payload.intake_mileage
 
         await self.db.commit()
         await self.db.refresh(order)
@@ -305,18 +325,26 @@ class ServiceOrderService:
         # they exist only because of this task, so they inherit its payer
         # and are tagged with its id (billing uses this to know the task
         # installed a part, for the separate "repuesto" warranty term).
+        # Never blocked by stock — see _add_line_to_transfer.
+        warnings: list[str] = []
         linked_parts = [p for p in tempario.parts if p.part_id is not None]
         if linked_parts:
             transfer = await self._get_or_create_pending_transfer(service_order_id)
             for tp in linked_parts:
                 part = await self.db.get(Part, tp.part_id)
                 if part is not None:
-                    await self._add_line_to_transfer(
+                    warning = await self._add_line_to_transfer(
                         transfer, part.id, tp.quantity, payer=payer, service_order_task_id=task.id
                     )
+                    if warning:
+                        warnings.append(warning)
 
         await self.db.commit()
         await self.db.refresh(task)
+        # Not a mapped column — a transient hint for the router to surface as
+        # a non-blocking warning on this one response, same convention as
+        # Vehicle.current_mileage elsewhere in this codebase.
+        task.stock_warnings = warnings
         return task
 
     async def get_task_filial(self, task_id: uuid.UUID) -> uuid.UUID:
@@ -377,9 +405,10 @@ class ServiceOrderService:
         if part is None:
             raise TransferNotFoundError(str(part_id))
         transfer = await self._get_or_create_pending_transfer(service_order_id)
-        await self._add_line_to_transfer(transfer, part.id, quantity, payer=payer)
+        warning = await self._add_line_to_transfer(transfer, part.id, quantity, payer=payer)
         await self.db.commit()
         await self.db.refresh(transfer)
+        transfer.stock_warnings = [warning] if warning else []
         return transfer
 
     async def update_transfer_line_payer(
@@ -514,7 +543,13 @@ class ServiceOrderService:
         quantity: int,
         payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE,
         service_order_task_id: uuid.UUID | None = None,
-    ) -> None:
+    ) -> str | None:
+        """Adds (or tops up) a line on the ODT. Never blocked by stock — a
+        client may bring their own part, or the shop may request it from
+        another branch later; the only point that actually blocks on stock
+        is dispatch ("pedir a almacén", mark_transfer_ordered). Returns a
+        warning message when the line's requested quantity exceeds what's
+        currently on the shelf, or None when fully covered."""
         await require_editable_order(self.db, transfer.service_order_id)
         order = await self.get_order(transfer.service_order_id)
         # Query directly instead of touching transfer.lines — for a transfer that
@@ -538,7 +573,8 @@ class ServiceOrderService:
         # Price via real FIFO consumption (oldest lot first, filial-wide —
         # same scope mark_transfer_ordered uses at dispatch), exactly like
         # the counter-sale flow — never off a single "latest" lot. This is
-        # a read-only preview: no stock is touched until dispatch.
+        # a read-only preview: no stock is touched until dispatch, and it's
+        # fully recomputed from whatever's actually consumed at that point.
         lots = list(
             (
                 await self.db.execute(
@@ -552,8 +588,28 @@ class ServiceOrderService:
                 )
             ).scalars()
         )
-        allocations = allocate_fifo(lots, new_quantity)
+        allocations, shortfall = allocate_fifo_preview(lots, new_quantity)
         cost = sum((Decimal(str(lot.unit_cost)) * take for lot, take in allocations), Decimal(0))
+
+        warning: str | None = None
+        if shortfall > 0:
+            # Best-effort estimate for the part of the quantity the shelf
+            # can't currently cover — priced at the last known cost for this
+            # part so the preview isn't wildly off; dispatch recomputes the
+            # real price from whatever's actually consumed then anyway.
+            fallback_cost = (
+                allocations[-1][0].unit_cost
+                if allocations
+                else await self._last_known_unit_cost(part_id)
+            )
+            cost += Decimal(str(fallback_cost)) * shortfall
+            part = await self.db.get(Part, part_id)
+            available = new_quantity - shortfall
+            warning = (
+                f"Stock insuficiente para \"{part.name if part else part_id}\": disponible "
+                f"{available} de {new_quantity} solicitadas. Se agregó la línea de todas formas — "
+                "solicítalo a almacén cuando haya existencia."
+            )
 
         if existing is None:
             existing = ServiceOrderTransferLine(
@@ -574,6 +630,20 @@ class ServiceOrderService:
         ]
         # Subsequent additions of this part in the same task must see this line.
         await self.db.flush()
+        return warning
+
+    async def _last_known_unit_cost(self, part_id: uuid.UUID) -> Decimal:
+        """The most recent cost this part was ever received at, regardless of
+        whether that lot still has stock remaining — used only to price the
+        shortfall portion of an add-time preview, never to block it."""
+        result = await self.db.execute(
+            select(PartLot.unit_cost)
+            .where(PartLot.part_id == part_id)
+            .order_by(PartLot.received_at.desc(), PartLot.id.desc())
+            .limit(1)
+        )
+        cost = result.scalar_one_or_none()
+        return Decimal(str(cost)) if cost is not None else Decimal(0)
 
     # Pricing summary
 
@@ -654,7 +724,19 @@ class ServiceOrderService:
         iva_amount = (labor_subtotal + parts_subtotal) * iva_percentage / 100
         total = labor_subtotal + parts_subtotal + iva_amount
 
+        payer_breakdown = []
+        for payer in ServiceOrderPayer:
+            labor = sum(float(t.hours_snapshot) for t in tasks if t.payer == payer) * hourly_rate
+            parts = sum(float(line.line_total) for line in all_lines if line.payer == payer)
+            payer_breakdown.append({
+                "payer": payer,
+                "labor_subtotal": labor,
+                "parts_subtotal": parts,
+                "subtotal": labor + parts,
+            })
+
         return OrderSummary(
+            payer_breakdown=payer_breakdown,
             discount_label=order.discount_label,
             tasks=[
                 TaskRead(

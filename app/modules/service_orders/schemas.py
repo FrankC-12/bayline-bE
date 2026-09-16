@@ -45,11 +45,14 @@ class ServiceOrderCreate(BaseModel):
     # Reception data. customer_reason can be inherited from an unlinked
     # PreliminaryInspection for this vehicle; advisor_user_id/promised_at
     # have no inspection equivalent and are always entered by hand.
-    # intake_mileage is optional here — a walk-in ODS collects it right away
-    # (the vehicle is physically present), but one scheduled ahead via
-    # "Agendar Orden de Servicio" can't know it yet; it's filled in later
-    # via ServiceOrderUpdate once the vehicle actually arrives.
-    intake_mileage: int | None = Field(default=None, ge=0)
+    # intake_mileage is never entered by hand — it's always a read-only
+    # view inherited from a PreliminaryInspection, set server-side (see
+    # ServiceOrderService.create_order). A walk-in ODS (no scheduled_at)
+    # must reference an existing unlinked inspection for this vehicle here;
+    # one scheduled ahead via "Agendar Orden de Servicio" can't know it yet
+    # (the vehicle isn't there), so inspection_id may be omitted and gets
+    # linked later, from the order detail screen, once it arrives.
+    inspection_id: uuid.UUID | None = None
     customer_reason: str = Field(min_length=1, max_length=2000)
     advisor_user_id: uuid.UUID
     promised_at: date
@@ -70,9 +73,6 @@ class ServiceOrderUpdate(BaseModel):
     bay_id: uuid.UUID | None = None
     scheduled_at: datetime | None = None
     notes: str | None = None
-    # Set once the vehicle physically arrives for an order that was
-    # scheduled ahead without it.
-    intake_mileage: int | None = Field(default=None, ge=0)
     # "None" above means "leave unchanged" — these flags are how the client
     # explicitly asks to clear a nullable assignment back to "Sin asignar".
     clear_technician: bool = False
@@ -168,7 +168,15 @@ class TransferRead(BaseModel):
     created_at: datetime
 
 
+class PayerBreakdown(BaseModel):
+    payer: ServiceOrderPayer
+    labor_subtotal: float
+    parts_subtotal: float
+    subtotal: float
+
+
 class OrderSummary(BaseModel):
+    payer_breakdown: list[PayerBreakdown] | None = None
     igtf_percentage: float = 0
     igtf_amount: float = 0
     pricing_frozen: bool = False
@@ -182,6 +190,10 @@ class OrderSummary(BaseModel):
     iva_percentage: float | None
     iva_amount: float | None
     total: float
+    # Non-blocking, one-off hints for the request that produced this summary
+    # (e.g. "added the part anyway, but stock is short") — never persisted,
+    # empty on any summary read that isn't immediately after such an action.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class UpsellCreate(BaseModel):

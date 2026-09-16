@@ -89,6 +89,18 @@ class VehicleMaintenancePlanAssign(BaseModel):
     plan_id: uuid.UUID | None = None
 
 
+class VehicleMileageHistoryEntry(BaseModel):
+    """One recorded odometer reading for a vehicle — sourced from a
+    PreliminaryInspection, never overwritten, so the full history simply
+    accumulates one entry per inspection that captured a mileage."""
+
+    inspection_id: uuid.UUID
+    mileage: int
+    recorded_at: datetime
+    service_order_id: uuid.UUID | None
+    service_order_code: str | None
+
+
 class VehiclePlanEntryStatusRead(BaseModel):
     entry_id: uuid.UUID
     tempario_id: uuid.UUID

@@ -1,9 +1,11 @@
 """Reception data (customer reason, advisor, promised date) is required to
 open a service order — the API rejects creation without it. intake_mileage
-is the one exception: a walk-in ODS collects it right away since the
-vehicle is physically present, but one scheduled ahead of time via
-"Agendar Orden de Servicio" can't know it yet — it's optional at creation
-and gets filled in later via ServiceOrderUpdate once the vehicle arrives."""
+is never entered by hand: it's always a read-only view inherited from a
+PreliminaryInspection. A walk-in ODS (no scheduled_at — the vehicle is
+physically present) must reference an existing unlinked inspection for the
+vehicle; one scheduled ahead of time via "Agendar Orden de Servicio" can't
+know it yet, so it may omit inspection_id and get it linked later, once the
+vehicle arrives, via InspectionService.update_inspection."""
 
 import os
 import uuid
@@ -19,7 +21,9 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
-from app.modules.service_orders.schemas import ServiceOrderCreate, ServiceOrderRead, ServiceOrderUpdate
+from app.core.exceptions import BadRequestError
+from app.modules.inspections.models import PreliminaryInspection
+from app.modules.service_orders.schemas import ServiceOrderCreate, ServiceOrderRead
 from app.modules.service_orders.service import ServiceOrderService
 
 
@@ -31,15 +35,29 @@ def env():
         yield ServiceOrderService(AsyncAdapter(session)), session
 
 
-def _valid_payload(filial_id, vehicle_id, advisor_id):
-    return ServiceOrderCreate(
-        filial_id=filial_id,
+def _make_inspection(session, vehicle_id, mileage=15000, service_order_id=None):
+    inspection = PreliminaryInspection(
+        filial_id=uuid.uuid4(),
         vehicle_id=vehicle_id,
-        intake_mileage=15000,
-        customer_reason="Ruido en frenos delanteros",
-        advisor_user_id=advisor_id,
-        promised_at=date(2026, 9, 10),
+        inspector_user_id=uuid.uuid4(),
+        mileage=mileage,
+        service_order_id=service_order_id,
     )
+    session.add(inspection)
+    session.flush()
+    return inspection
+
+
+def _payload(filial_id, vehicle_id, advisor_id, **overrides):
+    fields = {
+        "filial_id": filial_id,
+        "vehicle_id": vehicle_id,
+        "customer_reason": "Ruido en frenos delanteros",
+        "advisor_user_id": advisor_id,
+        "promised_at": date(2026, 9, 10),
+    }
+    fields.update(overrides)
+    return ServiceOrderCreate(**fields)
 
 
 def test_missing_reception_fields_are_rejected():
@@ -52,7 +70,6 @@ def test_empty_customer_reason_is_rejected():
         ServiceOrderCreate(
             filial_id=uuid.uuid4(),
             vehicle_id=uuid.uuid4(),
-            intake_mileage=1000,
             customer_reason="",
             advisor_user_id=uuid.uuid4(),
             promised_at=date(2026, 9, 10),
@@ -60,16 +77,29 @@ def test_empty_customer_reason_is_rejected():
 
 
 @pytest.mark.asyncio
-async def test_create_order_persists_reception_data(env):
+async def test_walk_in_order_requires_an_inspection(env):
     service, _session = env
     filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
 
-    order = await service.create_order(_valid_payload(filial_id, vehicle_id, advisor_id))
+    with pytest.raises(BadRequestError):
+        await service.create_order(_payload(filial_id, vehicle_id, advisor_id))
+
+
+@pytest.mark.asyncio
+async def test_create_order_inherits_mileage_from_inspection_and_links_it(env):
+    service, session = env
+    filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    inspection = _make_inspection(session, vehicle_id, mileage=15000)
+
+    order = await service.create_order(
+        _payload(filial_id, vehicle_id, advisor_id, inspection_id=inspection.id)
+    )
 
     assert order.intake_mileage == 15000
     assert order.customer_reason == "Ruido en frenos delanteros"
     assert order.advisor_user_id == advisor_id
     assert order.promised_at == date(2026, 9, 10)
+    assert inspection.service_order_id == order.id
 
     read = ServiceOrderRead.model_validate(order)
     assert read.intake_mileage == 15000
@@ -77,24 +107,36 @@ async def test_create_order_persists_reception_data(env):
 
 
 @pytest.mark.asyncio
-async def test_intake_mileage_is_optional_when_scheduling_ahead(env):
-    service, _session = env
+async def test_inspection_for_a_different_vehicle_is_rejected(env):
+    service, session = env
     filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    payload = _valid_payload(filial_id, vehicle_id, advisor_id).model_copy(update={"intake_mileage": None})
+    other_vehicle_inspection = _make_inspection(session, uuid.uuid4(), mileage=15000)
 
-    order = await service.create_order(payload)
-
-    assert order.intake_mileage is None
+    with pytest.raises(BadRequestError):
+        await service.create_order(
+            _payload(filial_id, vehicle_id, advisor_id, inspection_id=other_vehicle_inspection.id)
+        )
 
 
 @pytest.mark.asyncio
-async def test_intake_mileage_can_be_recorded_later_once_the_vehicle_arrives(env):
+async def test_already_linked_inspection_is_rejected(env):
+    service, session = env
+    filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    inspection = _make_inspection(session, vehicle_id, mileage=15000, service_order_id=uuid.uuid4())
+
+    with pytest.raises(BadRequestError):
+        await service.create_order(
+            _payload(filial_id, vehicle_id, advisor_id, inspection_id=inspection.id)
+        )
+
+
+@pytest.mark.asyncio
+async def test_scheduled_order_can_omit_inspection_and_mileage(env):
     service, _session = env
     filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    payload = _valid_payload(filial_id, vehicle_id, advisor_id).model_copy(update={"intake_mileage": None})
-    order = await service.create_order(payload)
+
+    order = await service.create_order(
+        _payload(filial_id, vehicle_id, advisor_id, scheduled_at="2026-09-15T10:00:00+00:00")
+    )
+
     assert order.intake_mileage is None
-
-    updated = await service.update_order(order.id, ServiceOrderUpdate(intake_mileage=18500))
-
-    assert updated.intake_mileage == 18500

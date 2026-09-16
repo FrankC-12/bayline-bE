@@ -78,6 +78,16 @@ class InspectionService:
             if inspection.service_order_id is not None:
                 raise InspectionAlreadyLinkedError()
             inspection.service_order_id = payload.service_order_id
+            # Kilometraje de ingreso is always a view inherited from the
+            # linked inspection — mirror it onto the order the moment it's
+            # linked (covers an order scheduled ahead of time, whose intake
+            # mileage couldn't be known until the vehicle actually arrived).
+            if inspection.mileage is not None:
+                from app.modules.service_orders.models import ServiceOrder
+
+                order = await self.db.get(ServiceOrder, payload.service_order_id)
+                if order is not None:
+                    order.intake_mileage = inspection.mileage
 
         await self.db.commit()
         await self.db.refresh(inspection)

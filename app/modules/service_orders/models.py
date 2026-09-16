@@ -169,6 +169,9 @@ class ServiceOrderTransfer(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Whether almacén staff has acknowledged this dispatched request in the
+    # "Órdenes de Transferencia" screen — drives the unseen-count badge there.
+    warehouse_seen: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     lines: Mapped[list["ServiceOrderTransferLine"]] = relationship(

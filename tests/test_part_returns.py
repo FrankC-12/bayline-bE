@@ -31,7 +31,8 @@ def env():
     with Session(engine, expire_on_commit=False, autoflush=False) as session:
         filial_id = uuid.uuid4()
         part = Part(
-            id=uuid.uuid4(), filial_id=filial_id, code="P1", name="Repuesto", price=10, stock_quantity=5
+            id=uuid.uuid4(), category_id=uuid.uuid4(), filial_id=filial_id, code="P1", name="Repuesto",
+            price=10, stock_quantity=5,
         )
         session.add(part)
         session.commit()

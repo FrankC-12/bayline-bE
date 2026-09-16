@@ -13,9 +13,10 @@ from app.modules.users.models import User, UserModulePermission  # noqa: F401
 from app.modules.clients.models import Client, Vehicle  # noqa: F401
 from app.modules.service_orders.models import Bay, ServiceOrder  # noqa: F401
 from app.modules.inspections.models import PreliminaryInspection  # noqa: F401
-from app.modules.parts.models import Part, PartSale, PartSaleLine, PartReturn  # noqa: F401
+from app.modules.parts.models import Part, PartCategory, PartMeasure, PartSale, PartSaleLine, PartReturn  # noqa: F401
 from app.modules.post_ventas.models import LaborSettings, Tempario, TemparioPart  # noqa: F401
-from app.modules.warehouse.models import Warehouse, PartLot, StockMovement, Transfer, TransferLine  # noqa: F401
+from app.modules.warehouse.models import Warehouse, PartLot, StockInReason, StockMovement, Transfer, TransferLine  # noqa: F401
 from app.modules.concesionario.models import DealershipVehicle, VehicleSale  # noqa: F401
 from app.modules.administracion.models import Supplier, PurchaseRequest, PurchaseRequestLine, SupplierClaim, SupplierPaymentAccount, Account, IncomeEntry, ExpenseEntry  # noqa: F401
 from app.modules.exchange_rates.models import ExchangeRate  # noqa: F401
+from app.modules.vehicle_catalog.models import VehicleBrand, VehicleModel  # noqa: F401

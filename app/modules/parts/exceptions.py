@@ -13,6 +13,44 @@ class PartCodeAlreadyExistsError(ConflictError):
         )
 
 
+class PartCategoryNotFoundError(NotFoundError):
+    def __init__(self, category_id: str) -> None:
+        super().__init__(
+            f"Part category '{category_id}' was not found.", error_code="part_category_not_found"
+        )
+
+
+class PartCategoryNameAlreadyExistsError(ConflictError):
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"A part category named '{name}' already exists.",
+            error_code="part_category_name_already_exists",
+        )
+
+
+class PartMeasureNotFoundError(NotFoundError):
+    def __init__(self, measure_id: str) -> None:
+        super().__init__(
+            f"Part measure '{measure_id}' was not found.", error_code="part_measure_not_found"
+        )
+
+
+class PartMeasureNameAlreadyExistsError(ConflictError):
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"A part measure named '{name}' already exists.",
+            error_code="part_measure_name_already_exists",
+        )
+
+
+class VehicleModelBrandMismatchError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "El modelo seleccionado no pertenece a la marca seleccionada.",
+            error_code="vehicle_model_brand_mismatch",
+        )
+
+
 class PartSaleNotFoundError(NotFoundError):
     def __init__(self, sale_id: str) -> None:
         super().__init__(f"Part sale '{sale_id}' was not found.", error_code="part_sale_not_found")

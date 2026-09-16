@@ -38,7 +38,7 @@ def env():
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Taller", slug="taller"))
 
         warehouse = Warehouse(filial_id=filial_id, name="Principal")
-        part = Part(filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=15)
+        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=15)
         session.add_all([warehouse, part])
 
         client = Client(
@@ -122,10 +122,17 @@ async def test_allocations_recorded_at_add_time_before_dispatch(env):
 
 
 @pytest.mark.asyncio
-async def test_requesting_more_than_available_raises(env):
+async def test_requesting_more_than_available_warns_but_still_creates_the_line(env):
+    """Adding a line is never blocked by stock — a client may bring their own
+    part. Only dispatch ("pedir a almacén") actually blocks on stock."""
     service, session, order, part, _warehouse, _older, _newer = env
+    transfer = await service.add_transfer_line(order.id, part.id, 16)
+
+    assert len(transfer.stock_warnings) == 1
+    assert "insuficiente" in transfer.stock_warnings[0].lower()
+
     with pytest.raises(InsufficientStockError):
-        await service.add_transfer_line(order.id, part.id, 16)
+        await service.mark_transfer_ordered(transfer.id)
 
 
 @pytest.mark.asyncio

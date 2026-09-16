@@ -29,7 +29,8 @@ def env():
         filial_id = uuid.uuid4()
         warehouse = Warehouse(id=uuid.uuid4(), filial_id=filial_id, name="Almacén 1")
         part = Part(
-            id=uuid.uuid4(), filial_id=filial_id, code="P1", name="Repuesto", price=0, stock_quantity=2
+            id=uuid.uuid4(), category_id=uuid.uuid4(), filial_id=filial_id, code="P1", name="Repuesto",
+            price=0, stock_quantity=2,
         )
         session.add_all([warehouse, part])
         session.add_all(
@@ -79,3 +80,27 @@ async def test_fifo_unit_cost_stays_the_oldest_lot_after_adding_a_third(env):
     assert row.fifo_unit_cost == 10.0
     # get_average_cost is untouched — transfers/administracion still see the blend.
     assert await service.get_average_cost(part.id, warehouse.id) == 14.0
+
+
+@pytest.mark.asyncio
+async def test_inventory_can_be_filtered_by_part_for_the_transfer_modal_hint(env):
+    """Powers "disponible en cada almacén" when picking a part on a new
+    transfer order — filtering server-side instead of the client fetching
+    every lot in the filial just to find one part's rows."""
+    service, session, filial_id, warehouse, part = env
+    other_part = Part(
+        id=uuid.uuid4(), category_id=uuid.uuid4(), filial_id=filial_id, code="P2", name="Otro repuesto", price=0,
+    )
+    session.add(other_part)
+    session.add(
+        PartLot(
+            filial_id=filial_id, warehouse_id=warehouse.id, part_id=other_part.id,
+            quantity_received=5, quantity_remaining=5, unit_cost=1,
+        )
+    )
+    session.commit()
+
+    rows = await service.get_inventory(filial_id, part_id=part.id)
+
+    assert {r.part_id for r in rows} == {part.id}
+    assert sum(r.quantity for r in rows) == 2

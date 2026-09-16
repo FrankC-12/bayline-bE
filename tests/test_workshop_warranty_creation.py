@@ -194,7 +194,7 @@ async def test_task_with_installed_part_also_gets_repuesto_warranty(ready):
     vehicle.vin = "1HGCM82633A123456"
     order.intake_mileage = 10000
 
-    installed_part = Part(filial_id=order.filial_id, code="P-99", name="Bomba de agua", price=50, stock_quantity=0)
+    installed_part = Part(category_id=uuid.uuid4(), filial_id=order.filial_id, code="P-99", name="Bomba de agua", price=50, stock_quantity=0)
     tempario = Tempario(
         filial_id=order.filial_id, category=TemparioCategory.MOTOR, sequence_number=1,
         name="Cambio de bomba", estimated_hours=2,
@@ -258,7 +258,7 @@ async def test_labor_and_parts_terms_can_differ(ready):
     settings.workshop_parts_warranty_days = 365
     settings.workshop_parts_warranty_km = 50000
 
-    installed_part = Part(filial_id=order.filial_id, code="P-77", name="Correa", price=20, stock_quantity=0)
+    installed_part = Part(category_id=uuid.uuid4(), filial_id=order.filial_id, code="P-77", name="Correa", price=20, stock_quantity=0)
     tempario = Tempario(
         filial_id=order.filial_id, category=TemparioCategory.MOTOR, sequence_number=2,
         name="Cambio de correa", estimated_hours=1,

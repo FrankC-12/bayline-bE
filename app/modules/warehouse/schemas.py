@@ -26,6 +26,23 @@ class WarehouseRead(BaseModel):
     created_at: datetime
 
 
+class StockInReasonCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class StockInReasonUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+
+
+class StockInReasonRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    holding_id: uuid.UUID
+    name: str
+    is_active: bool
+
+
 class LotLineInput(BaseModel):
     part_id: uuid.UUID
     quantity: int = Field(ge=1)
@@ -52,6 +69,53 @@ class PartLotRead(BaseModel):
     location: str | None
     note: str | None
     received_at: datetime
+
+
+class LotOutboundMovementRead(BaseModel):
+    """One dispatched consumption of this lot — a counter sale line or a
+    workshop ODT line. Only real, dispatched consumption is included (never
+    a pending/preview allocation)."""
+
+    id: uuid.UUID
+    source: str  # "venta_repuestos" | "odt_taller"
+    quantity: int
+    unit_cost: float
+    occurred_at: datetime
+    reference_code: str
+    description: str
+    # Opaque id of whatever the reference_code points to (a PartSale or a
+    # ServiceOrder) — lets the frontend link to its detail screen.
+    link_id: uuid.UUID
+
+
+class PartLotDetailRead(PartLotRead):
+    part_code: str
+    part_name: str
+    warehouse_name: str
+    outbound_movements: list[LotOutboundMovementRead]
+
+
+class ServiceOrderPartRequestLineRead(BaseModel):
+    part_id: uuid.UUID
+    part_code: str
+    part_name: str
+    quantity: int
+
+
+class ServiceOrderPartRequestRead(BaseModel):
+    """A dispatched ODT ('Marcar como Pedido' from a service order) surfaced
+    to almacén staff — this is how a parts request travels from the ODS side
+    to the 'Órdenes de Transferencia' screen. `warehouse_seen` drives the
+    unseen-count badge on that screen's nav item."""
+
+    id: uuid.UUID
+    code: str
+    service_order_id: uuid.UUID
+    service_order_code: str
+    vehicle_label: str
+    fulfilled_at: datetime | None
+    warehouse_seen: bool
+    lines: list[ServiceOrderPartRequestLineRead]
 
 
 class BulkLotItem(BaseModel):

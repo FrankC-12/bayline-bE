@@ -9,12 +9,20 @@ from app.core.database import get_db
 from app.core.storage import save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.filiales.exceptions import FilialNotFoundError
+from app.modules.filiales.models import Filial
 from app.modules.parts.enums import ReturnCondition, ReturnReason
 from app.modules.parts.exceptions import MissingReturnPhotoError
 from app.modules.parts.schemas import (
     PartBulkCreate,
     PartBulkResult,
+    PartCategoryCreate,
+    PartCategoryRead,
+    PartCategoryUpdate,
     PartCreate,
+    PartMeasureCreate,
+    PartMeasureRead,
+    PartMeasureUpdate,
     PartRead,
     PartReturnCreate,
     PartReturnRead,
@@ -47,15 +55,23 @@ async def _ensure_access(
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
 
 
+async def _holding_id_for_filial(db: AsyncSession, filial_id: uuid.UUID) -> uuid.UUID:
+    filial = await db.get(Filial, filial_id)
+    if filial is None:
+        raise FilialNotFoundError(str(filial_id))
+    return filial.holding_id
+
+
 @router.get("/parts", response_model=list[PartRead])
 async def list_parts(
     filial_id: uuid.UUID = Query(...),
     search: str | None = Query(default=None),
+    include_inactive: bool = Query(default=False),
     current_user: CurrentUser = Depends(get_current_user),
     service: PartsService = Depends(get_service),
 ) -> list[PartRead]:
     await _ensure_access(current_user, filial_id, service.db)
-    return await service.list_parts(filial_id, search)
+    return await service.list_parts(filial_id, search, include_inactive)
 
 
 @router.post("/parts", response_model=PartRead, status_code=status.HTTP_201_CREATED)
@@ -91,6 +107,157 @@ async def update_part(
     existing = await service.get_part(part_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_part(part_id, payload)
+
+
+@router.post("/parts/{part_id}/activate", response_model=PartRead)
+async def activate_part(
+    part_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartRead:
+    existing = await service.get_part(part_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.set_part_active(part_id, is_active=True)
+
+
+@router.post("/parts/{part_id}/deactivate", response_model=PartRead)
+async def deactivate_part(
+    part_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartRead:
+    existing = await service.get_part(part_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.set_part_active(part_id, is_active=False)
+
+
+# Part categories (Ajustes → Categorías de Repuestos) — holding-wide, same
+# access boundary as the parts catalog itself.
+
+
+@router.get("/part-categories", response_model=list[PartCategoryRead])
+async def list_part_categories(
+    filial_id: uuid.UUID = Query(...),
+    include_inactive: bool = Query(default=False),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> list[PartCategoryRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.list_categories(holding_id, include_inactive)
+
+
+@router.post("/part-categories", response_model=PartCategoryRead, status_code=status.HTTP_201_CREATED)
+async def create_part_category(
+    payload: PartCategoryCreate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartCategoryRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.create_category(holding_id, payload)
+
+
+@router.patch("/part-categories/{category_id}", response_model=PartCategoryRead)
+async def update_part_category(
+    category_id: uuid.UUID,
+    payload: PartCategoryUpdate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartCategoryRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.update_category(category_id, holding_id, payload)
+
+
+@router.post("/part-categories/{category_id}/activate", response_model=PartCategoryRead)
+async def activate_part_category(
+    category_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartCategoryRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.set_category_active(category_id, holding_id, is_active=True)
+
+
+@router.post("/part-categories/{category_id}/deactivate", response_model=PartCategoryRead)
+async def deactivate_part_category(
+    category_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartCategoryRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.set_category_active(category_id, holding_id, is_active=False)
+
+
+# Part measures (Ajustes → Medidas de Repuestos) — holding-wide.
+
+
+@router.get("/part-measures", response_model=list[PartMeasureRead])
+async def list_part_measures(
+    filial_id: uuid.UUID = Query(...),
+    include_inactive: bool = Query(default=False),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> list[PartMeasureRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.list_measures(holding_id, include_inactive)
+
+
+@router.post("/part-measures", response_model=PartMeasureRead, status_code=status.HTTP_201_CREATED)
+async def create_part_measure(
+    payload: PartMeasureCreate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartMeasureRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.create_measure(holding_id, payload)
+
+
+@router.patch("/part-measures/{measure_id}", response_model=PartMeasureRead)
+async def update_part_measure(
+    measure_id: uuid.UUID,
+    payload: PartMeasureUpdate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartMeasureRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.update_measure(measure_id, holding_id, payload)
+
+
+@router.post("/part-measures/{measure_id}/activate", response_model=PartMeasureRead)
+async def activate_part_measure(
+    measure_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartMeasureRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.set_measure_active(measure_id, holding_id, is_active=True)
+
+
+@router.post("/part-measures/{measure_id}/deactivate", response_model=PartMeasureRead)
+async def deactivate_part_measure(
+    measure_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartMeasureRead:
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.set_measure_active(measure_id, holding_id, is_active=False)
 
 
 @router.get("/part-sales", response_model=list[PartSaleRead])

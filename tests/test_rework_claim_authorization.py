@@ -89,7 +89,7 @@ async def test_approve_with_vigente_warranty_opens_a_retrabajo_order(env):
         filial_id=filial_id, category=TemparioCategory.MOTOR, sequence_number=1,
         name="Cambio de aceite", estimated_hours=1,
     )
-    part = Part(filial_id=filial_id, code="P-1", name="Filtro", price=10, stock_quantity=0)
+    part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro", price=10, stock_quantity=0)
     session.add_all([tempario, part])
     session.commit()
     await service.add_task(order.id, tempario.id)

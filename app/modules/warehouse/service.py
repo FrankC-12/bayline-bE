@@ -9,19 +9,35 @@ from app.modules.warehouse.enums import MovementReason, MovementType, TransferSt
 from app.modules.warehouse.exceptions import (
     InsufficientStockError,
     InvalidTransferStatusTransitionError,
+    PartLotNotFoundError,
     SameWarehouseError,
+    StockInReasonNameAlreadyExistsError,
+    StockInReasonNotFoundError,
     TransferNotFoundError,
     WarehouseNotFoundError,
 )
-from app.modules.warehouse.models import PartLot, StockMovement, Transfer, TransferLine, Warehouse
+from app.modules.warehouse.models import (
+    PartLot,
+    StockInReason,
+    StockMovement,
+    Transfer,
+    TransferLine,
+    Warehouse,
+)
 from app.modules.warehouse.schemas import (
     BulkLotItem,
     BulkLotReview,
     BulkLotReviewItem,
     InventoryRow,
     LotLineInput,
+    LotOutboundMovementRead,
+    PartLotDetailRead,
     PartLotRead,
+    ServiceOrderPartRequestLineRead,
+    ServiceOrderPartRequestRead,
     StockInCreate,
+    StockInReasonCreate,
+    StockInReasonUpdate,
     StockOutCreate,
     TransferCreate,
     TransferLineRead,
@@ -36,6 +52,17 @@ REASON_TO_MOVEMENT_TYPE: dict[MovementReason, MovementType] = {
     MovementReason.OTRO: MovementType.SALIDA,
     MovementReason.DEVOLUCION_PROVEEDOR: MovementType.DEVOLUCION,
 }
+
+# Preloaded for every holding — matches the two hardcoded defaults this
+# catalog replaces (the frontend's old localStorage list, and StockInCreate's
+# schema default). New ones are seeded at holding creation; existing ones are
+# backfilled by the migration that introduced this catalog.
+DEFAULT_STOCK_IN_REASONS = [
+    "Compra directa",
+    "Ajuste de inventario",
+    "Devolución de cliente",
+    "Otro",
+]
 
 TRANSFER_TRANSITIONS: dict[TransferStatus, set[TransferStatus]] = {
     TransferStatus.PEDIDO: {TransferStatus.EN_PROCESO, TransferStatus.CANCELADA},
@@ -96,6 +123,86 @@ class AlmacenService:
         await self.db.commit()
         await self.db.refresh(warehouse)
         return warehouse
+
+    # Stock-in reasons (Ajustes → Motivos de Entrada) — holding-wide.
+
+    async def _holding_id_for_filial(self, filial_id: uuid.UUID) -> uuid.UUID:
+        from app.core.exceptions import BadRequestError
+        from app.modules.filiales.models import Filial
+
+        filial = await self.db.get(Filial, filial_id)
+        if filial is None:
+            raise BadRequestError("La filial no existe.")
+        return filial.holding_id
+
+    async def list_stock_in_reasons(
+        self, holding_id: uuid.UUID, include_inactive: bool = False
+    ) -> list[StockInReason]:
+        query = (
+            select(StockInReason)
+            .where(StockInReason.holding_id == holding_id)
+            .order_by(StockInReason.name)
+        )
+        if not include_inactive:
+            query = query.where(StockInReason.is_active.is_(True))
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+    async def _get_stock_in_reason(self, reason_id: uuid.UUID, holding_id: uuid.UUID) -> StockInReason:
+        result = await self.db.execute(
+            select(StockInReason).where(
+                StockInReason.id == reason_id, StockInReason.holding_id == holding_id
+            )
+        )
+        reason = result.scalar_one_or_none()
+        if reason is None:
+            raise StockInReasonNotFoundError(str(reason_id))
+        return reason
+
+    async def create_stock_in_reason(
+        self, holding_id: uuid.UUID, payload: StockInReasonCreate
+    ) -> StockInReason:
+        await self._ensure_stock_in_reason_name_is_available(holding_id, payload.name)
+        reason = StockInReason(holding_id=holding_id, name=payload.name.strip())
+        self.db.add(reason)
+        await self.db.commit()
+        await self.db.refresh(reason)
+        return reason
+
+    async def update_stock_in_reason(
+        self, reason_id: uuid.UUID, holding_id: uuid.UUID, payload: StockInReasonUpdate
+    ) -> StockInReason:
+        reason = await self._get_stock_in_reason(reason_id, holding_id)
+        if payload.name and payload.name.strip() != reason.name:
+            await self._ensure_stock_in_reason_name_is_available(holding_id, payload.name)
+            reason.name = payload.name.strip()
+        await self.db.commit()
+        await self.db.refresh(reason)
+        return reason
+
+    async def set_stock_in_reason_active(
+        self, reason_id: uuid.UUID, holding_id: uuid.UUID, is_active: bool
+    ) -> StockInReason:
+        reason = await self._get_stock_in_reason(reason_id, holding_id)
+        reason.is_active = is_active
+        await self.db.commit()
+        await self.db.refresh(reason)
+        return reason
+
+    async def _ensure_stock_in_reason_name_is_available(self, holding_id: uuid.UUID, name: str) -> None:
+        result = await self.db.execute(
+            select(StockInReason).where(
+                StockInReason.holding_id == holding_id,
+                func.lower(StockInReason.name) == name.strip().lower(),
+            )
+        )
+        if result.scalar_one_or_none() is not None:
+            raise StockInReasonNameAlreadyExistsError(name)
+
+    async def seed_default_stock_in_reasons(self, holding_id: uuid.UUID) -> None:
+        for name in DEFAULT_STOCK_IN_REASONS:
+            self.db.add(StockInReason(holding_id=holding_id, name=name))
+        await self.db.commit()
 
     # Entradas (receiving stock -> creates a FIFO lot)
 
@@ -179,17 +286,24 @@ class AlmacenService:
         result = await self.db.execute(select(Part).where(Part.filial_id == filial_id))
         parts_by_code = {p.code.strip().casefold(): p for p in result.scalars().all()}
 
-        for item in review.new:
-            part = Part(
-                filial_id=filial_id, code=item.part_code, name=item.part_name,
-                category=item.category or "Sin categoría", brand="Sin marca",
-                application="Universal", unit="Unidad", price=0,
-                stock_quantity=0, min_stock=0,
-            )
-            _sync_availability(part)
-            self.db.add(part)
-            await self.db.flush()
-            parts_by_code[part.code.strip().casefold()] = part
+        if review.new:
+            from app.modules.filiales.models import Filial
+            from app.modules.parts.service import PartsService
+
+            filial = await self.db.get(Filial, filial_id)
+            parts_service = PartsService(self.db)
+            for item in review.new:
+                category = await parts_service.get_or_create_category(
+                    filial.holding_id, item.category or "Sin categoría"
+                )
+                part = Part(
+                    filial_id=filial_id, code=item.part_code, name=item.part_name,
+                    category_id=category.id, unit="Unidad", price=0, stock_quantity=0,
+                )
+                _sync_availability(part)
+                self.db.add(part)
+                await self.db.flush()
+                parts_by_code[part.code.strip().casefold()] = part
 
         created: list[PartLot] = []
         skipped: list[str] = []
@@ -416,11 +530,17 @@ class AlmacenService:
     # Inventory, lots & movements
 
     async def get_inventory(
-        self, filial_id: uuid.UUID, warehouse_id: uuid.UUID | None = None, search: str | None = None
+        self,
+        filial_id: uuid.UUID,
+        warehouse_id: uuid.UUID | None = None,
+        search: str | None = None,
+        part_id: uuid.UUID | None = None,
     ) -> list[InventoryRow]:
         query = select(PartLot).where(PartLot.filial_id == filial_id, PartLot.quantity_remaining > 0)
         if warehouse_id:
             query = query.where(PartLot.warehouse_id == warehouse_id)
+        if part_id:
+            query = query.where(PartLot.part_id == part_id)
         result = await self.db.execute(query.order_by(PartLot.received_at))
         lots = list(result.scalars().all())
 
@@ -489,15 +609,179 @@ class AlmacenService:
         return total_cost / total_qty
 
     async def list_lots(
-        self, filial_id: uuid.UUID, part_id: uuid.UUID | None = None, warehouse_id: uuid.UUID | None = None
+        self,
+        filial_id: uuid.UUID,
+        part_id: uuid.UUID | None = None,
+        warehouse_id: uuid.UUID | None = None,
+        search: str | None = None,
     ) -> list[PartLot]:
         query = select(PartLot).where(PartLot.filial_id == filial_id).order_by(PartLot.received_at)
         if part_id:
             query = query.where(PartLot.part_id == part_id)
         if warehouse_id:
             query = query.where(PartLot.warehouse_id == warehouse_id)
+        if search:
+            # PartLot.code is a computed "L-{lot_number}" property, not a real
+            # column — match the numeric part regardless of how it's typed
+            # ("L-104", "l104", "104").
+            digits = search.strip().upper().removeprefix("L-").removeprefix("L")
+            if digits.isdigit():
+                query = query.where(PartLot.lot_number == int(digits))
+            else:
+                return []
         result = await self.db.execute(query)
         return list(result.scalars().all())
+
+    async def get_lot(self, lot_id: uuid.UUID) -> PartLot:
+        lot = await self.db.get(PartLot, lot_id)
+        if lot is None:
+            raise PartLotNotFoundError(str(lot_id))
+        return lot
+
+    async def get_lot_detail(self, lot: PartLot) -> PartLotDetailRead:
+        """Every dispatched consumption of this exact lot — a counter sale
+        line (Venta de Repuestos) or a workshop ODT line — unified into one
+        chronological list. Warehouse-to-warehouse transfers aren't included:
+        they don't record which origin lot they drained (a real gap in that
+        flow, not something this view can paper over)."""
+        part = await self.db.get(Part, lot.part_id)
+        warehouse = await self.get_warehouse(lot.warehouse_id)
+
+        movements: list[LotOutboundMovementRead] = []
+
+        from app.modules.parts.models import PartSale, PartSaleLine, PartSaleLotAllocation
+
+        sale_rows = await self.db.execute(
+            select(PartSaleLotAllocation, PartSale)
+            .join(PartSaleLine, PartSaleLine.id == PartSaleLotAllocation.part_sale_line_id)
+            .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
+            .where(PartSaleLotAllocation.lot_id == lot.id)
+        )
+        for allocation, sale in sale_rows.all():
+            movements.append(
+                LotOutboundMovementRead(
+                    id=allocation.id,
+                    source="venta_repuestos",
+                    quantity=allocation.quantity,
+                    unit_cost=float(allocation.unit_cost),
+                    occurred_at=sale.created_at,
+                    reference_code=sale.code,
+                    description=f"Venta de mostrador a {sale.client_name}",
+                    link_id=sale.id,
+                )
+            )
+
+        from app.modules.service_orders.enums import TransferStatus as ServiceOrderTransferStatus
+        from app.modules.service_orders.models import (
+            ServiceOrder,
+            ServiceOrderTransfer,
+            ServiceOrderTransferLine,
+            ServiceOrderTransferLotAllocation,
+        )
+
+        odt_rows = await self.db.execute(
+            select(ServiceOrderTransferLotAllocation, ServiceOrderTransfer, ServiceOrder)
+            .join(
+                ServiceOrderTransferLine,
+                ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
+            )
+            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+            .join(ServiceOrder, ServiceOrder.id == ServiceOrderTransfer.service_order_id)
+            .where(
+                ServiceOrderTransferLotAllocation.lot_id == lot.id,
+                # Only real, dispatched consumption — a line just added but
+                # not yet "pedida a almacén" only carries a preview allocation.
+                ServiceOrderTransfer.status == ServiceOrderTransferStatus.PEDIDO,
+            )
+        )
+        for allocation, transfer, order in odt_rows.all():
+            movements.append(
+                LotOutboundMovementRead(
+                    id=allocation.id,
+                    source="odt_taller",
+                    quantity=allocation.quantity,
+                    unit_cost=float(allocation.unit_cost),
+                    occurred_at=transfer.fulfilled_at or transfer.created_at,
+                    reference_code=f"{order.code} · {transfer.code}",
+                    description=f"Repuesto solicitado en la orden {order.code}",
+                    link_id=order.id,
+                )
+            )
+
+        movements.sort(key=lambda m: m.occurred_at, reverse=True)
+
+        return PartLotDetailRead(
+            id=lot.id,
+            code=lot.code,
+            warehouse_id=lot.warehouse_id,
+            part_id=lot.part_id,
+            part_code=part.code if part else "",
+            part_name=part.name if part else "",
+            warehouse_name=warehouse.name,
+            quantity_received=lot.quantity_received,
+            quantity_remaining=lot.quantity_remaining,
+            unit_cost=float(lot.unit_cost),
+            location=lot.location,
+            note=lot.note,
+            received_at=lot.received_at,
+            outbound_movements=movements,
+        )
+
+    async def list_service_order_requests(self, filial_id: uuid.UUID) -> list[ServiceOrderPartRequestRead]:
+        """Dispatched ODTs ('Marcar como Pedido' from a service order) for
+        this filial — how a parts request from an ODS reaches almacén staff
+        in the 'Órdenes de Transferencia' screen."""
+        from app.modules.clients.models import Vehicle
+        from app.modules.service_orders.enums import TransferStatus as ServiceOrderTransferStatus
+        from app.modules.service_orders.models import ServiceOrder, ServiceOrderTransfer
+
+        rows = await self.db.execute(
+            select(ServiceOrderTransfer, ServiceOrder, Vehicle)
+            .join(ServiceOrder, ServiceOrder.id == ServiceOrderTransfer.service_order_id)
+            .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
+            .where(
+                ServiceOrder.filial_id == filial_id,
+                ServiceOrderTransfer.status == ServiceOrderTransferStatus.PEDIDO,
+            )
+            .order_by(ServiceOrderTransfer.fulfilled_at.desc())
+        )
+
+        results: list[ServiceOrderPartRequestRead] = []
+        for transfer, order, vehicle in rows.all():
+            lines: list[ServiceOrderPartRequestLineRead] = []
+            for line in transfer.lines:
+                part = await self.db.get(Part, line.part_id)
+                lines.append(
+                    ServiceOrderPartRequestLineRead(
+                        part_id=line.part_id,
+                        part_code=part.code if part else "",
+                        part_name=part.name if part else "",
+                        quantity=line.quantity,
+                    )
+                )
+            results.append(
+                ServiceOrderPartRequestRead(
+                    id=transfer.id,
+                    code=transfer.code,
+                    service_order_id=order.id,
+                    service_order_code=order.code,
+                    vehicle_label=f"{vehicle.brand} {vehicle.model} · {vehicle.plate}",
+                    fulfilled_at=transfer.fulfilled_at,
+                    warehouse_seen=transfer.warehouse_seen,
+                    lines=lines,
+                )
+            )
+        return results
+
+    async def acknowledge_service_order_request(self, transfer_id: uuid.UUID) -> None:
+        from app.modules.service_orders.exceptions import TransferNotFoundError as ServiceOrderTransferNotFoundError
+        from app.modules.service_orders.models import ServiceOrderTransfer
+
+        transfer = await self.db.get(ServiceOrderTransfer, transfer_id)
+        if transfer is None:
+            raise ServiceOrderTransferNotFoundError(str(transfer_id))
+        transfer.warehouse_seen = True
+        await self.db.commit()
 
     async def list_movements(
         self, filial_id: uuid.UUID, part_id: uuid.UUID | None = None, warehouse_id: uuid.UUID | None = None

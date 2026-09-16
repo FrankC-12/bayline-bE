@@ -7,23 +7,76 @@ from app.modules.parts.enums import PartSaleStatus, ReturnCondition, ReturnReaso
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, DiscountLabel
 
 
+class PartCategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
+class PartCategoryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+
+
+class PartCategoryRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    holding_id: uuid.UUID
+    name: str
+    is_active: bool
+
+
+class PartMeasureCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+
+
+class PartMeasureUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=60)
+
+
+class PartMeasureRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    holding_id: uuid.UUID
+    name: str
+    is_active: bool
+
+
 class PartCreate(BaseModel):
     filial_id: uuid.UUID
     code: str = Field(min_length=1, max_length=40)
+    manufacturer_part_number: str | None = Field(default=None, max_length=80)
     name: str = Field(min_length=1, max_length=150)
-    category: str = Field(min_length=1, max_length=80)
-    brand: str = Field(min_length=1, max_length=80)
-    application: str = Field(min_length=1, max_length=180)
+    category_id: uuid.UUID
+    # Vehicle fit — both optional (a truly generic part has neither); years
+    # independently optional, empty = fits every year (universal).
+    vehicle_brand_id: uuid.UUID | None = None
+    vehicle_model_id: uuid.UUID | None = None
+    year_from: int | None = Field(default=None, ge=1900, le=2100)
+    year_to: int | None = Field(default=None, ge=1900, le=2100)
+    measure_id: uuid.UUID | None = None
     unit: str = Field(min_length=1, max_length=30)
+    min_stock: int = Field(default=10, ge=0)
 
 
 class PartUpdate(BaseModel):
     code: str | None = Field(default=None, min_length=1, max_length=40)
+    manufacturer_part_number: str | None = None
     name: str | None = Field(default=None, min_length=1, max_length=150)
-    category: str | None = Field(default=None, min_length=1, max_length=80)
-    brand: str | None = Field(default=None, min_length=1, max_length=80)
-    application: str | None = Field(default=None, min_length=1, max_length=180)
+    category_id: uuid.UUID | None = None
+    vehicle_brand_id: uuid.UUID | None = None
+    vehicle_model_id: uuid.UUID | None = None
+    year_from: int | None = Field(default=None, ge=1900, le=2100)
+    year_to: int | None = Field(default=None, ge=1900, le=2100)
+    measure_id: uuid.UUID | None = None
     unit: str | None = Field(default=None, min_length=1, max_length=30)
+    min_stock: int | None = Field(default=None, ge=0)
+    # Clears (sets to None) an optional field the payload can't otherwise
+    # distinguish from "leave unchanged" — mirrors ServiceOrderUpdate's clear_*.
+    clear_vehicle_brand: bool = False
+    clear_vehicle_model: bool = False
+    clear_measure: bool = False
+    clear_manufacturer_part_number: bool = False
+    clear_years: bool = False
 
 
 class PartRead(BaseModel):
@@ -32,13 +85,26 @@ class PartRead(BaseModel):
     id: uuid.UUID
     filial_id: uuid.UUID
     code: str
+    manufacturer_part_number: str | None
     name: str
-    category: str
-    brand: str
-    application: str
+    category_id: uuid.UUID
+    category_name: str
+    vehicle_brand_id: uuid.UUID | None
+    vehicle_brand_name: str | None
+    vehicle_model_id: uuid.UUID | None
+    vehicle_model_name: str | None
+    year_from: int | None
+    year_to: int | None
+    measure_id: uuid.UUID | None
+    measure_name: str | None
     unit: str
+    min_stock: int
+    is_active: bool
     stock_total: int = 0
     reference_price: float | None = None
+    # Ubicación en almacén — jalada del lote recibido más recientemente que
+    # registró una, nunca escrita a mano en el catálogo.
+    location: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -46,9 +112,7 @@ class PartRead(BaseModel):
 class PartBulkItem(BaseModel):
     code: str = Field(min_length=1, max_length=40)
     name: str = Field(min_length=1, max_length=150)
-    category: str = Field(min_length=1, max_length=80)
-    brand: str = Field(min_length=1, max_length=80)
-    application: str = Field(min_length=1, max_length=180)
+    category: str = Field(min_length=1, max_length=60)
     unit: str = Field(min_length=1, max_length=30)
 
 

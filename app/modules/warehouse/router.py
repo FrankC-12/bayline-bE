@@ -4,13 +4,20 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.modules.filiales.exceptions import FilialNotFoundError
+from app.modules.filiales.models import Filial
 from app.modules.warehouse.schemas import (
     BulkLotCreate,
     BulkLotReview,
     BulkLotResult,
     InventoryRow,
+    PartLotDetailRead,
     PartLotRead,
+    ServiceOrderPartRequestRead,
     StockInCreate,
+    StockInReasonCreate,
+    StockInReasonRead,
+    StockInReasonUpdate,
     StockMovementRead,
     StockOutCreate,
     TransferCreate,
@@ -27,6 +34,9 @@ from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 
 MODULE_ID = "almacen"
+# Motivos de Entrada is managed from Ajustes, same permission boundary as the
+# other holding-wide catalogs (Marcas y Modelos, Categorías/Medidas de Repuestos).
+AJUSTES_MODULE_ID = "ajustes"
 
 router = APIRouter(tags=["Almacen"])
 
@@ -42,6 +52,22 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
+
+
+async def _ensure_ajustes_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, AJUSTES_MODULE_ID, level)
+
+
+async def _holding_id_for_filial(db: AsyncSession, filial_id: uuid.UUID) -> uuid.UUID:
+    filial = await db.get(Filial, filial_id)
+    if filial is None:
+        raise FilialNotFoundError(str(filial_id))
+    return filial.holding_id
 
 
 @router.get("/warehouses", response_model=list[WarehouseRead])
@@ -81,11 +107,12 @@ async def get_inventory(
     filial_id: uuid.UUID = Query(...),
     warehouse_id: uuid.UUID | None = Query(default=None),
     search: str | None = Query(default=None),
+    part_id: uuid.UUID | None = Query(default=None),
     current_user: CurrentUser = Depends(get_current_user),
     service: AlmacenService = Depends(get_service),
 ) -> list[InventoryRow]:
     await _ensure_access(current_user, filial_id, service.db)
-    return await service.get_inventory(filial_id, warehouse_id, search)
+    return await service.get_inventory(filial_id, warehouse_id, search, part_id)
 
 
 @router.get("/almacen/lots", response_model=list[PartLotRead])
@@ -93,12 +120,24 @@ async def list_lots(
     filial_id: uuid.UUID = Query(...),
     part_id: uuid.UUID | None = Query(default=None),
     warehouse_id: uuid.UUID | None = Query(default=None),
+    search: str | None = Query(default=None, description="Matches a lot code, e.g. 'L-104'."),
     current_user: CurrentUser = Depends(get_current_user),
     service: AlmacenService = Depends(get_service),
 ) -> list[PartLotRead]:
     await _ensure_access(current_user, filial_id, service.db)
-    lots = await service.list_lots(filial_id, part_id, warehouse_id)
+    lots = await service.list_lots(filial_id, part_id, warehouse_id, search)
     return [_lot_to_read(lot) for lot in lots]
+
+
+@router.get("/almacen/lots/{lot_id}", response_model=PartLotDetailRead)
+async def get_lot_detail(
+    lot_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> PartLotDetailRead:
+    lot = await service.get_lot(lot_id)
+    await _ensure_access(current_user, lot.filial_id, service.db)
+    return await service.get_lot_detail(lot)
 
 
 @router.post("/almacen/stock-in", response_model=list[PartLotRead], status_code=status.HTTP_201_CREATED)
@@ -197,6 +236,29 @@ async def update_transfer_status(
     return transfer_to_read(transfer)
 
 
+@router.get("/almacen/service-order-requests", response_model=list[ServiceOrderPartRequestRead])
+async def list_service_order_requests(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> list[ServiceOrderPartRequestRead]:
+    """Dispatched parts requests from Órdenes de Servicio, surfaced here so
+    almacén staff can see them alongside warehouse-to-warehouse transfers."""
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_service_order_requests(filial_id)
+
+
+@router.post("/almacen/service-order-requests/{transfer_id}/acknowledge", status_code=status.HTTP_204_NO_CONTENT)
+async def acknowledge_service_order_request(
+    transfer_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> None:
+    await _ensure_access(current_user, filial_id, service.db)
+    await service.acknowledge_service_order_request(transfer_id)
+
+
 @router.get("/almacen/movements", response_model=list[StockMovementRead])
 async def list_movements(
     filial_id: uuid.UUID = Query(...),
@@ -207,3 +269,67 @@ async def list_movements(
 ) -> list[StockMovementRead]:
     await _ensure_access(current_user, filial_id, service.db)
     return await service.list_movements(filial_id, part_id, warehouse_id)
+
+
+# Motivos de Entrada (Ajustes → Motivos de Entrada) — holding-wide.
+
+
+@router.get("/stock-in-reasons", response_model=list[StockInReasonRead])
+async def list_stock_in_reasons(
+    filial_id: uuid.UUID = Query(...),
+    include_inactive: bool = Query(default=False),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> list[StockInReasonRead]:
+    await _ensure_ajustes_access(current_user, filial_id, service.db)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.list_stock_in_reasons(holding_id, include_inactive)
+
+
+@router.post("/stock-in-reasons", response_model=StockInReasonRead, status_code=status.HTTP_201_CREATED)
+async def create_stock_in_reason(
+    payload: StockInReasonCreate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> StockInReasonRead:
+    await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.create_stock_in_reason(holding_id, payload)
+
+
+@router.patch("/stock-in-reasons/{reason_id}", response_model=StockInReasonRead)
+async def update_stock_in_reason(
+    reason_id: uuid.UUID,
+    payload: StockInReasonUpdate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> StockInReasonRead:
+    await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.update_stock_in_reason(reason_id, holding_id, payload)
+
+
+@router.post("/stock-in-reasons/{reason_id}/activate", response_model=StockInReasonRead)
+async def activate_stock_in_reason(
+    reason_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> StockInReasonRead:
+    await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.set_stock_in_reason_active(reason_id, holding_id, is_active=True)
+
+
+@router.post("/stock-in-reasons/{reason_id}/deactivate", response_model=StockInReasonRead)
+async def deactivate_stock_in_reason(
+    reason_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> StockInReasonRead:
+    await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    return await service.set_stock_in_reason_active(reason_id, holding_id, is_active=False)

@@ -30,6 +30,12 @@ class HoldingService:
         self.db.add(holding)
         await self.db.commit()
         await self.db.refresh(holding)
+
+        from app.modules.vehicle_catalog.service import VehicleCatalogService
+        from app.modules.warehouse.service import AlmacenService
+
+        await VehicleCatalogService(self.db).seed_default_brands(holding.id)
+        await AlmacenService(self.db).seed_default_stock_in_reasons(holding.id)
         return holding
 
     async def update_holding(self, holding_id: uuid.UUID, payload: HoldingUpdate) -> Holding:

@@ -1,12 +1,48 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.modules.parts.enums import PartAvailability, PartSaleStatus, ReturnCondition, ReturnReason
+
+
+class PartCategory(Base):
+    """A part category (e.g. Lubricantes, Frenos) shared by every filial in a
+    Holding — managed from Ajustes, same as VehicleBrand."""
+
+    __tablename__ = "part_categories"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    holding_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("holdings.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(60), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PartMeasure(Base):
+    """A part measure/size (e.g. a filter size, a tire measurement) shared by
+    every filial in a Holding — managed from Ajustes, same as VehicleBrand."""
+
+    __tablename__ = "part_measures"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    holding_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("holdings.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(60), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class Part(Base):
@@ -22,17 +58,38 @@ class Part(Base):
         index=True,
     )
     code: Mapped[str] = mapped_column(String(40), nullable=False)
+    # The manufacturer's own part number — distinct from `code`, our internal
+    # catalog code. Optional: not every part (e.g. a locally-made item) has one.
+    manufacturer_part_number: Mapped[str | None] = mapped_column(String(80), nullable=True)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
-    category: Mapped[str] = mapped_column(String(80), nullable=False, default="Sin categoría")
-    brand: Mapped[str] = mapped_column(String(80), nullable=False, default="Sin marca")
-    application: Mapped[str] = mapped_column(String(180), nullable=False, default="Universal")
+    category_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_categories.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    # Vehicle fit — the brand/model this part was built for. Both nullable:
+    # a truly generic part (e.g. shop supplies) has neither. year_from/year_to
+    # nullable independently — empty means "fits every year" (universal).
+    vehicle_brand_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vehicle_brands.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    vehicle_model_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vehicle_models.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    year_from: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    year_to: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    measure_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_measures.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     unit: Mapped[str] = mapped_column(String(30), nullable=False, default="Unidad")
+    # Never physically deleted — deactivate instead, same convention as every
+    # other catalog in the app (Bay, VehicleBrand, Filial...).
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Legacy compatibility fields. Catalog reads no longer expose or trust these;
     # stock and reference price are derived from part_lots.
     price: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
     stock_quantity: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # Stock mínimo / punto de reorden — set by hand on the catalog form.
     min_stock: Mapped[int] = mapped_column(Integer, nullable=False, default=10, server_default="10")
     availability: Mapped[PartAvailability] = mapped_column(
         Enum(PartAvailability, name="part_availability"),

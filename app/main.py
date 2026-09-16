@@ -24,6 +24,7 @@ from app.modules.inspections.router import router as inspections_router
 from app.modules.parts.router import router as parts_router
 from app.modules.post_ventas.router import router as post_ventas_router
 from app.modules.ajustes.router import router as ajustes_router
+from app.modules.vehicle_catalog.router import router as vehicle_catalog_router
 from app.modules.warehouse.router import router as almacen_router
 from app.modules.concesionario.router import router as concesionario_router
 from app.modules.administracion.router import router as administracion_router
@@ -91,6 +92,7 @@ app.include_router(inspections_router, prefix=settings.api_v1_prefix)
 app.include_router(parts_router, prefix=settings.api_v1_prefix)
 app.include_router(post_ventas_router, prefix=settings.api_v1_prefix)
 app.include_router(ajustes_router, prefix=settings.api_v1_prefix)
+app.include_router(vehicle_catalog_router, prefix=settings.api_v1_prefix)
 app.include_router(almacen_router, prefix=settings.api_v1_prefix)
 app.include_router(concesionario_router, prefix=settings.api_v1_prefix)
 app.include_router(administracion_router, prefix=settings.api_v1_prefix)

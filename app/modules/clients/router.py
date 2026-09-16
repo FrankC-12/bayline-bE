@@ -12,6 +12,7 @@ from app.modules.clients.schemas import (
     ClientRead,
     ClientUpdate,
     VehicleMaintenancePlanAssign,
+    VehicleMileageHistoryEntry,
     VehiclePlanStatusRead,
 )
 from app.modules.clients.service import ClientService
@@ -113,6 +114,20 @@ async def get_vehicle_plan_status(
     filial_id = await _vehicle_filial_id(service, vehicle_id)
     await _ensure_access(current_user, filial_id, service.db)
     return await service.get_vehicle_plan_status(vehicle_id)
+
+
+@router.get("/vehicles/{vehicle_id}/mileage-history", response_model=list[VehicleMileageHistoryEntry])
+async def get_vehicle_mileage_history(
+    vehicle_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ClientService = Depends(get_client_service),
+) -> list[VehicleMileageHistoryEntry]:
+    """Full history of recorded odometer readings for this vehicle, newest
+    first — one entry per preliminary inspection that captured a mileage,
+    never overwritten."""
+    filial_id = await _vehicle_filial_id(service, vehicle_id)
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_mileage_history(vehicle_id)
 
 
 @router.patch("/vehicles/{vehicle_id}/maintenance-plan", response_model=VehiclePlanStatusRead)
