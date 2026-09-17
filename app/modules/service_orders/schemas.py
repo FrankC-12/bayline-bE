@@ -2,12 +2,11 @@ import uuid
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, DiscountLabel
+from app.modules.post_ventas.schemas import VehicleWarrantyRead, WorkshopWarrantyRead
 from app.modules.service_orders.enums import (
-    ReworkAuthorizationStatus,
-    ReworkClaimStatus,
     ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
@@ -16,6 +15,7 @@ from app.modules.service_orders.enums import (
     TransferStatus,
     UpsellStatus,
     WarrantyClaimStatus,
+    WarrantyClaimType,
 )
 
 
@@ -219,88 +219,105 @@ class UpsellRead(BaseModel):
     resolved_at: datetime | None
 
 
-class ReworkClaimCreate(BaseModel):
+class WarrantyClaimCreate(BaseModel):
+    claim_type: WarrantyClaimType
+    vehicle_id: uuid.UUID
+    # Mandatory for claim_type=comeback (enforced below), optional otherwise.
+    service_order_id: uuid.UUID | None = None
     tempario_id: uuid.UUID | None = None
     part_id: uuid.UUID | None = None
-    # Optional here — the cause may genuinely not be known yet the day the
-    # client complains. It's required to close the claim (see ReworkClaimCloseInput).
     failure_category: ReworkFailureCategory | None = None
-    failure_cause: str = Field(min_length=3, max_length=300)
+    failure_cause: str | None = Field(default=None, max_length=300)
+    reported_symptom: str | None = Field(default=None, max_length=1000)
+    reported_mileage: int = Field(ge=0)
     claimed_at: date = Field(default_factory=date.today)
     note: str | None = Field(default=None, max_length=500)
 
+    @model_validator(mode="after")
+    def _check_fields_for_claim_type(self) -> "WarrantyClaimCreate":
+        if self.claim_type == WarrantyClaimType.COMEBACK and self.service_order_id is None:
+            raise ValueError("Un reclamo de tipo comeback debe referenciar la orden de servicio de origen.")
+        if self.claim_type in (WarrantyClaimType.COMEBACK, WarrantyClaimType.REPUESTO_PROVEEDOR):
+            if not self.failure_cause or len(self.failure_cause.strip()) < 3:
+                raise ValueError("Describe la causa de la falla.")
+        else:
+            if not self.reported_symptom or len(self.reported_symptom.strip()) < 3:
+                raise ValueError("Describe el síntoma reportado.")
+        return self
 
-class ReworkClaimCloseInput(BaseModel):
-    # Optional only because the claim may already carry a category from
-    # creation — omit it here to close with whatever's already on record.
-    # Closing with neither set raises FailureCategoryRequiredError.
-    failure_category: ReworkFailureCategory | None = None
-    note: str | None = Field(default=None, max_length=500)
 
-
-class ReworkClaimAuthorizationInput(BaseModel):
+class WarrantyClaimAuthorizationInput(BaseModel):
     decision: Literal["aprobado", "rechazado"]
-    # The explicit, recorded exception to authorize without a vigente
-    # factory warranty on the vehicle — ignored on rejection.
+    # Only meaningful for claim_type in (fabrica, campana_recall) — the
+    # explicit, recorded exception to authorize without a vigente factory
+    # warranty on the vehicle. Ignored on rejection.
     warranty_override: bool = False
     warranty_override_note: str | None = Field(default=None, max_length=500)
-    # For the new order this decision opens — kept minimal, auto-derived
-    # from the original order when omitted (see the service method).
+    # Only meaningful for claim_type in (comeback, repuesto_proveedor) when
+    # the claim wasn't created with one yet.
+    failure_category: ReworkFailureCategory | None = None
+
+
+class WarrantyClaimConvertInput(BaseModel):
+    # For the new order this step opens — kept minimal, auto-derived from
+    # the original order (if any) or the claim's own reported_mileage when
+    # omitted (see convert_warranty_claim_to_order).
     intake_mileage: int | None = Field(default=None, ge=0)
     promised_at: date | None = None
 
 
-class ReworkClaimRead(BaseModel):
+class WarrantyClaimRead(BaseModel):
     id: uuid.UUID
-    service_order_id: uuid.UUID
+    code: str
+    filial_id: uuid.UUID
+    claim_type: WarrantyClaimType
+    vehicle_id: uuid.UUID
+    vehicle_plate: str
+    vehicle_vin: str | None
+    client_name: str
+    service_order_id: uuid.UUID | None
+    service_order_code: str | None
     tempario_id: uuid.UUID | None
     tempario_name: str | None
     part_id: uuid.UUID | None
     part_name: str | None
     failure_category: ReworkFailureCategory | None
-    failure_cause: str
+    failure_cause: str | None
+    reported_symptom: str | None
+    reported_mileage: int
+    vehicle_mileage_at_claim: int | None
+    mileage_inconsistent: bool
     claimed_at: date
-    days_since_invoice: int | None
     recorded_by_user_id: uuid.UUID | None
     note: str | None
+    photo_urls: list[str]
+    document_urls: list[str]
     created_at: datetime
-    status: ReworkClaimStatus
-    closed_at: datetime | None
-    closed_by_user_id: uuid.UUID | None
-    # Populated only once the claim is closed with failure_category
-    # repuesto_defectuoso — either the ids of the SupplierClaim(s) generated
-    # automatically, or a note explaining why none could be (e.g. the lot
-    # predates this feature and has no purchase order on record).
+    status: WarrantyClaimStatus
+    # Populated only once a repuesto_proveedor claim is converted — either
+    # the ids of the SupplierClaim(s) generated automatically, or a note
+    # explaining why none could be (e.g. the lot predates this feature and
+    # has no purchase order on record).
     auto_generated_supplier_claim_ids: list[uuid.UUID] = Field(default_factory=list)
     supplier_claim_note: str | None = None
-    authorization_status: ReworkAuthorizationStatus
     authorized_by_user_id: uuid.UUID | None
     authorized_at: datetime | None
     warranty_override: bool
     warranty_override_note: str | None
+    converted_by_user_id: uuid.UUID | None
+    converted_at: datetime | None
     resulting_service_order_id: uuid.UUID | None
     resulting_service_order_code: str | None = None
 
 
-class WarrantyClaimCreate(BaseModel):
-    vehicle_id: uuid.UUID
-    warranty_ids: list[uuid.UUID] = Field(min_length=1)
-    reported_symptom: str = Field(min_length=3, max_length=1000)
-    reported_mileage: int = Field(ge=0)
+class WarrantyClaimContext(BaseModel):
+    """Everything an advisor needs to verify what the system claims about a
+    vehicle before filing a warranty claim against it, instead of trusting a
+    bare pass/fail message."""
 
-
-class WarrantyClaimRead(BaseModel):
-    id: uuid.UUID
-    filial_id: uuid.UUID
-    vehicle_id: uuid.UUID
-    vehicle_plate: str
-    vehicle_vin: str | None
-    client_name: str
-    reported_symptom: str
-    reported_mileage: int
-    vehicle_mileage_at_claim: int | None
-    mileage_inconsistent: bool
-    status: WarrantyClaimStatus
-    warranty_ids: list[uuid.UUID]
-    recorded_by_user_id: uuid.UUID | None
-    created_at: datetime
+    current_mileage: int | None
+    last_visit_date: date | None
+    last_visit_service_order_code: str | None
+    factory_warranty: VehicleWarrantyRead | None = None
+    workshop_warranties: list[WorkshopWarrantyRead] = Field(default_factory=list)
+    duplicate_open_claim: WarrantyClaimRead | None = None

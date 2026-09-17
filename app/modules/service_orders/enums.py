@@ -15,8 +15,9 @@ class ServiceOrderType(str, enum.Enum):
     # ODS" form deliberately hides this option so it can't be picked with
     # no workflow behind it. Kept in the API/enum for when that module ships.
     MPT = "mpt"
-    # Opened automatically when a manager authorizes a ReworkClaim — see
-    # ServiceOrderService.authorize_rework_claim. Never picked by hand.
+    # Opened automatically when a WarrantyClaim is converted to an order —
+    # see ServiceOrderService.convert_warranty_claim_to_order. Never picked
+    # by hand.
     RETRABAJO = "retrabajo"
 
 
@@ -45,19 +46,18 @@ class ReworkFailureCategory(str, enum.Enum):
     NO_DETERMINADA = "no_determinada"
 
 
-class ReworkClaimStatus(str, enum.Enum):
-    ABIERTO = "abierto"
-    CERRADO = "cerrado"
-
-
-class ReworkAuthorizationStatus(str, enum.Enum):
-    PENDIENTE = "pendiente"
-    APROBADO = "aprobado"
-    RECHAZADO = "rechazado"
+class WarrantyClaimType(str, enum.Enum):
+    FABRICA = "fabrica"
+    COMEBACK = "comeback"
+    REPUESTO_PROVEEDOR = "repuesto_proveedor"
+    CAMPANA_RECALL = "campana_recall"
 
 
 class WarrantyClaimStatus(str, enum.Enum):
     SOLICITADO = "solicitado"
+    AUTORIZADO = "autorizado"
+    RECHAZADO = "rechazado"
+    CONVERTIDO_A_ODS = "convertido_a_ods"
 
 
 class ServiceOrderPayer(str, enum.Enum):

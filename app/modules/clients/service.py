@@ -182,6 +182,19 @@ class ClientService:
         inspection = latest.get(vehicle_id)
         return inspection.mileage if inspection else None
 
+    async def get_mileage_context(
+        self, vehicle_id: uuid.UUID
+    ) -> tuple[int | None, date | None, uuid.UUID | None]:
+        """Mileage, visit date, and originating service_order_id from the
+        vehicle's most recent mileage-carrying inspection — the same source
+        as get_current_mileage, bundled for callers (e.g. a warranty claim's
+        coverage-context panel) that need the visit date too."""
+        latest = await self._latest_mileage_inspections([vehicle_id])
+        inspection = latest.get(vehicle_id)
+        if inspection is None:
+            return None, None, None
+        return inspection.mileage, inspection.created_at.date(), inspection.service_order_id
+
     async def list_mileage_history(self, vehicle_id: uuid.UUID) -> list[VehicleMileageHistoryEntry]:
         """Every recorded odometer reading for this vehicle, newest first —
         one entry per PreliminaryInspection that captured a mileage. Nothing

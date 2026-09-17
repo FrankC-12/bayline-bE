@@ -19,8 +19,8 @@ from app.modules.kpis.service import KpiService
 from app.modules.post_ventas.enums import TemparioCategory
 from app.modules.post_ventas.models import Tempario
 from app.modules.parts.models import Part
-from app.modules.service_orders.enums import ReworkFailureCategory
-from app.modules.service_orders.models import ReworkClaim, ServiceOrder, ServiceOrderInvoice
+from app.modules.service_orders.enums import ReworkFailureCategory, WarrantyClaimType
+from app.modules.service_orders.models import ServiceOrder, ServiceOrderInvoice, WarrantyClaim
 
 
 @pytest.fixture
@@ -78,16 +78,18 @@ async def test_rework_rate_and_breakdown(env):
     session.commit()
 
     # Quick claim (5 days) on order1/tech_a — likely workmanship.
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order1.id, tempario_id=tempario.id,
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=1, claim_type=WarrantyClaimType.COMEBACK,
+        vehicle_id=order1.vehicle_id, service_order_id=order1.id, tempario_id=tempario.id,
         failure_category=ReworkFailureCategory.MANO_DE_OBRA,
-        failure_cause="Fuga de aceite", claimed_at=date(2026, 3, 20),
+        failure_cause="Fuga de aceite", reported_mileage=0, claimed_at=date(2026, 3, 20),
     ))
     # Slow claim (60 days) on order3/tech_b, referencing a part — likely normal wear.
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order3.id, part_id=part.id,
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=2, claim_type=WarrantyClaimType.COMEBACK,
+        vehicle_id=order3.vehicle_id, service_order_id=order3.id, part_id=part.id,
         failure_category=ReworkFailureCategory.NO_DETERMINADA,
-        failure_cause="Filtro obstruido", claimed_at=date(2026, 5, 14),
+        failure_cause="Filtro obstruido", reported_mileage=0, claimed_at=date(2026, 5, 14),
     ))
     session.commit()
 
@@ -119,9 +121,10 @@ async def test_rework_rate_and_breakdown(env):
     # order2 (tech_a, no claim) must not appear in either breakdown's claim counts,
     # and orders outside the invoicing window must not count at all.
     order4, _ = make_invoiced_order(session, filial_id, client_id, tech_a, datetime(2026, 4, 15, tzinfo=timezone.utc))
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order4.id, failure_category=ReworkFailureCategory.NO_DETERMINADA,
-        failure_cause="Fuera de rango", claimed_at=date(2026, 4, 20),
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=3, claim_type=WarrantyClaimType.COMEBACK,
+        vehicle_id=order4.vehicle_id, service_order_id=order4.id, failure_category=ReworkFailureCategory.NO_DETERMINADA,
+        failure_cause="Fuera de rango", reported_mileage=0, claimed_at=date(2026, 4, 20),
     ))
     session.commit()
     report_march = await service.get_rework_report(filial_id, date(2026, 3, 1), date(2026, 3, 31))

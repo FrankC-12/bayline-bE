@@ -1,13 +1,15 @@
 import datetime as dt
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.storage import save_upload_attachment
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
-from app.modules.post_ventas.schemas import VehicleWarrantyRead
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 from app.modules.service_orders.billing_schemas import (
@@ -16,16 +18,12 @@ from app.modules.service_orders.billing_schemas import (
     InvoiceCreate,
     ReceivableRead,
 )
-from app.modules.service_orders.enums import ServiceOrderStatus
+from app.modules.service_orders.enums import ReworkFailureCategory, ServiceOrderStatus, WarrantyClaimStatus, WarrantyClaimType
 from app.modules.service_orders.schemas import (
     BayCreate,
     BayRead,
     BayUpdate,
     OrderSummary,
-    ReworkClaimAuthorizationInput,
-    ReworkClaimCloseInput,
-    ReworkClaimCreate,
-    ReworkClaimRead,
     ServiceOrderCloseInput,
     ServiceOrderCreate,
     ServiceOrderRead,
@@ -40,6 +38,9 @@ from app.modules.service_orders.schemas import (
     UpsellCreate,
     UpsellRead,
     UpsellStatusUpdate,
+    WarrantyClaimAuthorizationInput,
+    WarrantyClaimContext,
+    WarrantyClaimConvertInput,
     WarrantyClaimCreate,
     WarrantyClaimRead,
 )
@@ -536,73 +537,6 @@ async def collect_receivable(
     return await billing.collect_invoice(invoice_id, payload, current_user.user_id)
 
 
-# Rework claims (garantía de taller) — feeds the Torre de Control rework-rate metric.
-
-
-@router.post(
-    "/service-orders/{order_id}/rework-claims",
-    response_model=ReworkClaimRead,
-    status_code=status.HTTP_201_CREATED,
-)
-async def create_rework_claim(
-    order_id: uuid.UUID,
-    payload: ReworkClaimCreate,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: ServiceOrderService = Depends(get_service),
-) -> ReworkClaimRead:
-    order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_rework_claim(order_id, payload, current_user.user_id)
-
-
-@router.get("/service-orders/{order_id}/rework-claims", response_model=list[ReworkClaimRead])
-async def list_rework_claims(
-    order_id: uuid.UUID,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: ServiceOrderService = Depends(get_service),
-) -> list[ReworkClaimRead]:
-    order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db)
-    return await service.list_rework_claims(order_id)
-
-
-@router.post(
-    "/service-orders/{order_id}/rework-claims/{claim_id}/close",
-    response_model=ReworkClaimRead,
-)
-async def close_rework_claim(
-    order_id: uuid.UUID,
-    claim_id: uuid.UUID,
-    payload: ReworkClaimCloseInput,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: ServiceOrderService = Depends(get_service),
-) -> ReworkClaimRead:
-    order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.close_rework_claim(claim_id, payload, current_user.user_id)
-
-
-@router.post(
-    "/service-orders/{order_id}/rework-claims/{claim_id}/authorize",
-    response_model=ReworkClaimRead,
-)
-async def authorize_rework_claim(
-    order_id: uuid.UUID,
-    claim_id: uuid.UUID,
-    payload: ReworkClaimAuthorizationInput,
-    current_user: CurrentUser = Depends(get_current_user),
-    service: ServiceOrderService = Depends(get_service),
-) -> ReworkClaimRead:
-    # Deliberately gated by the "administracion" module (jefe de
-    # taller/gerente territory — reclamos are already its stated job, see
-    # seed_roles.py), NOT "asesor-servicios" like the sibling endpoints
-    # above — an asesor can create and close a claim, but cannot approve
-    # or reject its own warranty request.
-    order = await service.get_order(order_id)
-    await ensure_module_access(service.db, current_user, order.filial_id, "administracion", AccessLevel.EDITAR)
-    return await service.authorize_rework_claim(claim_id, payload, current_user.user_id)
-
-
 @router.post("/service-orders/{order_id}/close", response_model=ServiceOrderRead)
 async def close_service_order(
     order_id: uuid.UUID,
@@ -617,36 +551,137 @@ async def close_service_order(
     )
 
 
+# Warranty claims (unified "reclamo de garantía") — covers factory,
+# comeback (garantía de taller), defective-part (proveedor), and
+# campaign/recall claims in one flow: solicitado -> autorizado/rechazado ->
+# (if autorizado) convertido_a_ods.
+
+
+@router.get("/warranty-claims/context", response_model=WarrantyClaimContext)
+async def get_warranty_claim_context(
+    vehicle_id: uuid.UUID = Query(...),
+    service_order_id: uuid.UUID | None = Query(default=None),
+    tempario_id: uuid.UUID | None = Query(default=None),
+    part_id: uuid.UUID | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> WarrantyClaimContext:
+    filial_id = await service.get_vehicle_filial_id(vehicle_id)
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.get_claim_context(vehicle_id, service_order_id, tempario_id, part_id)
+
+
 @router.get("/warranty-claims", response_model=list[WarrantyClaimRead])
 async def list_warranty_claims(
     filial_id: uuid.UUID = Query(...),
+    status_filter: WarrantyClaimStatus | None = Query(default=None, alias="status"),
+    vehicle_id: uuid.UUID | None = Query(default=None),
+    service_order_id: uuid.UUID | None = Query(default=None),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> list[WarrantyClaimRead]:
     await _ensure_access(current_user, filial_id, service.db)
-    return await service.list_warranty_claims(filial_id)
+    return await service.list_warranty_claims(filial_id, status_filter, vehicle_id, service_order_id)
 
 
-@router.get(
-    "/warranty-claims/vehicles/{vehicle_id}/warranties",
-    response_model=list[VehicleWarrantyRead],
-)
-async def get_vehicle_warranties_for_claim(
-    vehicle_id: uuid.UUID,
+@router.get("/warranty-claims/{claim_id}", response_model=WarrantyClaimRead)
+async def get_warranty_claim(
+    claim_id: uuid.UUID,
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
-) -> list[VehicleWarrantyRead]:
-    filial_id, warranties = await service.get_vehicle_warranties_for_claim(vehicle_id)
+) -> WarrantyClaimRead:
+    claim = await service.get_warranty_claim(claim_id)
+    filial_id = await service.get_vehicle_filial_id(claim.vehicle_id)
     await _ensure_access(current_user, filial_id, service.db)
-    return warranties
+    return claim
 
 
 @router.post("/warranty-claims", response_model=WarrantyClaimRead, status_code=status.HTTP_201_CREATED)
 async def create_warranty_claim(
-    payload: WarrantyClaimCreate,
+    claim_type: WarrantyClaimType = Form(...),
+    vehicle_id: uuid.UUID = Form(...),
+    service_order_id: uuid.UUID | None = Form(default=None),
+    tempario_id: uuid.UUID | None = Form(default=None),
+    part_id: uuid.UUID | None = Form(default=None),
+    failure_category: ReworkFailureCategory | None = Form(default=None),
+    failure_cause: str | None = Form(default=None),
+    reported_symptom: str | None = Form(default=None),
+    reported_mileage: int = Form(...),
+    claimed_at: dt.date = Form(default_factory=dt.date.today),
+    note: str | None = Form(default=None),
+    photos: list[UploadFile] = File(default=[]),
+    documents: list[UploadFile] = File(default=[]),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> WarrantyClaimRead:
-    filial_id, _ = await service.get_vehicle_warranties_for_claim(payload.vehicle_id)
+    filial_id = await service.get_vehicle_filial_id(vehicle_id)
     await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_warranty_claim(payload, current_user.user_id)
+
+    settings = get_settings()
+    photo_urls = [
+        await save_upload_attachment(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="warranty-claims",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        for photo in photos
+    ]
+    document_urls = [
+        await save_upload_attachment(
+            document,
+            directory=Path(settings.uploads_dir),
+            subdir="warranty-claims",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        for document in documents
+    ]
+
+    payload = WarrantyClaimCreate(
+        claim_type=claim_type,
+        vehicle_id=vehicle_id,
+        service_order_id=service_order_id,
+        tempario_id=tempario_id,
+        part_id=part_id,
+        failure_category=failure_category,
+        failure_cause=failure_cause,
+        reported_symptom=reported_symptom,
+        reported_mileage=reported_mileage,
+        claimed_at=claimed_at,
+        note=note,
+    )
+    return await service.create_warranty_claim(payload, photo_urls, document_urls, current_user.user_id)
+
+
+@router.post("/warranty-claims/{claim_id}/authorize", response_model=WarrantyClaimRead)
+async def authorize_warranty_claim(
+    claim_id: uuid.UUID,
+    payload: WarrantyClaimAuthorizationInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> WarrantyClaimRead:
+    # Deliberately gated by the "administracion" module (jefe de
+    # taller/gerente territory — reclamos are already its stated job, see
+    # seed_roles.py), NOT "asesor-servicios" — an asesor can create a claim,
+    # but cannot approve or reject its own warranty request.
+    claim = await service.get_warranty_claim(claim_id)
+    filial_id = await service.get_vehicle_filial_id(claim.vehicle_id)
+    await ensure_module_access(service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR)
+    return await service.authorize_warranty_claim(claim_id, payload, current_user.user_id)
+
+
+@router.post("/warranty-claims/{claim_id}/convert-to-order", response_model=WarrantyClaimRead)
+async def convert_warranty_claim_to_order(
+    claim_id: uuid.UUID,
+    payload: WarrantyClaimConvertInput = WarrantyClaimConvertInput(),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> WarrantyClaimRead:
+    # Same gate as authorize — converting an authorized claim into a real
+    # order is the continuation of the same approval decision.
+    claim = await service.get_warranty_claim(claim_id)
+    filial_id = await service.get_vehicle_filial_id(claim.vehicle_id)
+    await ensure_module_access(service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR)
+    return await service.convert_warranty_claim_to_order(claim_id, payload, current_user.user_id)

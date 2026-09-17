@@ -174,11 +174,11 @@ class SupplierClaimCreate(BaseModel):
     claimed_amount: float | None = Field(default=None, ge=0)
     currency: AccountCurrency | None = None
     client_id: uuid.UUID | None = None
-    # Set when this claim is generated automatically from a rework claim on
-    # a defective part — see ServiceOrderService.create_rework_claim.
+    # Set when this claim is generated automatically from a warranty claim
+    # on a defective part — see ServiceOrderService.convert_warranty_claim_to_order.
     lot_id: uuid.UUID | None = None
     purchase_request_id: uuid.UUID | None = None
-    rework_claim_id: uuid.UUID | None = None
+    warranty_claim_id: uuid.UUID | None = None
 
 
 class SupplierClaimUpdate(BaseModel):
@@ -225,7 +225,7 @@ class SupplierClaimRead(BaseModel):
     expense_entry_id: uuid.UUID | None
     lot_id: uuid.UUID | None = None
     purchase_request_id: uuid.UUID | None = None
-    rework_claim_id: uuid.UUID | None = None
+    warranty_claim_id: uuid.UUID | None = None
 
 
 # Accounts

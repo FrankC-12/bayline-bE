@@ -11,10 +11,8 @@ from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
 from app.modules.parts.pricing import price_parts_cost
 from app.modules.parts.service import _sync_availability
-from app.modules.post_ventas.models import LaborSettings, Tempario, VehicleWarranty
+from app.modules.post_ventas.models import LaborSettings, Tempario
 from app.modules.service_orders.enums import (
-    ReworkAuthorizationStatus,
-    ReworkClaimStatus,
     ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
@@ -22,28 +20,30 @@ from app.modules.service_orders.enums import (
     TaskStatus,
     TransferStatus,
     UpsellStatus,
+    WarrantyClaimStatus,
+    WarrantyClaimType,
 )
 from app.modules.service_orders.exceptions import (
     BayNotFoundError,
     FailureCategoryRequiredError,
     InvalidStatusTransitionError,
     OrderNotInvoicedError,
-    ReworkClaimAlreadyAuthorizedError,
-    ReworkClaimAlreadyClosedError,
-    ReworkClaimNotFoundError,
-    ReworkClaimReferenceMismatchError,
     ServiceOrderNotFoundError,
+    ServiceOrderRequiredForComebackError,
     TaskNotFoundError,
     TransferNotFoundError,
     UpsellNotFoundError,
     VehicleWarrantyRequiredError,
-    WarrantyClaimWarrantyMismatchError,
+    WarrantyClaimAlreadyConvertedError,
+    WarrantyClaimAlreadyDecidedError,
+    WarrantyClaimNotAuthorizedError,
+    WarrantyClaimNotFoundError,
+    WarrantyClaimReferenceMismatchError,
     WarrantyOverrideNoteRequiredError,
 )
 from app.modules.service_orders.guards import require_editable_order
 from app.modules.service_orders.models import (
     Bay,
-    ReworkClaim,
     ServiceOrder,
     ServiceOrderInvoice,
     ServiceOrderTask,
@@ -52,22 +52,20 @@ from app.modules.service_orders.models import (
     ServiceOrderTransferLotAllocation,
     Upsell,
     WarrantyClaim,
-    WarrantyClaimWarranty,
 )
 from app.modules.service_orders.schemas import (
     BayCreate,
     BayUpdate,
     OrderSummary,
-    ReworkClaimAuthorizationInput,
-    ReworkClaimCloseInput,
-    ReworkClaimCreate,
-    ReworkClaimRead,
     ServiceOrderCreate,
     ServiceOrderUpdate,
     TaskRead,
     TransferLineRead,
     TransferRead,
     UpsellCreate,
+    WarrantyClaimAuthorizationInput,
+    WarrantyClaimContext,
+    WarrantyClaimConvertInput,
     WarrantyClaimCreate,
     WarrantyClaimRead,
 )
@@ -825,11 +823,12 @@ class ServiceOrderService:
         await self.db.refresh(upsell)
         return upsell
 
-    # Rework claims (garantía de taller) — a comeback complaint about an
-    # already-invoiced order. Deliberately NOT gated by require_editable_order:
-    # it records a new fact about a locked order, it doesn't modify the order.
+    # Warranty claims (unified "reclamo de garantía") — covers all four
+    # responsible-party cases: factory/importer, a shop-assumed comeback, a
+    # supplier-assumed defective part, or a manufacturer campaign/recall.
+    # Creating a claim never touches an existing order; converting one does.
 
-    async def _rework_claim_to_read(self, claim: ReworkClaim, invoice: ServiceOrderInvoice) -> ReworkClaimRead:
+    async def _warranty_claim_to_read(self, claim: WarrantyClaim, vehicle: Vehicle) -> WarrantyClaimRead:
         tempario_name = None
         if claim.tempario_id is not None:
             tempario = await self.db.get(Tempario, claim.tempario_id)
@@ -839,82 +838,107 @@ class ServiceOrderService:
             part = await self.db.get(Part, claim.part_id)
             part_name = part.name if part else None
 
+        service_order_code = None
+        if claim.service_order_id is not None:
+            order = await self.db.get(ServiceOrder, claim.service_order_id)
+            service_order_code = order.code if order else None
+
         auto_claim_ids: list[uuid.UUID] = []
         supplier_claim_note: str | None = None
         if (
-            claim.status == ReworkClaimStatus.CERRADO
-            and claim.failure_category == ReworkFailureCategory.REPUESTO_DEFECTUOSO
+            claim.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
+            and claim.claim_type == WarrantyClaimType.REPUESTO_PROVEEDOR
             and claim.part_id is not None
         ):
             result = await self.db.execute(
-                select(SupplierClaim.id).where(SupplierClaim.rework_claim_id == claim.id)
+                select(SupplierClaim.id).where(SupplierClaim.warranty_claim_id == claim.id)
             )
             auto_claim_ids = [row[0] for row in result.all()]
             if not auto_claim_ids:
-                # Same "actually dispatched" scoping as _auto_claim_defective_part
-                # — a pre-dispatch price-preview allocation doesn't count as
-                # "hay un despacho registrado."
-                has_allocation = (
-                    await self.db.execute(
-                        select(ServiceOrderTransferLotAllocation.id)
-                        .join(
-                            ServiceOrderTransferLine,
-                            ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
-                        )
-                        .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
-                        .where(
-                            ServiceOrderTransfer.service_order_id == claim.service_order_id,
-                            ServiceOrderTransferLine.part_id == claim.part_id,
-                            ServiceOrderTransfer.status == TransferStatus.PEDIDO,
-                        )
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
-                if has_allocation is None:
+                if claim.service_order_id is None:
                     supplier_claim_note = (
-                        "No se pudo generar el reclamo al proveedor: no hay un despacho de este repuesto "
-                        "registrado en la orden."
+                        "No se pudo generar el reclamo al proveedor: este reclamo no tiene una orden de "
+                        "servicio de origen de la que trazar el despacho."
                     )
                 else:
-                    supplier_claim_note = (
-                        "No se pudo generar el reclamo al proveedor: el lote de origen no tiene una orden "
-                        "de compra asociada."
-                    )
+                    # Same "actually dispatched" scoping as _auto_claim_defective_part
+                    # — a pre-dispatch price-preview allocation doesn't count as
+                    # "hay un despacho registrado."
+                    has_allocation = (
+                        await self.db.execute(
+                            select(ServiceOrderTransferLotAllocation.id)
+                            .join(
+                                ServiceOrderTransferLine,
+                                ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
+                            )
+                            .join(
+                                ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id
+                            )
+                            .where(
+                                ServiceOrderTransfer.service_order_id == claim.service_order_id,
+                                ServiceOrderTransferLine.part_id == claim.part_id,
+                                ServiceOrderTransfer.status == TransferStatus.PEDIDO,
+                            )
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                    if has_allocation is None:
+                        supplier_claim_note = (
+                            "No se pudo generar el reclamo al proveedor: no hay un despacho de este repuesto "
+                            "registrado en la orden."
+                        )
+                    else:
+                        supplier_claim_note = (
+                            "No se pudo generar el reclamo al proveedor: el lote de origen no tiene una orden "
+                            "de compra asociada."
+                        )
 
         resulting_service_order_code = None
         if claim.resulting_service_order_id is not None:
             resulting_order = await self.db.get(ServiceOrder, claim.resulting_service_order_id)
             resulting_service_order_code = resulting_order.code if resulting_order else None
 
-        return ReworkClaimRead(
+        return WarrantyClaimRead(
             id=claim.id,
+            code=claim.code,
+            filial_id=claim.filial_id,
+            claim_type=claim.claim_type,
+            vehicle_id=claim.vehicle_id,
+            vehicle_plate=vehicle.plate,
+            vehicle_vin=vehicle.vin,
+            client_name=vehicle.client.full_name,
             service_order_id=claim.service_order_id,
+            service_order_code=service_order_code,
             tempario_id=claim.tempario_id,
             tempario_name=tempario_name,
             part_id=claim.part_id,
             part_name=part_name,
             failure_category=claim.failure_category,
             failure_cause=claim.failure_cause,
+            reported_symptom=claim.reported_symptom,
+            reported_mileage=claim.reported_mileage,
+            vehicle_mileage_at_claim=claim.vehicle_mileage_at_claim,
+            mileage_inconsistent=claim.mileage_inconsistent,
             claimed_at=claim.claimed_at,
-            days_since_invoice=(claim.claimed_at - invoice.issued_at.date()).days,
             recorded_by_user_id=claim.recorded_by_user_id,
             note=claim.note,
+            photo_urls=list(claim.photo_urls or []),
+            document_urls=list(claim.document_urls or []),
             created_at=claim.created_at,
             status=claim.status,
-            closed_at=claim.closed_at,
-            closed_by_user_id=claim.closed_by_user_id,
             auto_generated_supplier_claim_ids=auto_claim_ids,
             supplier_claim_note=supplier_claim_note,
-            authorization_status=claim.authorization_status,
             authorized_by_user_id=claim.authorized_by_user_id,
             authorized_at=claim.authorized_at,
             warranty_override=claim.warranty_override,
             warranty_override_note=claim.warranty_override_note,
+            converted_by_user_id=claim.converted_by_user_id,
+            converted_at=claim.converted_at,
             resulting_service_order_id=claim.resulting_service_order_id,
             resulting_service_order_code=resulting_service_order_code,
         )
 
-    async def _auto_claim_defective_part(self, order: ServiceOrder, claim: ReworkClaim) -> None:
+    async def _auto_claim_defective_part(self, order: ServiceOrder, claim: WarrantyClaim) -> None:
         # Only allocations from an actually-dispatched ODT count as real
         # consumption — a line's allocation is set the moment it's added
         # (a FIFO price preview, before any stock moves) and again,
@@ -962,10 +986,10 @@ class ServiceOrderService:
                     part_id=claim.part_id,
                     quantity=quantity,
                     supplier_id=purchase_request.supplier_id,
-                    note=f"Generado automáticamente — retrabajo {order.code}, repuesto defectuoso",
+                    note=f"Generado automáticamente — reclamo {claim.code}, repuesto defectuoso",
                     lot_id=lot.id,
                     purchase_request_id=purchase_request.id,
-                    rework_claim_id=claim.id,
+                    warranty_claim_id=claim.id,
                 )
             )
 
@@ -978,82 +1002,302 @@ class ServiceOrderService:
             raise OrderNotInvoicedError()
         return invoice
 
-    async def create_rework_claim(
-        self, order_id: uuid.UUID, payload: ReworkClaimCreate, recorded_by_user_id: uuid.UUID | None
-    ) -> ReworkClaimRead:
-        order = await self.get_order(order_id)
-        invoice = await self._get_order_invoice(order_id)
+    async def _next_claim_sequence_number(self, filial_id: uuid.UUID) -> int:
+        result = await self.db.execute(
+            select(func.max(WarrantyClaim.sequence_number)).where(WarrantyClaim.filial_id == filial_id)
+        )
+        current_max = result.scalar()
+        return (current_max or 100) + 1
 
-        if payload.tempario_id is not None:
-            task = (
-                await self.db.execute(
-                    select(ServiceOrderTask).where(
-                        ServiceOrderTask.service_order_id == order_id,
-                        ServiceOrderTask.tempario_id == payload.tempario_id,
+    async def _check_duplicate_open_claim(
+        self, vehicle_id: uuid.UUID, tempario_id: uuid.UUID | None, part_id: uuid.UUID | None
+    ) -> WarrantyClaim | None:
+        """Non-blocking: a claim already open (solicitado/autorizado) for the
+        same vehicle and the same 'componente' (task or part) — surfaced as
+        a warning, never a hard stop."""
+        if tempario_id is None and part_id is None:
+            return None
+        conditions = []
+        if tempario_id is not None:
+            conditions.append(WarrantyClaim.tempario_id == tempario_id)
+        if part_id is not None:
+            conditions.append(WarrantyClaim.part_id == part_id)
+        result = await self.db.execute(
+            select(WarrantyClaim)
+            .where(
+                WarrantyClaim.vehicle_id == vehicle_id,
+                WarrantyClaim.status.in_([WarrantyClaimStatus.SOLICITADO, WarrantyClaimStatus.AUTORIZADO]),
+                *conditions,
+            )
+            .order_by(WarrantyClaim.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_claim_context(
+        self,
+        vehicle_id: uuid.UUID,
+        service_order_id: uuid.UUID | None = None,
+        tempario_id: uuid.UUID | None = None,
+        part_id: uuid.UUID | None = None,
+    ) -> WarrantyClaimContext:
+        """Everything an advisor needs to verify what the system claims about
+        a vehicle before filing a warranty claim — last visit, current
+        mileage, factory/workshop coverage validity, and any already-open
+        duplicate claim — instead of a bare pass/fail message."""
+        from app.modules.clients.service import ClientService
+        from app.modules.post_ventas.exceptions import VehicleWarrantyNotFoundError
+        from app.modules.post_ventas.service import PostVentasService
+
+        vehicle = await self._get_vehicle_with_client(vehicle_id)
+        filial_id = vehicle.client.filial_id
+
+        current_mileage, last_visit_date, last_visit_order_id = await ClientService(
+            self.db
+        ).get_mileage_context(vehicle_id)
+        last_visit_service_order_code = None
+        if last_visit_order_id is not None:
+            last_order = await self.db.get(ServiceOrder, last_visit_order_id)
+            last_visit_service_order_code = last_order.code if last_order else None
+
+        factory_warranty = None
+        workshop_warranties: list = []
+        if vehicle.vin:
+            post_ventas = PostVentasService(self.db)
+            try:
+                factory_warranty = await post_ventas.get_vehicle_warranty_by_vin(filial_id, vehicle.vin)
+            except VehicleWarrantyNotFoundError:
+                factory_warranty = None
+            workshop_warranties = await post_ventas.list_workshop_warranties_by_vin(filial_id, vehicle.vin)
+            if service_order_id is not None:
+                workshop_warranties = [w for w in workshop_warranties if w.service_order_id == service_order_id]
+
+        duplicate = await self._check_duplicate_open_claim(vehicle_id, tempario_id, part_id)
+        duplicate_read = await self._warranty_claim_to_read(duplicate, vehicle) if duplicate else None
+
+        return WarrantyClaimContext(
+            current_mileage=current_mileage,
+            last_visit_date=last_visit_date,
+            last_visit_service_order_code=last_visit_service_order_code,
+            factory_warranty=factory_warranty,
+            workshop_warranties=workshop_warranties,
+            duplicate_open_claim=duplicate_read,
+        )
+
+    async def create_warranty_claim(
+        self,
+        payload: WarrantyClaimCreate,
+        photo_urls: list[str],
+        document_urls: list[str],
+        recorded_by_user_id: uuid.UUID | None,
+    ) -> WarrantyClaimRead:
+        vehicle = await self._get_vehicle_with_client(payload.vehicle_id)
+        filial_id = vehicle.client.filial_id
+
+        if payload.claim_type == WarrantyClaimType.COMEBACK and payload.service_order_id is None:
+            raise ServiceOrderRequiredForComebackError()
+
+        if payload.service_order_id is not None:
+            await self._get_order_invoice(payload.service_order_id)
+            if payload.tempario_id is not None:
+                task = (
+                    await self.db.execute(
+                        select(ServiceOrderTask).where(
+                            ServiceOrderTask.service_order_id == payload.service_order_id,
+                            ServiceOrderTask.tempario_id == payload.tempario_id,
+                        )
                     )
-                )
-            ).scalar_one_or_none()
-            if task is None:
-                raise ReworkClaimReferenceMismatchError()
-
-        if payload.part_id is not None:
-            line = (
-                await self.db.execute(
-                    select(ServiceOrderTransferLine)
-                    .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
-                    .where(
-                        ServiceOrderTransfer.service_order_id == order_id,
-                        ServiceOrderTransferLine.part_id == payload.part_id,
+                ).scalar_one_or_none()
+                if task is None:
+                    raise WarrantyClaimReferenceMismatchError()
+            if payload.part_id is not None:
+                line = (
+                    await self.db.execute(
+                        select(ServiceOrderTransferLine)
+                        .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                        .where(
+                            ServiceOrderTransfer.service_order_id == payload.service_order_id,
+                            ServiceOrderTransferLine.part_id == payload.part_id,
+                        )
                     )
-                )
-            ).scalar_one_or_none()
-            if line is None:
-                raise ReworkClaimReferenceMismatchError()
+                ).scalar_one_or_none()
+                if line is None:
+                    raise WarrantyClaimReferenceMismatchError()
 
-        claim = ReworkClaim(
-            filial_id=order.filial_id,
-            service_order_id=order.id,
+        from app.modules.clients.service import ClientService
+
+        current_mileage = await ClientService(self.db).get_current_mileage(payload.vehicle_id)
+        mileage_inconsistent = current_mileage is not None and payload.reported_mileage < current_mileage
+
+        sequence_number = await self._next_claim_sequence_number(filial_id)
+        claim = WarrantyClaim(
+            filial_id=filial_id,
+            sequence_number=sequence_number,
+            claim_type=payload.claim_type,
+            vehicle_id=payload.vehicle_id,
+            service_order_id=payload.service_order_id,
             tempario_id=payload.tempario_id,
             part_id=payload.part_id,
             failure_category=payload.failure_category,
             failure_cause=payload.failure_cause,
+            reported_symptom=payload.reported_symptom,
+            reported_mileage=payload.reported_mileage,
+            vehicle_mileage_at_claim=current_mileage,
+            mileage_inconsistent=mileage_inconsistent,
             claimed_at=payload.claimed_at,
             recorded_by_user_id=recorded_by_user_id,
             note=payload.note,
+            photo_urls=photo_urls,
+            document_urls=document_urls,
         )
         self.db.add(claim)
         await self.db.commit()
         await self.db.refresh(claim)
-        return await self._rework_claim_to_read(claim, invoice)
+        return await self._warranty_claim_to_read(claim, vehicle)
 
-    async def close_rework_claim(
-        self, claim_id: uuid.UUID, payload: ReworkClaimCloseInput, closed_by_user_id: uuid.UUID | None
-    ) -> ReworkClaimRead:
-        claim = await self.db.get(ReworkClaim, claim_id)
+    async def authorize_warranty_claim(
+        self, claim_id: uuid.UUID, payload: WarrantyClaimAuthorizationInput, authorized_by_user_id: uuid.UUID | None
+    ) -> WarrantyClaimRead:
+        claim = await self.db.get(WarrantyClaim, claim_id)
         if claim is None:
-            raise ReworkClaimNotFoundError(str(claim_id))
-        if claim.status == ReworkClaimStatus.CERRADO:
-            raise ReworkClaimAlreadyClosedError()
+            raise WarrantyClaimNotFoundError(str(claim_id))
+        if claim.status != WarrantyClaimStatus.SOLICITADO:
+            raise WarrantyClaimAlreadyDecidedError()
 
-        if payload.failure_category is not None:
-            claim.failure_category = payload.failure_category
-        if claim.failure_category is None:
-            raise FailureCategoryRequiredError()
+        vehicle = await self._get_vehicle_with_client(claim.vehicle_id)
 
-        if claim.failure_category == ReworkFailureCategory.REPUESTO_DEFECTUOSO and claim.part_id is not None:
-            order = await self.get_order(claim.service_order_id)
-            await self._auto_claim_defective_part(order, claim)
+        if payload.decision == "aprobado":
+            if claim.claim_type in (WarrantyClaimType.FABRICA, WarrantyClaimType.CAMPANA_RECALL):
+                from app.modules.post_ventas.exceptions import VehicleWarrantyNotFoundError
+                from app.modules.post_ventas.service import PostVentasService
 
-        if payload.note:
-            claim.note = f"{claim.note}\n{payload.note}" if claim.note else payload.note
-        claim.status = ReworkClaimStatus.CERRADO
-        claim.closed_at = datetime.now(UTC)
-        claim.closed_by_user_id = closed_by_user_id
+                has_vigente_warranty = False
+                if vehicle.vin:
+                    try:
+                        warranty = await PostVentasService(self.db).get_vehicle_warranty_by_vin(
+                            claim.filial_id, vehicle.vin
+                        )
+                        has_vigente_warranty = warranty.status == "vigente"
+                    except VehicleWarrantyNotFoundError:
+                        has_vigente_warranty = False
+
+                if not has_vigente_warranty:
+                    if not payload.warranty_override:
+                        raise VehicleWarrantyRequiredError()
+                    if not payload.warranty_override_note:
+                        raise WarrantyOverrideNoteRequiredError()
+                claim.warranty_override = payload.warranty_override
+                claim.warranty_override_note = payload.warranty_override_note
+            else:
+                if payload.failure_category is not None:
+                    claim.failure_category = payload.failure_category
+                if claim.failure_category is None:
+                    raise FailureCategoryRequiredError()
+
+            claim.status = WarrantyClaimStatus.AUTORIZADO
+        else:
+            claim.status = WarrantyClaimStatus.RECHAZADO
+
+        claim.authorized_by_user_id = authorized_by_user_id
+        claim.authorized_at = datetime.now(UTC)
 
         await self.db.commit()
         await self.db.refresh(claim)
-        invoice = await self._get_order_invoice(claim.service_order_id)
-        return await self._rework_claim_to_read(claim, invoice)
+        return await self._warranty_claim_to_read(claim, vehicle)
+
+    async def convert_warranty_claim_to_order(
+        self, claim_id: uuid.UUID, payload: WarrantyClaimConvertInput, converted_by_user_id: uuid.UUID | None
+    ) -> WarrantyClaimRead:
+        claim = await self.db.get(WarrantyClaim, claim_id)
+        if claim is None:
+            raise WarrantyClaimNotFoundError(str(claim_id))
+        if claim.status == WarrantyClaimStatus.CONVERTIDO_A_ODS:
+            raise WarrantyClaimAlreadyConvertedError()
+        if claim.status != WarrantyClaimStatus.AUTORIZADO:
+            raise WarrantyClaimNotAuthorizedError()
+
+        vehicle = await self._get_vehicle_with_client(claim.vehicle_id)
+        original_order = await self.get_order(claim.service_order_id) if claim.service_order_id else None
+
+        payer_by_type = {
+            WarrantyClaimType.FABRICA: ServiceOrderPayer.GARANTIA_FABRICA,
+            WarrantyClaimType.CAMPANA_RECALL: ServiceOrderPayer.GARANTIA_FABRICA,
+            WarrantyClaimType.COMEBACK: ServiceOrderPayer.GARANTIA_TALLER,
+            WarrantyClaimType.REPUESTO_PROVEEDOR: ServiceOrderPayer.PROVEEDOR,
+        }
+        payer = payer_by_type[claim.claim_type]
+
+        next_seq = await self._next_sequence_number(claim.filial_id)
+        intake_mileage = payload.intake_mileage
+        if intake_mileage is None:
+            intake_mileage = original_order.intake_mileage if original_order else claim.reported_mileage
+        cause_label = claim.failure_cause or claim.reported_symptom or claim.claim_type.value
+        new_order = ServiceOrder(
+            filial_id=claim.filial_id,
+            vehicle_id=claim.vehicle_id,
+            order_type=ServiceOrderType.RETRABAJO,
+            advisor_user_id=original_order.advisor_user_id if original_order else None,
+            intake_mileage=intake_mileage,
+            customer_reason=f"Retrabajo de garantía — {cause_label}",
+            promised_at=payload.promised_at or date.today(),
+            sequence_number=next_seq,
+        )
+        self.db.add(new_order)
+        await self.db.flush()
+
+        if claim.tempario_id is not None:
+            await self.add_task(new_order.id, claim.tempario_id, payer=payer)
+        if claim.part_id is not None:
+            quantity = 1
+            if original_order is not None:
+                quantity = await self._line_quantity_for_part(original_order.id, claim.part_id)
+            await self.add_transfer_line(new_order.id, claim.part_id, quantity, payer=payer)
+
+        claim.resulting_service_order_id = new_order.id
+        claim.converted_by_user_id = converted_by_user_id
+        claim.converted_at = datetime.now(UTC)
+        claim.status = WarrantyClaimStatus.CONVERTIDO_A_ODS
+
+        if claim.claim_type == WarrantyClaimType.REPUESTO_PROVEEDOR and claim.part_id is not None and original_order is not None:
+            await self._auto_claim_defective_part(original_order, claim)
+
+        await self.db.commit()
+        await self.db.refresh(claim)
+        return await self._warranty_claim_to_read(claim, vehicle)
+
+    async def get_warranty_claim(self, claim_id: uuid.UUID) -> WarrantyClaimRead:
+        claim = await self.db.get(WarrantyClaim, claim_id)
+        if claim is None:
+            raise WarrantyClaimNotFoundError(str(claim_id))
+        vehicle = await self._get_vehicle_with_client(claim.vehicle_id)
+        return await self._warranty_claim_to_read(claim, vehicle)
+
+    async def list_warranty_claims(
+        self,
+        filial_id: uuid.UUID,
+        status: WarrantyClaimStatus | None = None,
+        vehicle_id: uuid.UUID | None = None,
+        service_order_id: uuid.UUID | None = None,
+    ) -> list[WarrantyClaimRead]:
+        query = select(WarrantyClaim).where(WarrantyClaim.filial_id == filial_id)
+        if status is not None:
+            query = query.where(WarrantyClaim.status == status)
+        if vehicle_id is not None:
+            query = query.where(WarrantyClaim.vehicle_id == vehicle_id)
+        if service_order_id is not None:
+            query = query.where(WarrantyClaim.service_order_id == service_order_id)
+        query = query.order_by(WarrantyClaim.created_at.desc())
+
+        result = await self.db.execute(query)
+        claims = list(result.scalars().all())
+        vehicle_ids = {c.vehicle_id for c in claims}
+        vehicles: dict[uuid.UUID, Vehicle] = {}
+        if vehicle_ids:
+            result = await self.db.execute(
+                select(Vehicle).options(selectinload(Vehicle.client)).where(Vehicle.id.in_(vehicle_ids))
+            )
+            vehicles = {v.id: v for v in result.scalars()}
+        return [await self._warranty_claim_to_read(c, vehicles[c.vehicle_id]) for c in claims]
 
     async def _line_quantity_for_part(self, order_id: uuid.UUID, part_id: uuid.UUID) -> int:
         """The quantity actually dispatched for this part on this order —
@@ -1071,103 +1315,6 @@ class ServiceOrderService:
         lines = list(result.scalars().all())
         return sum(line.quantity for line in lines) or 1
 
-    async def _open_order_from_claim(
-        self, original_order: ServiceOrder, claim: ReworkClaim, order_type, payload: ReworkClaimAuthorizationInput
-    ) -> ServiceOrder:
-        next_seq = await self._next_sequence_number(original_order.filial_id)
-        new_order = ServiceOrder(
-            filial_id=original_order.filial_id,
-            vehicle_id=original_order.vehicle_id,  # inherited — never editable afterward (no field on ServiceOrderUpdate)
-            order_type=order_type,
-            advisor_user_id=original_order.advisor_user_id,
-            intake_mileage=payload.intake_mileage if payload.intake_mileage is not None else original_order.intake_mileage,
-            customer_reason=f"Retrabajo de garantía — {claim.failure_cause}",
-            promised_at=payload.promised_at or date.today(),
-            sequence_number=next_seq,
-        )
-        self.db.add(new_order)
-        await self.db.flush()
-
-        # An approved claim's inherited work is on the shop's dime; a
-        # rejected one bills the client normally.
-        payer = ServiceOrderPayer.GARANTIA_TALLER if order_type == ServiceOrderType.RETRABAJO else ServiceOrderPayer.CLIENTE
-
-        if claim.tempario_id is not None:
-            await self.add_task(new_order.id, claim.tempario_id, payer=payer)
-        if claim.part_id is not None:
-            quantity = await self._line_quantity_for_part(original_order.id, claim.part_id)
-            await self.add_transfer_line(new_order.id, claim.part_id, quantity, payer=payer)
-
-        return new_order
-
-    async def authorize_rework_claim(
-        self, claim_id: uuid.UUID, payload: ReworkClaimAuthorizationInput, authorized_by_user_id: uuid.UUID | None
-    ) -> ReworkClaimRead:
-        claim = await self.db.get(ReworkClaim, claim_id)
-        if claim is None:
-            raise ReworkClaimNotFoundError(str(claim_id))
-        if claim.authorization_status != ReworkAuthorizationStatus.PENDIENTE:
-            raise ReworkClaimAlreadyAuthorizedError()
-
-        original_order = await self.get_order(claim.service_order_id)
-
-        if payload.decision == "aprobado":
-            vehicle = await self.db.get(Vehicle, original_order.vehicle_id)
-            has_vigente_warranty = False
-            if vehicle is not None and vehicle.vin:
-                from app.modules.post_ventas.exceptions import VehicleWarrantyNotFoundError
-                from app.modules.post_ventas.service import PostVentasService
-
-                try:
-                    warranty = await PostVentasService(self.db).get_vehicle_warranty_by_vin(
-                        original_order.filial_id, vehicle.vin
-                    )
-                    has_vigente_warranty = warranty.status == "vigente"
-                except VehicleWarrantyNotFoundError:
-                    has_vigente_warranty = False
-
-            if not has_vigente_warranty:
-                if not payload.warranty_override:
-                    raise VehicleWarrantyRequiredError()
-                if not payload.warranty_override_note:
-                    raise WarrantyOverrideNoteRequiredError()
-
-            new_order = await self._open_order_from_claim(
-                original_order, claim, ServiceOrderType.RETRABAJO, payload
-            )
-            claim.warranty_override = payload.warranty_override
-            claim.warranty_override_note = payload.warranty_override_note
-            claim.authorization_status = ReworkAuthorizationStatus.APROBADO
-        else:
-            new_order = await self._open_order_from_claim(
-                original_order, claim, ServiceOrderType.REGULAR, payload
-            )
-            claim.authorization_status = ReworkAuthorizationStatus.RECHAZADO
-
-        claim.resulting_service_order_id = new_order.id
-        claim.authorized_by_user_id = authorized_by_user_id
-        claim.authorized_at = datetime.now(UTC)
-
-        await self.db.commit()
-        await self.db.refresh(claim)
-        invoice = await self._get_order_invoice(claim.service_order_id)
-        return await self._rework_claim_to_read(claim, invoice)
-
-    async def list_rework_claims(self, order_id: uuid.UUID) -> list[ReworkClaimRead]:
-        result = await self.db.execute(
-            select(ServiceOrderInvoice).where(ServiceOrderInvoice.service_order_id == order_id)
-        )
-        invoice = result.scalar_one_or_none()
-        if invoice is None:
-            return []
-        result = await self.db.execute(
-            select(ReworkClaim)
-            .where(ReworkClaim.service_order_id == order_id)
-            .order_by(ReworkClaim.claimed_at.desc())
-        )
-        claims = list(result.scalars().all())
-        return [await self._rework_claim_to_read(c, invoice) for c in claims]
-
     async def _get_vehicle_with_client(self, vehicle_id: uuid.UUID) -> Vehicle:
         from app.modules.clients.exceptions import VehicleNotFoundError
 
@@ -1179,90 +1326,6 @@ class ServiceOrderService:
             raise VehicleNotFoundError(str(vehicle_id))
         return vehicle
 
-    async def get_vehicle_warranties_for_claim(self, vehicle_id: uuid.UUID):
+    async def get_vehicle_filial_id(self, vehicle_id: uuid.UUID) -> uuid.UUID:
         vehicle = await self._get_vehicle_with_client(vehicle_id)
-        if not vehicle.vin:
-            return vehicle.client.filial_id, []
-
-        from app.modules.clients.service import ClientService
-        from app.modules.post_ventas.service import PostVentasService
-
-        current_mileage = await ClientService(self.db).get_current_mileage(vehicle_id)
-        warranties = await PostVentasService(self.db).list_vigente_warranties_by_vin(
-            vehicle.client.filial_id, vehicle.vin, current_mileage
-        )
-        return vehicle.client.filial_id, warranties
-
-    async def create_warranty_claim(
-        self, payload: WarrantyClaimCreate, recorded_by_user_id: uuid.UUID | None
-    ) -> WarrantyClaimRead:
-        vehicle = await self._get_vehicle_with_client(payload.vehicle_id)
-        filial_id = vehicle.client.filial_id
-
-        from app.modules.clients.service import ClientService
-
-        current_mileage = await ClientService(self.db).get_current_mileage(payload.vehicle_id)
-        mileage_inconsistent = current_mileage is not None and payload.reported_mileage < current_mileage
-
-        matched_ids: set[uuid.UUID] = set()
-        if vehicle.vin:
-            result = await self.db.execute(
-                select(VehicleWarranty.id).where(
-                    VehicleWarranty.id.in_(payload.warranty_ids), VehicleWarranty.vin == vehicle.vin
-                )
-            )
-            matched_ids = {row[0] for row in result.all()}
-        if matched_ids != set(payload.warranty_ids):
-            raise WarrantyClaimWarrantyMismatchError()
-
-        claim = WarrantyClaim(
-            filial_id=filial_id,
-            vehicle_id=payload.vehicle_id,
-            reported_symptom=payload.reported_symptom,
-            reported_mileage=payload.reported_mileage,
-            vehicle_mileage_at_claim=current_mileage,
-            mileage_inconsistent=mileage_inconsistent,
-            recorded_by_user_id=recorded_by_user_id,
-        )
-        self.db.add(claim)
-        await self.db.flush()
-        for warranty_id in payload.warranty_ids:
-            self.db.add(WarrantyClaimWarranty(warranty_claim_id=claim.id, vehicle_warranty_id=warranty_id))
-        await self.db.commit()
-        await self.db.refresh(claim)
-        return self._warranty_claim_to_read(claim, vehicle)
-
-    async def list_warranty_claims(self, filial_id: uuid.UUID) -> list[WarrantyClaimRead]:
-        result = await self.db.execute(
-            select(WarrantyClaim)
-            .options(selectinload(WarrantyClaim.warranty_links))
-            .where(WarrantyClaim.filial_id == filial_id)
-            .order_by(WarrantyClaim.created_at.desc())
-        )
-        claims = list(result.scalars().all())
-        vehicle_ids = {c.vehicle_id for c in claims}
-        vehicles: dict[uuid.UUID, Vehicle] = {}
-        if vehicle_ids:
-            result = await self.db.execute(
-                select(Vehicle).options(selectinload(Vehicle.client)).where(Vehicle.id.in_(vehicle_ids))
-            )
-            vehicles = {v.id: v for v in result.scalars()}
-        return [self._warranty_claim_to_read(c, vehicles[c.vehicle_id]) for c in claims]
-
-    def _warranty_claim_to_read(self, claim: WarrantyClaim, vehicle: Vehicle) -> WarrantyClaimRead:
-        return WarrantyClaimRead(
-            id=claim.id,
-            filial_id=claim.filial_id,
-            vehicle_id=claim.vehicle_id,
-            vehicle_plate=vehicle.plate,
-            vehicle_vin=vehicle.vin,
-            client_name=vehicle.client.full_name,
-            reported_symptom=claim.reported_symptom,
-            reported_mileage=claim.reported_mileage,
-            vehicle_mileage_at_claim=claim.vehicle_mileage_at_claim,
-            mileage_inconsistent=claim.mileage_inconsistent,
-            status=claim.status,
-            warranty_ids=[link.vehicle_warranty_id for link in claim.warranty_links],
-            recorded_by_user_id=claim.recorded_by_user_id,
-            created_at=claim.created_at,
-        )
+        return vehicle.client.filial_id

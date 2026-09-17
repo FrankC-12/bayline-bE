@@ -70,45 +70,61 @@ class ReceivableCurrencyMismatchError(BadRequestError):
 class OrderNotInvoicedError(BadRequestError):
     def __init__(self) -> None:
         super().__init__(
-            "Solo se puede registrar un reclamo de garantía sobre una orden ya facturada.",
+            "Solo se puede registrar un reclamo de garantía tipo comeback sobre una orden ya facturada.",
             error_code="order_not_invoiced",
         )
 
 
-class ReworkClaimReferenceMismatchError(BadRequestError):
+class WarrantyClaimReferenceMismatchError(BadRequestError):
     def __init__(self) -> None:
         super().__init__(
             "El servicio o el repuesto elegido no pertenece a esta orden.",
-            error_code="rework_claim_reference_mismatch",
+            error_code="warranty_claim_reference_mismatch",
         )
 
 
-class ReworkClaimNotFoundError(NotFoundError):
+class WarrantyClaimNotFoundError(NotFoundError):
     def __init__(self, claim_id: str) -> None:
-        super().__init__(f"Rework claim '{claim_id}' was not found.", error_code="rework_claim_not_found")
-
-
-class ReworkClaimAlreadyClosedError(BadRequestError):
-    def __init__(self) -> None:
-        super().__init__(
-            "Este reclamo de retrabajo ya está cerrado.",
-            error_code="rework_claim_already_closed",
-        )
+        super().__init__(f"Warranty claim '{claim_id}' was not found.", error_code="warranty_claim_not_found")
 
 
 class FailureCategoryRequiredError(BadRequestError):
     def __init__(self) -> None:
         super().__init__(
-            "No se puede cerrar un reclamo de retrabajo sin haber registrado la causa de la falla.",
+            "No se puede autorizar este reclamo sin haber registrado la causa de la falla.",
             error_code="failure_category_required",
         )
 
 
-class ReworkClaimAlreadyAuthorizedError(BadRequestError):
+class WarrantyClaimAlreadyDecidedError(BadRequestError):
     def __init__(self) -> None:
         super().__init__(
-            "Este reclamo de retrabajo ya fue autorizado o rechazado.",
-            error_code="rework_claim_already_authorized",
+            "Este reclamo ya fue autorizado o rechazado.",
+            error_code="warranty_claim_already_decided",
+        )
+
+
+class WarrantyClaimNotAuthorizedError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Este reclamo debe estar autorizado antes de convertirlo en una orden de servicio.",
+            error_code="warranty_claim_not_authorized",
+        )
+
+
+class WarrantyClaimAlreadyConvertedError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Este reclamo ya fue convertido en una orden de servicio.",
+            error_code="warranty_claim_already_converted",
+        )
+
+
+class ServiceOrderRequiredForComebackError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Un reclamo de tipo comeback debe referenciar la orden de servicio que lo originó.",
+            error_code="service_order_required_for_comeback",
         )
 
 
@@ -126,12 +142,4 @@ class WarrantyOverrideNoteRequiredError(BadRequestError):
         super().__init__(
             "Debes registrar por qué se autoriza sin garantía vigente.",
             error_code="warranty_override_note_required",
-        )
-
-
-class WarrantyClaimWarrantyMismatchError(BadRequestError):
-    def __init__(self) -> None:
-        super().__init__(
-            "Una de las garantías seleccionadas no corresponde a este vehículo.",
-            error_code="warranty_claim_warranty_mismatch",
         )

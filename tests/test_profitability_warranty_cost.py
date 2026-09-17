@@ -21,8 +21,8 @@ from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
 from app.modules.post_ventas.enums import TemparioCategory
 from app.modules.post_ventas.models import LaborSettings, Tempario
-from app.modules.service_orders.enums import ReworkFailureCategory
-from app.modules.service_orders.models import ReworkClaim, ServiceOrder
+from app.modules.service_orders.enums import ReworkFailureCategory, WarrantyClaimType
+from app.modules.service_orders.models import ServiceOrder, WarrantyClaim
 from app.modules.service_orders.service import ServiceOrderService
 from app.modules.warehouse.models import PartLot, Warehouse
 
@@ -91,10 +91,11 @@ async def test_part_cost_uses_the_real_fifo_allocation(env):
     transfer = await so.add_transfer_line(order.id, part.id, 3)
     await so.mark_transfer_ordered(transfer.id)
 
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order.id, part_id=part.id,
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=1, claim_type=WarrantyClaimType.REPUESTO_PROVEEDOR,
+        vehicle_id=order.vehicle_id, service_order_id=order.id, part_id=part.id,
         failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO,
-        failure_cause="Falló", claimed_at=date(2026, 6, 15),
+        failure_cause="Falló", reported_mileage=0, claimed_at=date(2026, 6, 15),
     ))
     session.commit()
 
@@ -111,10 +112,11 @@ async def test_part_cost_falls_back_to_line_cost_total_without_an_allocation(env
     session.add(transfer)
     session.commit()
     session.add(ServiceOrderTransferLine(transfer_id=transfer.id, part_id=part.id, quantity=2, cost_total=50))
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order.id, part_id=part.id,
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=1, claim_type=WarrantyClaimType.REPUESTO_PROVEEDOR,
+        vehicle_id=order.vehicle_id, service_order_id=order.id, part_id=part.id,
         failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO,
-        failure_cause="Anterior a F0-01", claimed_at=date(2026, 6, 15),
+        failure_cause="Anterior a F0-01", reported_mileage=0, claimed_at=date(2026, 6, 15),
     ))
     session.commit()
 
@@ -131,10 +133,11 @@ async def test_labor_cost_uses_tempario_hours_times_hourly_rate(env):
     )
     session.add(tempario)
     session.commit()
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order.id, tempario_id=tempario.id,
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=1, claim_type=WarrantyClaimType.COMEBACK,
+        vehicle_id=order.vehicle_id, service_order_id=order.id, tempario_id=tempario.id,
         failure_category=ReworkFailureCategory.MANO_DE_OBRA,
-        failure_cause="Mal ajustado", claimed_at=date(2026, 6, 15),
+        failure_cause="Mal ajustado", reported_mileage=0, claimed_at=date(2026, 6, 15),
     ))
     session.commit()
 
@@ -152,10 +155,11 @@ async def test_claims_outside_the_period_are_excluded(env):
     )
     session.add(tempario)
     session.commit()
-    session.add(ReworkClaim(
-        filial_id=filial_id, service_order_id=order.id, tempario_id=tempario.id,
+    session.add(WarrantyClaim(
+        filial_id=filial_id, sequence_number=1, claim_type=WarrantyClaimType.COMEBACK,
+        vehicle_id=order.vehicle_id, service_order_id=order.id, tempario_id=tempario.id,
         failure_category=ReworkFailureCategory.MANO_DE_OBRA,
-        failure_cause="Fuera de rango", claimed_at=date(2026, 5, 1),
+        failure_cause="Fuera de rango", reported_mileage=0, claimed_at=date(2026, 5, 1),
     ))
     session.commit()
 

@@ -89,14 +89,14 @@ from app.modules.parts.models import PartSale, PartSaleLine
 from app.modules.post_ventas.models import Tempario
 from app.modules.post_ventas.service import PostVentasService
 from app.modules.clients.models import Client
-from app.modules.service_orders.enums import TransferStatus
+from app.modules.service_orders.enums import TransferStatus, WarrantyClaimType
 from app.modules.service_orders.models import (
-    ReworkClaim,
     ServiceOrder,
     ServiceOrderInvoice,
     ServiceOrderTransfer,
     ServiceOrderTransferLine,
     ServiceOrderTransferLotAllocation,
+    WarrantyClaim,
 )
 
 # Spanish month abbreviations for the finance trend chart — not read from
@@ -1409,16 +1409,20 @@ class AdministracionService:
         return await self._compute_profitability(filial_ids, date_from, date_to, None)
 
     async def _warranty_cost(self, filial_id: uuid.UUID, date_from: date, date_to: date) -> float:
-        """What rework claims actually cost the workshop: the real FIFO cost
-        of parts consumed (traced via ServiceOrderTransferLotAllocation —
-        F0-01) plus the labor of the flagged service, at the current hourly
-        rate. Free to the client, but not to the shop — parts leave
-        inventory and the technician's hours are paid regardless."""
+        """What warranty claims the SHOP itself absorbs actually cost it: the
+        real FIFO cost of parts consumed (traced via
+        ServiceOrderTransferLotAllocation — F0-01) plus the labor of the
+        flagged service, at the current hourly rate. Free to the client, but
+        not to the shop — parts leave inventory and the technician's hours
+        are paid regardless. Only claim_type in (comeback, repuesto_proveedor)
+        count here — fábrica/campaña claims are the manufacturer's money,
+        not the shop's rework cost."""
         claims_result = await self.db.execute(
-            select(ReworkClaim).where(
-                ReworkClaim.filial_id == filial_id,
-                ReworkClaim.claimed_at >= date_from,
-                ReworkClaim.claimed_at <= date_to,
+            select(WarrantyClaim).where(
+                WarrantyClaim.filial_id == filial_id,
+                WarrantyClaim.claim_type.in_([WarrantyClaimType.COMEBACK, WarrantyClaimType.REPUESTO_PROVEEDOR]),
+                WarrantyClaim.claimed_at >= date_from,
+                WarrantyClaim.claimed_at <= date_to,
             )
         )
         claims = list(claims_result.scalars().all())

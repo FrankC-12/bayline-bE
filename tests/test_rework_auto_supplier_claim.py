@@ -1,8 +1,10 @@
-"""When a rework claim's cause is a defective part, the system generates the
-SupplierClaim on its own — tracing part -> lot -> purchase order -> supplier
-via the allocations Part B now records, instead of anyone looking it up.
-The auto-claim only fires when the rework claim is CLOSED with that cause —
-never at creation, since the cause may not be known yet."""
+"""When a warranty claim's cause is a defective part (claim_type=
+repuesto_proveedor), the system generates the SupplierClaim on its own —
+tracing part -> lot -> purchase order -> supplier via the allocations Part B
+now records, instead of anyone looking it up. The auto-claim only fires when
+the claim is CONVERTED to an order — never at creation or authorization,
+since the cause may not be known yet at creation and converting is the step
+that actually commits the shop to the rework."""
 
 import uuid
 from datetime import UTC, datetime
@@ -21,9 +23,9 @@ from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
-from app.modules.service_orders.enums import ReworkClaimStatus, ReworkFailureCategory
+from app.modules.service_orders.enums import ReworkFailureCategory, WarrantyClaimStatus, WarrantyClaimType
 from app.modules.service_orders.models import ServiceOrder, ServiceOrderInvoice
-from app.modules.service_orders.schemas import ReworkClaimCloseInput, ReworkClaimCreate
+from app.modules.service_orders.schemas import WarrantyClaimAuthorizationInput, WarrantyClaimConvertInput, WarrantyClaimCreate
 from app.modules.service_orders.service import ServiceOrderService
 from app.modules.warehouse.models import PartLot, Warehouse
 
@@ -93,6 +95,26 @@ def make_lot(session, filial_id, warehouse, part, quantity, purchase_request_id=
     return lot
 
 
+def claim_payload(order, part, **overrides):
+    defaults = dict(
+        claim_type=WarrantyClaimType.REPUESTO_PROVEEDOR,
+        vehicle_id=order.vehicle_id,
+        service_order_id=order.id,
+        part_id=part.id,
+        failure_cause="El alternador llegó defectuoso",
+        reported_mileage=0,
+    )
+    defaults.update(overrides)
+    return WarrantyClaimCreate(**defaults)
+
+
+async def _authorize_and_convert(service, claim_id, user_id=None, failure_category=None):
+    await service.authorize_warranty_claim(
+        claim_id, WarrantyClaimAuthorizationInput(decision="aprobado", failure_category=failure_category), user_id
+    )
+    return await service.convert_warranty_claim_to_order(claim_id, WarrantyClaimConvertInput(), user_id)
+
+
 @pytest.mark.asyncio
 async def test_open_claim_has_no_auto_claim_info_yet(env):
     service, session, filial_id, order, part, warehouse = env
@@ -101,49 +123,46 @@ async def test_open_claim_has_no_auto_claim_info_yet(env):
     transfer = await service.add_transfer_line(order.id, part.id, 2)
     await service.mark_transfer_ordered(transfer.id)
 
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(
-            failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO,
-            failure_cause="El alternador llegó defectuoso", part_id=part.id,
-        ),
-        None,
-    )
+    claim = await service.create_warranty_claim(claim_payload(order, part), [], [], None)
 
-    assert claim.status == ReworkClaimStatus.ABIERTO
+    assert claim.status == WarrantyClaimStatus.SOLICITADO
     assert claim.auto_generated_supplier_claim_ids == []
     assert claim.supplier_claim_note is None
-    assert session.scalar(select(SupplierClaim).where(SupplierClaim.rework_claim_id == claim.id)) is None
+    assert session.scalar(select(SupplierClaim).where(SupplierClaim.warranty_claim_id == claim.id)) is None
 
 
 @pytest.mark.asyncio
-async def test_cannot_close_without_ever_having_a_failure_category(env):
+async def test_cannot_authorize_without_ever_having_a_failure_category(env):
     service, _session, _filial_id, order, part, _warehouse = env
-    claim = await service.create_rework_claim(
-        order.id, ReworkClaimCreate(failure_cause="Aún sin diagnosticar"), None
+    claim = await service.create_warranty_claim(
+        claim_payload(order, part, part_id=None, failure_cause="Aún sin diagnosticar"), [], [], None
     )
     assert claim.failure_category is None
 
     with pytest.raises(BadRequestError):
-        await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+        await service.authorize_warranty_claim(
+            claim.id, WarrantyClaimAuthorizationInput(decision="aprobado"), None
+        )
 
 
 @pytest.mark.asyncio
-async def test_cannot_close_an_already_closed_claim(env):
-    service, _session, _filial_id, order, _part, _warehouse = env
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(failure_category=ReworkFailureCategory.MANO_DE_OBRA, failure_cause="Mal ajustado"),
-        None,
+async def test_cannot_authorize_an_already_decided_claim(env):
+    service, _session, _filial_id, order, part, _warehouse = env
+    claim = await service.create_warranty_claim(
+        claim_payload(order, part, part_id=None, failure_cause="Mal ajustado"), [], [], None
     )
-    await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+    await service.authorize_warranty_claim(
+        claim.id, WarrantyClaimAuthorizationInput(decision="aprobado", failure_category=ReworkFailureCategory.MANO_DE_OBRA), None
+    )
 
     with pytest.raises(BadRequestError):
-        await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+        await service.authorize_warranty_claim(
+            claim.id, WarrantyClaimAuthorizationInput(decision="aprobado", failure_category=ReworkFailureCategory.MANO_DE_OBRA), None
+        )
 
 
 @pytest.mark.asyncio
-async def test_closing_with_a_known_po_auto_creates_the_supplier_claim(env):
+async def test_converting_with_a_known_po_auto_creates_the_supplier_claim(env):
     service, session, filial_id, order, part, warehouse = env
     supplier, request = make_supplier_and_po(session, filial_id)
     make_lot(session, filial_id, warehouse, part, quantity=10, purchase_request_id=request.id)
@@ -151,55 +170,48 @@ async def test_closing_with_a_known_po_auto_creates_the_supplier_claim(env):
     transfer = await service.add_transfer_line(order.id, part.id, 2)
     await service.mark_transfer_ordered(transfer.id)
 
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(failure_cause="El alternador llegó defectuoso", part_id=part.id),
-        None,
-    )
-    closer_id = uuid.uuid4()
-    closed = await service.close_rework_claim(
-        claim.id, ReworkClaimCloseInput(failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO), closer_id
+    claim = await service.create_warranty_claim(claim_payload(order, part), [], [], None)
+    converter_id = uuid.uuid4()
+    converted = await _authorize_and_convert(
+        service, claim.id, converter_id, failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO
     )
 
-    assert closed.status == ReworkClaimStatus.CERRADO
-    assert closed.closed_by_user_id == closer_id
-    assert closed.closed_at is not None
-    assert len(closed.auto_generated_supplier_claim_ids) == 1
-    assert closed.supplier_claim_note is None
+    assert converted.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
+    assert converted.converted_by_user_id == converter_id
+    assert converted.converted_at is not None
+    assert len(converted.auto_generated_supplier_claim_ids) == 1
+    assert converted.supplier_claim_note is None
 
-    supplier_claim = session.get(SupplierClaim, closed.auto_generated_supplier_claim_ids[0])
+    supplier_claim = session.get(SupplierClaim, converted.auto_generated_supplier_claim_ids[0])
     assert supplier_claim.part_id == part.id
     assert supplier_claim.quantity == 2
     assert supplier_claim.supplier_id == supplier.id
     assert supplier_claim.purchase_request_id == request.id
-    assert supplier_claim.rework_claim_id == closed.id
+    assert supplier_claim.warranty_claim_id == converted.id
 
 
 @pytest.mark.asyncio
-async def test_closing_from_a_lot_without_a_po_generates_no_claim(env):
+async def test_converting_from_a_lot_without_a_po_generates_no_claim(env):
     service, session, filial_id, order, part, warehouse = env
     make_lot(session, filial_id, warehouse, part, quantity=10, purchase_request_id=None)
 
     transfer = await service.add_transfer_line(order.id, part.id, 1)
     await service.mark_transfer_ordered(transfer.id)
 
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(
-            failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO,
-            failure_cause="Falló temprano", part_id=part.id,
-        ),
-        None,
+    claim = await service.create_warranty_claim(
+        claim_payload(order, part, failure_cause="Falló temprano"), [], [], None
     )
-    closed = await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+    converted = await _authorize_and_convert(
+        service, claim.id, failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO
+    )
 
-    assert closed.auto_generated_supplier_claim_ids == []
-    assert closed.supplier_claim_note is not None
-    assert "orden de compra" in closed.supplier_claim_note
+    assert converted.auto_generated_supplier_claim_ids == []
+    assert converted.supplier_claim_note is not None
+    assert "orden de compra" in converted.supplier_claim_note
 
 
 @pytest.mark.asyncio
-async def test_closing_a_never_dispatched_part_generates_no_claim(env):
+async def test_converting_a_never_dispatched_part_generates_no_claim(env):
     service, session, filial_id, order, part, warehouse = env
     make_lot(session, filial_id, warehouse, part, quantity=10)
     # The part is on the ODT (so the existing "belongs to this order" check
@@ -207,19 +219,16 @@ async def test_closing_a_never_dispatched_part_generates_no_claim(env):
     # consumed for it, so there's nothing to trace to a supplier.
     await service.add_transfer_line(order.id, part.id, 1)
 
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(
-            failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO,
-            failure_cause="Nunca se despachó por ODT", part_id=part.id,
-        ),
-        None,
+    claim = await service.create_warranty_claim(
+        claim_payload(order, part, failure_cause="Nunca se despachó por ODT"), [], [], None
     )
-    closed = await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+    converted = await _authorize_and_convert(
+        service, claim.id, failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO
+    )
 
-    assert closed.auto_generated_supplier_claim_ids == []
-    assert closed.supplier_claim_note is not None
-    assert "despacho" in closed.supplier_claim_note
+    assert converted.auto_generated_supplier_claim_ids == []
+    assert converted.supplier_claim_note is not None
+    assert "despacho" in converted.supplier_claim_note
 
 
 @pytest.mark.asyncio
@@ -233,25 +242,25 @@ async def test_multi_lot_consumption_creates_one_claim_per_supplier(env):
     transfer = await service.add_transfer_line(order.id, part.id, 5)
     await service.mark_transfer_ordered(transfer.id)
 
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(
-            failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO,
-            failure_cause="Defecto de fábrica", part_id=part.id,
-        ),
-        None,
+    claim = await service.create_warranty_claim(
+        claim_payload(order, part, failure_cause="Defecto de fábrica"), [], [], None
     )
-    closed = await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+    converted = await _authorize_and_convert(
+        service, claim.id, failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO
+    )
 
-    assert len(closed.auto_generated_supplier_claim_ids) == 2
+    assert len(converted.auto_generated_supplier_claim_ids) == 2
     quantities = sorted(
-        session.get(SupplierClaim, cid).quantity for cid in closed.auto_generated_supplier_claim_ids
+        session.get(SupplierClaim, cid).quantity for cid in converted.auto_generated_supplier_claim_ids
     )
     assert quantities == [2, 3]
 
 
 @pytest.mark.asyncio
-async def test_non_defective_category_never_triggers_a_claim(env):
+async def test_comeback_claim_type_never_triggers_a_supplier_claim(env):
+    """The auto-claim is gated by claim_type == repuesto_proveedor, not by
+    failure_category — a comeback (garantía taller assumes it) never
+    generates one even with a part_id and a defective-part-sounding cause."""
     service, session, filial_id, order, part, warehouse = env
     _supplier, request = make_supplier_and_po(session, filial_id)
     make_lot(session, filial_id, warehouse, part, quantity=10, purchase_request_id=request.id)
@@ -259,16 +268,13 @@ async def test_non_defective_category_never_triggers_a_claim(env):
     transfer = await service.add_transfer_line(order.id, part.id, 1)
     await service.mark_transfer_ordered(transfer.id)
 
-    claim = await service.create_rework_claim(
-        order.id,
-        ReworkClaimCreate(
-            failure_category=ReworkFailureCategory.MANO_DE_OBRA,
-            failure_cause="Mal ajustado", part_id=part.id,
-        ),
-        None,
+    claim = await service.create_warranty_claim(
+        claim_payload(order, part, claim_type=WarrantyClaimType.COMEBACK, failure_cause="Mal ajustado"), [], [], None
     )
-    closed = await service.close_rework_claim(claim.id, ReworkClaimCloseInput(), None)
+    converted = await _authorize_and_convert(
+        service, claim.id, failure_category=ReworkFailureCategory.MANO_DE_OBRA
+    )
 
-    assert closed.auto_generated_supplier_claim_ids == []
-    assert closed.supplier_claim_note is None
-    assert session.scalar(select(SupplierClaim).where(SupplierClaim.rework_claim_id == closed.id)) is None
+    assert converted.auto_generated_supplier_claim_ids == []
+    assert converted.supplier_claim_note is None
+    assert session.scalar(select(SupplierClaim).where(SupplierClaim.warranty_claim_id == converted.id)) is None

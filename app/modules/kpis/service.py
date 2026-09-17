@@ -19,11 +19,12 @@ from app.modules.kpis.schemas import (
 )
 from app.modules.parts.models import Part
 from app.modules.post_ventas.models import Tempario
+from app.modules.service_orders.enums import WarrantyClaimType
 from app.modules.service_orders.models import (
-    ReworkClaim,
     ServiceOrder,
     ServiceOrderInvoice,
     ServiceOrderTransfer,
+    WarrantyClaim,
 )
 
 QUICK_CLAIM_DAYS_THRESHOLD = 30
@@ -199,10 +200,13 @@ class KpiService:
         technician_by_order = {order.id: order.technician_user_id for order, _ in pairs}
         order_ids = list(issued_date_by_order.keys())
 
-        claims: list[ReworkClaim] = []
+        claims: list[WarrantyClaim] = []
         if order_ids:
             claims_result = await self.db.execute(
-                select(ReworkClaim).where(ReworkClaim.service_order_id.in_(order_ids))
+                select(WarrantyClaim).where(
+                    WarrantyClaim.service_order_id.in_(order_ids),
+                    WarrantyClaim.claim_type.in_([WarrantyClaimType.COMEBACK, WarrantyClaimType.REPUESTO_PROVEEDOR]),
+                )
             )
             claims = list(claims_result.scalars().all())
 

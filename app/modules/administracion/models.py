@@ -177,19 +177,19 @@ class SupplierClaim(Base):
     )
     warranty_submission: Mapped["WarrantySubmission | None"] = relationship(back_populates="claims")
 
-    # Populated when this claim was generated automatically from a rework
-    # claim on a defective part — traces part -> lot -> purchase order ->
-    # supplier without anyone having to look it up. Null for a manually
-    # created claim (e.g. a defect found at the counter, unrelated to any
-    # service order).
+    # Populated when this claim was generated automatically from a warranty
+    # claim on a defective part (claim_type=repuesto_proveedor) — traces
+    # part -> lot -> purchase order -> supplier without anyone having to
+    # look it up. Null for a manually created claim (e.g. a defect found at
+    # the counter, unrelated to any warranty claim).
     lot_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("part_lots.id", ondelete="SET NULL"), nullable=True
     )
     purchase_request_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("purchase_requests.id", ondelete="SET NULL"), nullable=True
     )
-    rework_claim_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("rework_claims.id", ondelete="SET NULL"), nullable=True
+    warranty_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_claims.id", ondelete="SET NULL"), nullable=True
     )
 
 

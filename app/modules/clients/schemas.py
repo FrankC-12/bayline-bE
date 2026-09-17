@@ -31,7 +31,7 @@ class VehicleInput(BaseModel):
     mileage: int | None = Field(default=None, ge=0)
     purchase_date: date | None = None
     body_type: str | None = Field(default=None, max_length=40)
-    plate: str = Field(max_length=8)
+    plate: str = Field(min_length=1, max_length=8)
     color: str | None = Field(default=None, max_length=40)
     upholstery: str | None = Field(default=None, max_length=40)
     fuel_type: FuelType | None = None
@@ -50,9 +50,14 @@ class VehicleInput(BaseModel):
     @field_validator("plate")
     @classmethod
     def validate_plate(cls, v: str) -> str:
+        # Real Venezuelan plate formats range from ~2 chars (poder público)
+        # to 8 (diplomática) depending on type — see
+        # frontend/src/lib/venezuela-plate.ts, which already validates the
+        # exact format client-side. This only normalizes and enforces the
+        # column width, it doesn't require a fixed length.
         v = v.upper().strip()
-        if len(v) != 8:
-            raise ValueError("La placa debe tener exactamente 8 caracteres.")
+        if not v:
+            raise ValueError("La placa es obligatoria.")
         return v
 
 

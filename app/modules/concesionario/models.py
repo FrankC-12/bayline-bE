@@ -72,9 +72,14 @@ class DealershipVehicle(Base):
 
     @property
     def igtf_amount(self) -> float:
+        # IGTF taxes the actual payment amount, which already includes IVA —
+        # it's not computed on the pre-tax base alone. Matches
+        # service_orders/billing.py, which applies IGTF to the IVA-inclusive
+        # total for the same reason.
         if self.price_currency != "USD":
             return 0.0
-        return round(float(self.price_cash) * float(self.igtf_percentage) / 100, 2)
+        taxable_amount = float(self.price_cash) + self.iva_amount
+        return round(taxable_amount * float(self.igtf_percentage) / 100, 2)
 
     @property
     def luxury_tax_amount(self) -> float:
