@@ -81,8 +81,9 @@ async def test_dispatch_consumes_a_single_lot_and_traces_it(env):
     service, session, filial_id, order, part, warehouse, _other = env
     lot = make_lot(session, filial_id, warehouse, part, quantity=10)
 
+    almacenista_id = uuid.uuid4()
     transfer = await service.add_transfer_line(order.id, part.id, 3)
-    await service.mark_transfer_ordered(transfer.id)
+    await service.mark_transfer_ordered(transfer.id, almacenista_id)
 
     session.refresh(lot)
     assert lot.quantity_remaining == 7
@@ -98,6 +99,41 @@ async def test_dispatch_consumes_a_single_lot_and_traces_it(env):
     assert len(movements) == 1
     assert movements[0].quantity == 3
     assert movements[0].warehouse_id == warehouse.id
+    assert movements[0].responsible_user_id == almacenista_id
+
+
+@pytest.mark.asyncio
+async def test_dispatch_multiple_parts_on_one_odt_including_exact_full_consumption(env):
+    """Mirrors the reported scenario exactly: one ODT with two parts —
+    dispatching all 5 remaining units of one part (5 -> 0) must not be
+    blocked as if it were an overdraft, and a second part on the same ODT
+    (7 -> 6) must dispatch correctly too, each leaving its own StockMovement."""
+    service, session, filial_id, order, oil, warehouse, _other = env
+    oil.name = "Aceite 15W40"
+    filter_part = Part(
+        category_id=uuid.uuid4(), filial_id=filial_id, code="P-2", name="Filtro", price=5, stock_quantity=0
+    )
+    session.add(filter_part)
+    session.commit()
+    oil_lot = make_lot(session, filial_id, warehouse, oil, quantity=5)
+    filter_lot = make_lot(session, filial_id, warehouse, filter_part, quantity=7)
+
+    transfer = await service.add_transfer_line(order.id, oil.id, 5)
+    await service.add_transfer_line(order.id, filter_part.id, 1)
+    await service.mark_transfer_ordered(transfer.id)
+
+    session.refresh(oil_lot)
+    session.refresh(filter_lot)
+    session.refresh(oil)
+    session.refresh(filter_part)
+    assert oil_lot.quantity_remaining == 0
+    assert oil.stock_quantity == 0
+    assert filter_lot.quantity_remaining == 6
+    assert filter_part.stock_quantity == 6
+
+    movements = {m.part_id: m for m in session.scalars(select(StockMovement)).all()}
+    assert movements[oil.id].quantity == 5
+    assert movements[filter_part.id].quantity == 1
 
 
 @pytest.mark.asyncio
@@ -137,8 +173,14 @@ async def test_add_line_with_insufficient_lot_stock_warns_but_still_creates_the_
     ).one()
     assert line.quantity == 5
 
-    with pytest.raises(InsufficientStockError):
+    with pytest.raises(InsufficientStockError) as excinfo:
         await service.mark_transfer_ordered(transfer.id)
+
+    # A dispatch failure must name which part ran short — an ODT can have
+    # several lines, and a generic "insufficient stock" toast leaves the
+    # user unable to tell which one to fix.
+    assert "Alternador" in excinfo.value.message
+    assert excinfo.value.details == [{"field": str(part.id), "message": excinfo.value.message}]
 
 
 @pytest.mark.asyncio
@@ -177,13 +219,20 @@ async def test_receiving_a_purchase_request_stamps_its_id_on_the_new_lot(env):
     session.add(line)
     session.commit()
 
+    comprador_id = uuid.uuid4()
     admin = AdministracionService(AsyncAdapter(session))
     await admin.update_request_status(
         request.id, PurchaseRequestStatus.COTIZADA, [QuoteLineInput(line_id=line.id, unit_cost=5)], None
     )
     await admin.update_request_status(request.id, PurchaseRequestStatus.PAGADA, None, None)
-    await admin.update_request_status(request.id, PurchaseRequestStatus.RECIBIDA, None, warehouse.id)
+    await admin.update_request_status(
+        request.id, PurchaseRequestStatus.RECIBIDA, None, warehouse.id, responsible_user_id=comprador_id
+    )
 
     lot = session.scalar(select(PartLot).where(PartLot.part_id == part.id))
     assert lot is not None
     assert lot.purchase_request_id == request.id
+
+    movement = session.scalar(select(StockMovement).where(StockMovement.part_id == part.id))
+    assert movement is not None
+    assert movement.responsible_user_id == comprador_id

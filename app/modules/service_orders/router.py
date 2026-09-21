@@ -24,6 +24,7 @@ from app.modules.service_orders.schemas import (
     BayRead,
     BayUpdate,
     OrderSummary,
+    ServiceOrderCancelInput,
     ServiceOrderCloseInput,
     ServiceOrderCreate,
     ServiceOrderRead,
@@ -36,8 +37,8 @@ from app.modules.service_orders.schemas import (
     TransferLinePayerUpdate,
     TransferRead,
     UpsellCreate,
+    UpsellDecisionInput,
     UpsellRead,
-    UpsellStatusUpdate,
     WarrantyClaimAuthorizationInput,
     WarrantyClaimContext,
     WarrantyClaimConvertInput,
@@ -121,7 +122,7 @@ async def update_service_order(
 ) -> ServiceOrderRead:
     existing = await service.get_order(order_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.update_order(order_id, payload)
+    return await service.update_order(order_id, payload, current_user)
 
 
 @router.delete("/service-orders/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -341,21 +342,7 @@ async def list_upsells(
     """All upsells across every ODS in the filial — vehicle/technician info is
     resolved on the frontend, same as the main Órdenes de Servicio list."""
     await _ensure_access(current_user, filial_id, service.db)
-    upsells = await service.list_upsells(filial_id)
-    return [
-        UpsellRead(
-            id=u.id,
-            service_order_id=u.service_order_id,
-            title=u.title,
-            description=u.description,
-            detected_by_user_id=u.detected_by_user_id,
-            evidence_count=u.evidence_count,
-            status=u.status,
-            created_at=u.created_at,
-            resolved_at=u.resolved_at,
-        )
-        for u in upsells
-    ]
+    return await service.list_upsells(filial_id)
 
 
 @router.post(
@@ -371,42 +358,20 @@ async def create_upsell(
 ) -> UpsellRead:
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    u = await service.create_upsell(order_id, payload)
-    return UpsellRead(
-        id=u.id,
-        service_order_id=u.service_order_id,
-        title=u.title,
-        description=u.description,
-        detected_by_user_id=u.detected_by_user_id,
-        evidence_count=u.evidence_count,
-        status=u.status,
-        created_at=u.created_at,
-        resolved_at=u.resolved_at,
-    )
+    return await service.create_upsell(order_id, payload)
 
 
 @router.patch("/upsells/{upsell_id}", response_model=UpsellRead)
-async def update_upsell_status(
+async def decide_upsell(
     upsell_id: uuid.UUID,
-    payload: UpsellStatusUpdate,
+    payload: UpsellDecisionInput,
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> UpsellRead:
     existing = await service.get_upsell(upsell_id)
     order = await service.get_order(existing.service_order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    u = await service.update_upsell_status(upsell_id, payload.status)
-    return UpsellRead(
-        id=u.id,
-        service_order_id=u.service_order_id,
-        title=u.title,
-        description=u.description,
-        detected_by_user_id=u.detected_by_user_id,
-        evidence_count=u.evidence_count,
-        status=u.status,
-        created_at=u.created_at,
-        resolved_at=u.resolved_at,
-    )
+    return await service.decide_upsell(upsell_id, payload, current_user.user_id)
 
 
 @router.get("/service-orders/{order_id}/billing")
@@ -515,10 +480,10 @@ async def list_receivables(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> list[ReceivableRead]:
-    from app.modules.service_orders.billing import BillingService
+    from app.modules.administracion.service import AdministracionService
 
     await _ensure_access(current_user, filial_id, service.db)
-    return await BillingService(service.db).list_receivables(filial_id)
+    return await AdministracionService(service.db).list_receivables(filial_id)
 
 
 @router.post("/receivables/{invoice_id}/collect", response_model=ReceivableRead)
@@ -549,6 +514,34 @@ async def close_service_order(
     return await service.close_order(
         order_id, payload.next_maintenance_due_at, payload.next_maintenance_tempario_id
     )
+
+
+@router.post("/service-orders/{order_id}/cancel", response_model=ServiceOrderRead)
+async def cancel_service_order(
+    order_id: uuid.UUID,
+    payload: ServiceOrderCancelInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ServiceOrderRead:
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.cancel_order(order_id, payload.reason, current_user.user_id)
+
+
+@router.post("/service-orders/{order_id}/reopen", response_model=ServiceOrderRead)
+async def reopen_service_order(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ServiceOrderRead:
+    order = await service.get_order(order_id)
+    # Reopening reverses a decision already made on the floor — same
+    # elevated bar as authorizing/rejecting a warranty claim, not a routine
+    # asesor-level edit.
+    await ensure_module_access(
+        service.db, current_user, order.filial_id, "administracion", AccessLevel.EDITAR
+    )
+    return await service.reopen_order(order_id, current_user.user_id)
 
 
 # Warranty claims (unified "reclamo de garantía") — covers factory,

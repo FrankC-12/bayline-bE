@@ -24,6 +24,7 @@ def get_current_user(request: Request) -> CurrentUser:
         return CurrentUser(
             user_id=uuid.UUID(payload["sub"]),
             email=payload["email"],
+            full_name=payload.get("full_name", ""),
             role_id=uuid.UUID(payload["role_id"]),
             role_slug=payload["role_slug"],
             scope=RoleScope(payload["scope"]),

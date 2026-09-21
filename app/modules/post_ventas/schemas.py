@@ -109,6 +109,9 @@ class TemparioRead(BaseModel):
     parts_margin: float
     labor_cost: float
     total_price: float
+    iva_percentage: float
+    iva_amount: float
+    total_with_iva: float
     created_at: datetime
     updated_at: datetime
 

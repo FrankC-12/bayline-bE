@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.modules.service_orders.schemas import OrderSummary
 
@@ -11,10 +11,15 @@ from app.modules.service_orders.schemas import OrderSummary
 class BillingInput(BaseModel):
     payment_method: Literal["usd", "bs", "mixed"]
     usd_base: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
-    # None = bill the vehicle's own owner (today's behavior). Set this to bill
-    # a different Client in the same filial instead — e.g. the holding,
-    # registered as a regular empresa client, for factory-warranty work.
+    # None/None = bill the vehicle's own owner (today's behavior). Set
+    # billed_client_id to bill a different Client in the same filial instead
+    # — e.g. the holding, registered as a regular empresa client. Set
+    # billed_supplier_id to bill a Supplier instead (e.g. the manufacturer
+    # or a parts supplier covering a warranty claim) — resolved to its
+    # linked billing Client, created on first use. At most one of the two
+    # may be set.
     billed_client_id: uuid.UUID | None = None
+    billed_supplier_id: uuid.UUID | None = None
     # A contribuyente especial (typically any empresa-type client, e.g. an
     # importador) withholds part of the IVA and ISLR when it pays — these
     # percentages let the quote/invoice show what will actually be received,
@@ -22,6 +27,12 @@ class BillingInput(BaseModel):
     # withholding agent.
     iva_retention_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, max_digits=5, decimal_places=2)
     islr_retention_percentage: Decimal = Field(default=Decimal("0"), ge=0, le=100, max_digits=5, decimal_places=2)
+
+    @model_validator(mode="after")
+    def _billed_target_is_unambiguous(self) -> "BillingInput":
+        if self.billed_client_id is not None and self.billed_supplier_id is not None:
+            raise ValueError("Elige un cliente o un proveedor para facturar, no ambos.")
+        return self
 
 
 class BillingQuote(BaseModel):
@@ -58,12 +69,16 @@ class InvoiceCreate(BillingInput):
 
 
 class ReceivableRead(BaseModel):
-    invoice_id: uuid.UUID
+    # "service_order_invoice" has an actual collect-payment action (see
+    # CollectInvoicePaymentInput/collect_invoice); "part_sale" is informational
+    # only here — it clears once the sale itself is marked completado.
+    document_type: Literal["service_order_invoice", "part_sale"] = "service_order_invoice"
+    invoice_id: uuid.UUID  # the document's own id (invoice.id, or sale.id for a part_sale)
     code: str
-    service_order_id: uuid.UUID
-    order_code: str
+    service_order_id: uuid.UUID | None = None
+    order_code: str | None = None
     filial_id: uuid.UUID
-    billed_client_id: uuid.UUID
+    billed_client_id: uuid.UUID | None = None
     billed_client_name: str
     total_usd: float
     iva_retention_amount: float
@@ -72,6 +87,8 @@ class ReceivableRead(BaseModel):
     amount_paid_at_issuance: float
     pending_amount: float
     issued_at: datetime
+    days_outstanding: int
+    aging_bucket: Literal["0-30", "31-60", "61-90", "90+"]
 
 
 class CollectInvoicePaymentInput(BaseModel):

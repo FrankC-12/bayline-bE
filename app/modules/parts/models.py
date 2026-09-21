@@ -128,6 +128,14 @@ class PartSale(Base):
         nullable=False,
         default=PartSaleStatus.PENDIENTE,
     )
+    # Frozen at sale time from the filial's LaborSettings, same convention as
+    # a service order invoice or a vehicle sale — a sale's own tax figures
+    # never retroactively change if the filial's rates change later. IGTF is
+    # computed on (total + iva_amount), never on total alone.
+    iva_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0, server_default="0")
+    iva_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0, server_default="0")
+    igtf_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -144,6 +152,10 @@ class PartSale(Base):
     @property
     def total(self) -> float:
         return sum(float(line.line_total) for line in self.lines)
+
+    @property
+    def total_with_taxes(self) -> float:
+        return self.total + float(self.iva_amount) + float(self.igtf_amount)
 
 
 class PartSaleLine(Base):

@@ -1,10 +1,10 @@
 import uuid
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.modules.auth.dependencies import get_current_user, require_holding_user
+from app.modules.auth.dependencies import require_holding_user
 from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.filiales.schemas import FilialCreate, FilialRead, FilialUpdate
@@ -24,24 +24,26 @@ def _ensure_owns_holding(current_user: CurrentUser, holding_id: uuid.UUID) -> No
 
 @router.get("", response_model=list[FilialRead])
 async def list_filiales(
-    holding_id: uuid.UUID | None = Query(default=None),
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_holding_user),
     service: FilialService = Depends(get_filial_service),
 ) -> list[FilialRead]:
-    """List filiales. Holding/Filial callers are always scoped to their own holding."""
-    if current_user.holding_id is not None:
-        holding_id = current_user.holding_id
-    return await service.list_filiales(holding_id)
+    """List filiales under the caller's own holding. Same gate as
+    create/update/activate — only a holding admin has a legitimate reason
+    to enumerate its filiales."""
+    return await service.list_filiales(current_user.holding_id)
 
 
 @router.get("/{filial_id}", response_model=FilialRead)
 async def get_filial(
     filial_id: uuid.UUID,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_holding_user),
     service: FilialService = Depends(get_filial_service),
 ) -> FilialRead:
-    """Retrieve a single filial by its id."""
-    return await service.get_filial(filial_id)
+    """Retrieve a single filial by its id. Only its owning Holding may view
+    it — same gate as update/activate/deactivate."""
+    filial = await service.get_filial(filial_id)
+    _ensure_owns_holding(current_user, filial.holding_id)
+    return filial
 
 
 @router.post("", response_model=FilialRead, status_code=status.HTTP_201_CREATED)

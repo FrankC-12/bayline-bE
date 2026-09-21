@@ -20,6 +20,8 @@ from app.modules.parts.exceptions import MissingReturnPhotoError
 from app.modules.parts.models import Part
 from app.modules.parts.schemas import PartReturnCreate
 from app.modules.parts.service import PartsService
+from app.modules.warehouse.enums import MovementType
+from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
 
 PHOTO = ["/api/v1/uploads/part-returns/evidence.jpg"]
 
@@ -34,9 +36,10 @@ def env():
             id=uuid.uuid4(), category_id=uuid.uuid4(), filial_id=filial_id, code="P1", name="Repuesto",
             price=10, stock_quantity=5,
         )
-        session.add(part)
+        warehouse = Warehouse(id=uuid.uuid4(), filial_id=filial_id, name="Almacén 1")
+        session.add_all([part, warehouse])
         session.commit()
-        yield PartsService(AsyncAdapter(session)), session, filial_id, part
+        yield PartsService(AsyncAdapter(session)), session, filial_id, part, warehouse
 
 
 def _payload(filial_id, part_id, condition, destination, photo_urls=PHOTO):
@@ -54,17 +57,29 @@ def _payload(filial_id, part_id, condition, destination, photo_urls=PHOTO):
 
 @pytest.mark.asyncio
 async def test_nuevo_can_return_to_sellable_inventory(env):
-    service, session, filial_id, part = env
+    service, session, filial_id, part, warehouse = env
+    responsible_user_id = uuid.uuid4()
     await service.create_return(
-        _payload(filial_id, part.id, ReturnCondition.NUEVO, "Almacén 1"), uuid.uuid4()
+        _payload(filial_id, part.id, ReturnCondition.NUEVO, "Almacén 1"), responsible_user_id
     )
     session.refresh(part)
     assert part.stock_quantity == 6
 
+    lot = session.query(PartLot).filter(PartLot.part_id == part.id).one()
+    assert lot.warehouse_id == warehouse.id
+    assert lot.quantity_received == 1
+    assert lot.quantity_remaining == 1
+
+    movement = session.query(StockMovement).filter(StockMovement.part_id == part.id).one()
+    assert movement.movement_type == MovementType.ENTRADA
+    assert movement.warehouse_id == warehouse.id
+    assert movement.quantity == 1
+    assert movement.responsible_user_id == responsible_user_id
+
 
 @pytest.mark.asyncio
 async def test_defectuoso_to_sellable_inventory_is_rejected(env):
-    service, _session, filial_id, part = env
+    service, _session, filial_id, part, _warehouse = env
     with pytest.raises(BadRequestError):
         await service.create_return(
             _payload(filial_id, part.id, ReturnCondition.DEFECTUOSO, "Almacén 1"), uuid.uuid4()
@@ -73,7 +88,7 @@ async def test_defectuoso_to_sellable_inventory_is_rejected(env):
 
 @pytest.mark.asyncio
 async def test_usado_to_sellable_inventory_is_rejected(env):
-    service, _session, filial_id, part = env
+    service, _session, filial_id, part, _warehouse = env
     with pytest.raises(BadRequestError):
         await service.create_return(
             _payload(filial_id, part.id, ReturnCondition.USADO, "Almacén 1"), uuid.uuid4()
@@ -82,27 +97,31 @@ async def test_usado_to_sellable_inventory_is_rejected(env):
 
 @pytest.mark.asyncio
 async def test_defectuoso_to_write_off_is_allowed_and_does_not_restock(env):
-    service, session, filial_id, part = env
+    service, session, filial_id, part, _warehouse = env
     await service.create_return(
         _payload(filial_id, part.id, ReturnCondition.DEFECTUOSO, "Baja (merma)"), uuid.uuid4()
     )
     session.refresh(part)
     assert part.stock_quantity == 5
+    assert session.query(PartLot).filter(PartLot.part_id == part.id).count() == 0
+    assert session.query(StockMovement).filter(StockMovement.part_id == part.id).count() == 0
 
 
 @pytest.mark.asyncio
 async def test_usado_to_write_off_is_allowed_and_does_not_restock(env):
-    service, session, filial_id, part = env
+    service, session, filial_id, part, _warehouse = env
     await service.create_return(
         _payload(filial_id, part.id, ReturnCondition.USADO, "Baja (merma)"), uuid.uuid4()
     )
     session.refresh(part)
     assert part.stock_quantity == 5
+    assert session.query(PartLot).filter(PartLot.part_id == part.id).count() == 0
+    assert session.query(StockMovement).filter(StockMovement.part_id == part.id).count() == 0
 
 
 @pytest.mark.asyncio
 async def test_rejected_return_is_not_persisted(env):
-    service, session, filial_id, part = env
+    service, session, filial_id, part, _warehouse = env
     with pytest.raises(BadRequestError):
         await service.create_return(
             _payload(filial_id, part.id, ReturnCondition.USADO, "Almacén 1"), uuid.uuid4()
@@ -112,7 +131,7 @@ async def test_rejected_return_is_not_persisted(env):
 
 @pytest.mark.asyncio
 async def test_return_without_photos_is_rejected(env):
-    service, _session, filial_id, part = env
+    service, _session, filial_id, part, _warehouse = env
     with pytest.raises(MissingReturnPhotoError):
         await service.create_return(
             _payload(filial_id, part.id, ReturnCondition.NUEVO, "Almacén 1", photo_urls=[]),
@@ -122,8 +141,17 @@ async def test_return_without_photos_is_rejected(env):
 
 @pytest.mark.asyncio
 async def test_return_with_photos_persists_them(env):
-    service, _session, filial_id, part = env
+    service, _session, filial_id, part, _warehouse = env
     ret = await service.create_return(
         _payload(filial_id, part.id, ReturnCondition.NUEVO, "Almacén 1"), uuid.uuid4()
     )
     assert ret.photo_urls == PHOTO
+
+
+@pytest.mark.asyncio
+async def test_return_to_unknown_warehouse_is_rejected(env):
+    service, _session, filial_id, part, _warehouse = env
+    with pytest.raises(BadRequestError):
+        await service.create_return(
+            _payload(filial_id, part.id, ReturnCondition.NUEVO, "Almacén inexistente"), uuid.uuid4()
+        )

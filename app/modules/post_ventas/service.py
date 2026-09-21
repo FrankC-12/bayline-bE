@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
 from app.modules.exchange_rates.models import ExchangeRate
+from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
 from app.modules.post_ventas.enums import CATEGORY_PREFIXES, TemparioCategory, VehicleWarrantySource
 from app.modules.post_ventas.exceptions import (
     MaintenancePlanNotFoundError,
@@ -42,14 +43,19 @@ from app.modules.post_ventas.schemas import (
     WorkshopWarrantyRead,
 )
 
-PARTS_MARGIN_RATE = 0.30
-
-
-def _tempario_to_read(t: Tempario, hourly_rate: float) -> TemparioRead:
+def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) -> TemparioRead:
+    # Same formula a real ODS uses (price_parts_cost/PARTS_MULTIPLIERS in
+    # app.modules.parts.pricing): margin applied once, on the true parts
+    # cost, using the same default margin tier an order starts on — so a
+    # tempario's preview total matches exactly what the ODS that uses it
+    # will charge, as long as the order keeps the default discount.
     parts_cost = sum(p.quantity * float(p.unit_cost) for p in t.parts)
-    parts_margin = parts_cost * PARTS_MARGIN_RATE
+    parts_price = parts_cost * float(PARTS_MULTIPLIERS[DEFAULT_DISCOUNT])
+    parts_margin = parts_price - parts_cost
     labor_cost = float(t.estimated_hours) * hourly_rate
     total_price = parts_cost + parts_margin + labor_cost
+    iva_amount = (labor_cost + parts_price) * iva_percentage / 100
+    total_with_iva = labor_cost + parts_price + iva_amount
 
     return TemparioRead(
         id=t.id,
@@ -78,6 +84,9 @@ def _tempario_to_read(t: Tempario, hourly_rate: float) -> TemparioRead:
         parts_margin=parts_margin,
         labor_cost=labor_cost,
         total_price=total_price,
+        iva_percentage=iva_percentage,
+        iva_amount=iva_amount,
+        total_with_iva=total_with_iva,
         created_at=t.created_at,
         updated_at=t.updated_at,
     )
@@ -198,12 +207,13 @@ class PostVentasService:
 
         settings = await self.get_labor_settings(filial_id)
         rate = float(settings.hourly_rate)
-        return [_tempario_to_read(t, rate) for t in temparios]
+        iva_percentage = float(settings.iva_percentage)
+        return [_tempario_to_read(t, rate, iva_percentage) for t in temparios]
 
     async def get_tempario(self, tempario_id: uuid.UUID) -> TemparioRead:
         t = await self._get_tempario_model(tempario_id)
         settings = await self.get_labor_settings(t.filial_id)
-        return _tempario_to_read(t, float(settings.hourly_rate))
+        return _tempario_to_read(t, float(settings.hourly_rate), float(settings.iva_percentage))
 
     async def create_tempario(self, payload: TemparioCreate) -> TemparioRead:
         sequence_number = payload.sequence_number or await self._next_sequence(

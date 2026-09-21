@@ -8,10 +8,10 @@ CENT = Decimal("0.01")
 MICRO = Decimal("0.000001")
 
 
-def allocate_fifo(lots, quantity):
+def allocate_fifo(lots, quantity, *, part_id=None, part_name=None):
     available = sum(lot.quantity_remaining for lot in lots)
     if available < quantity:
-        raise InsufficientStockError(available, quantity)
+        raise InsufficientStockError(available, quantity, part_id=part_id, part_name=part_name)
     remaining = quantity
     allocations = []
     for lot in lots:

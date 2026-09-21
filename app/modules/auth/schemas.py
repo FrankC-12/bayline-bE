@@ -23,6 +23,10 @@ class CurrentUser(BaseModel):
 
     user_id: uuid.UUID
     email: str
+    # Defaults to "" rather than being required — many tests construct
+    # CurrentUser directly (bypassing login) without it, and the greeting
+    # that needs this is the only consumer that cares if it's blank.
+    full_name: str = ""
     role_id: uuid.UUID
     role_slug: str
     scope: RoleScope

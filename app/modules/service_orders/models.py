@@ -25,6 +25,7 @@ from app.modules.service_orders.enums import (
     ServiceOrderType,
     TaskStatus,
     TransferStatus,
+    UpsellApprovalChannel,
     UpsellStatus,
     WarrantyClaimStatus,
     WarrantyClaimType,
@@ -105,6 +106,25 @@ class ServiceOrder(Base):
     invoiced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pricing_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     total_amount: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancelled_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reopened_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reopened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set only when "Marcar como completado" was confirmed despite an
+    # unfinished task or an undispatched ODT — the normal path never touches
+    # these three fields.
+    completed_with_pending_items: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    completed_override_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    completed_override_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def code(self) -> str:
@@ -246,10 +266,12 @@ class ServiceOrderTransferLotAllocation(Base):
 
 
 class Upsell(Base):
-    """Additional work a technician spots while working an ODS — a free-text
-    finding, not tied to the Tempario catalog. The advisor approves, postpones
-    or rejects it; approving does not automatically add it as a billable
-    task (that's a separate, deliberate step from the ODS detail)."""
+    """Additional work a technician spots while working an ODS — built from
+    real Tempario tasks and parts so it carries an actual amount, not just a
+    free-text finding. Approving it adds those same tasks/parts to the ODS
+    (ServiceOrderService.decide_upsell), the same way adding them by hand
+    would — the order's total is never stored on the upsell itself, it's
+    just whatever the order recomputes once the lines land."""
 
     __tablename__ = "upsells"
 
@@ -271,6 +293,58 @@ class Upsell(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Only ever set together, and only when status becomes APROBADO — how
+    # the client actually agreed to pay for this, and who took that down.
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    approval_channel: Mapped[UpsellApprovalChannel | None] = mapped_column(
+        Enum(UpsellApprovalChannel, name="upsell_approval_channel"), nullable=True
+    )
+
+    tasks: Mapped[list["UpsellTask"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+    parts: Mapped[list["UpsellPart"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
+
+
+class UpsellTask(Base):
+    """A tempario task proposed as part of an upsell — snapshotted the same
+    way ServiceOrderTask is, purely for display before a decision is made.
+    Approving the upsell doesn't replay these values; it calls
+    ServiceOrderService.add_task fresh, which snapshots again from whatever
+    the tempario/labor rate actually are at that moment."""
+
+    __tablename__ = "upsell_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    upsell_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("upsells.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tempario_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("temparios.id", ondelete="RESTRICT"), nullable=False
+    )
+    code_snapshot: Mapped[str] = mapped_column(String(20), nullable=False)
+    name_snapshot: Mapped[str] = mapped_column(String(150), nullable=False)
+    hours_snapshot: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)
+
+
+class UpsellPart(Base):
+    """A part proposed as part of an upsell, with the cost known at proposal
+    time — used only to preview the upsell's own amount (see
+    _upsell_to_read); approving it calls add_transfer_line fresh, which
+    re-derives the real cost from whatever FIFO lots exist at that moment."""
+
+    __tablename__ = "upsell_parts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    upsell_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("upsells.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    part_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
+    )
+    name_snapshot: Mapped[str] = mapped_column(String(150), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    unit_cost_snapshot: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
 
 
 class ServiceOrderInvoice(Base):

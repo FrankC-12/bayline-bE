@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -176,6 +176,7 @@ class PartsService:
                 is_active=part.is_active,
                 stock_total=int(total),
                 reference_price=round(float(cost) * 1.30, 2) if cost is not None else None,
+                latest_cost=float(cost) if cost is not None else None,
                 location=location,
                 created_at=part.created_at,
                 updated_at=part.updated_at,
@@ -185,10 +186,11 @@ class PartsService:
 
     async def _part_to_read(self, part: Part) -> PartRead:
         stock_total = await self._stock_total(part.id)
-        reference_price = await self.get_reference_price(part.id)
+        latest_cost = await self.get_latest_cost(part.id)
+        reference_price = round(latest_cost * 1.30, 2) if latest_cost is not None else 0.0
         location = await self.get_latest_location(part.id)
         return (await self._parts_to_read([(part, stock_total, None, location)]))[0].model_copy(
-            update={"reference_price": reference_price}
+            update={"reference_price": reference_price, "latest_cost": latest_cost}
         )
 
     async def _stock_total(self, part_id: uuid.UUID) -> int:
@@ -271,10 +273,6 @@ class PartsService:
         )
         cost = result.scalar_one_or_none()
         return float(cost) if cost is not None else None
-
-    async def get_reference_price(self, part_id: uuid.UUID) -> float:
-        cost = await self.get_latest_cost(part_id)
-        return round(cost * 1.30, 2) if cost is not None else 0.0
 
     async def get_part(self, part_id: uuid.UUID) -> Part:
         part = await self.db.get(Part, part_id)
@@ -568,6 +566,30 @@ class PartsService:
             raise PartSaleNotFoundError(str(sale_id))
         return sale
 
+    async def _tax_breakdown(
+        self, filial_id: uuid.UUID, subtotal: Decimal
+    ) -> tuple[float, Decimal, float, Decimal]:
+        """IVA on the subtotal, IGTF on (subtotal + IVA) — never on the
+        subtotal alone. Same formula already used for service orders and
+        vehicle sales; a counter sale is assumed paid in foreign currency in
+        full, the same simplifying assumption a vehicle's own list-price
+        preview already makes (no partial/Bs payment tracking exists for a
+        counter sale, unlike an ODS invoice or a vehicle checkout)."""
+        result = await self.db.execute(
+            select(LaborSettings.iva_percentage, LaborSettings.igtf_percentage).where(
+                LaborSettings.filial_id == filial_id
+            )
+        )
+        row = result.one_or_none()
+        iva_percentage = float(row[0]) if row else 16.0
+        igtf_percentage = float(row[1]) if row else 3.0
+        cent = Decimal("0.01")
+        iva_amount = (subtotal * Decimal(str(iva_percentage)) / 100).quantize(cent, rounding=ROUND_HALF_UP)
+        igtf_amount = ((subtotal + iva_amount) * Decimal(str(igtf_percentage)) / 100).quantize(
+            cent, rounding=ROUND_HALF_UP
+        )
+        return iva_percentage, iva_amount, igtf_percentage, igtf_amount
+
     async def _sale_plan(self, payload, *, consume=False):
         warehouse = await self.db.get(Warehouse, payload.warehouse_id)
         if warehouse is None or warehouse.filial_id != payload.filial_id or not warehouse.is_active:
@@ -596,7 +618,7 @@ class PartsService:
             if consume:
                 query = query.with_for_update().execution_options(populate_existing=True)
             lots = list((await self.db.execute(query)).scalars().all())
-            allocations = allocate_fifo(lots, quantity)
+            allocations = allocate_fifo(lots, quantity, part_id=part.id, part_name=part.name)
             cost, price, total = price_allocations(
                 allocations, quantity, PARTS_MULTIPLIERS[payload.discount_label]
             )
@@ -605,6 +627,10 @@ class PartsService:
 
     async def quote_sale(self, payload):
         plans = await self._sale_plan(payload)
+        subtotal = sum((plan[5] for plan in plans), Decimal(0))
+        iva_percentage, iva_amount, igtf_percentage, igtf_amount = await self._tax_breakdown(
+            payload.filial_id, subtotal
+        )
         return {
             "lines": [
                 dict(
@@ -621,12 +647,23 @@ class PartsService:
                 )
                 for part, quantity, allocations, cost, price, total in plans
             ],
-            "total": sum((plan[5] for plan in plans), Decimal(0)),
+            "total": subtotal,
+            "iva_percentage": iva_percentage,
+            "iva_amount": iva_amount,
+            "igtf_percentage": igtf_percentage,
+            "igtf_amount": igtf_amount,
+            "total_with_taxes": subtotal + iva_amount + igtf_amount,
         }
 
-    async def create_sale(self, payload: PartSaleCreate) -> PartSale:
+    async def create_sale(
+        self, payload: PartSaleCreate, responsible_user_id: uuid.UUID | None = None
+    ) -> PartSale:
         try:
             plans = await self._sale_plan(payload, consume=True)
+            subtotal = sum((plan[5] for plan in plans), Decimal(0))
+            iva_percentage, iva_amount, igtf_percentage, igtf_amount = await self._tax_breakdown(
+                payload.filial_id, subtotal
+            )
             sale = PartSale(
                 filial_id=payload.filial_id,
                 client_name=payload.client_name,
@@ -634,6 +671,10 @@ class PartsService:
                 request_reason="Venta de Repuestos",
                 discount_label=payload.discount_label,
                 sequence_number=await self._next_sale_sequence(payload.filial_id),
+                iva_percentage=iva_percentage,
+                iva_amount=iva_amount,
+                igtf_percentage=igtf_percentage,
+                igtf_amount=igtf_amount,
             )
             self.db.add(sale)
             await self.db.flush()
@@ -666,6 +707,7 @@ class PartsService:
                             quantity=take,
                             unit_cost=lot.unit_cost,
                             reference=sale.code,
+                            responsible_user_id=responsible_user_id,
                         )
                     )
                 part.stock_quantity = max(0, part.stock_quantity - quantity)
@@ -727,6 +769,7 @@ class PartsService:
         sale_id: uuid.UUID,
         new_status: PartSaleStatus,
         dispatched_lines: list[PartSaleLineDispatch] | None = None,
+        responsible_user_id: uuid.UUID | None = None,
     ) -> PartSale:
         # Serialize status transitions so cancellation restores allocations only once.
         await self.db.execute(
@@ -767,6 +810,7 @@ class PartsService:
                                 unit_cost=allocation.unit_cost,
                                 reference=sale.code,
                                 note="Cancelación de venta",
+                                responsible_user_id=responsible_user_id,
                             )
                         )
                     if line.allocations:
@@ -809,6 +853,13 @@ class PartsService:
         )
         return list(result.scalars().all())
 
+    async def _next_return_lot_number(self, filial_id: uuid.UUID) -> int:
+        result = await self.db.execute(
+            select(func.max(PartLot.lot_number)).where(PartLot.filial_id == filial_id)
+        )
+        current_max = result.scalar()
+        return (current_max or 100) + 1
+
     async def create_return(
         self, payload: PartReturnCreate, responsible_user_id: uuid.UUID
     ) -> PartReturn:
@@ -835,6 +886,49 @@ class PartsService:
         self.db.add(ret)
 
         if not is_write_off:
+            # A return that comes back into sellable stock has to move the
+            # same three things a normal entrada does — a PartLot (what the
+            # displayed stock and FIFO cost are actually computed from), a
+            # StockMovement ledger entry, and the Part.stock_quantity
+            # convenience column — otherwise the part's shown quantity never
+            # moves even though the return "succeeded".
+            warehouse_result = await self.db.execute(
+                select(Warehouse).where(
+                    Warehouse.filial_id == payload.filial_id,
+                    func.lower(Warehouse.name) == payload.destination_warehouse.strip().lower(),
+                )
+            )
+            warehouse = warehouse_result.scalar_one_or_none()
+            if warehouse is None:
+                raise BadRequestError(
+                    f"El almacén de destino '{payload.destination_warehouse}' no existe."
+                )
+
+            unit_cost = await self.get_latest_cost(payload.part_id) or 0.0
+            self.db.add(
+                PartLot(
+                    filial_id=payload.filial_id,
+                    lot_number=await self._next_return_lot_number(payload.filial_id),
+                    warehouse_id=warehouse.id,
+                    part_id=payload.part_id,
+                    quantity_received=payload.quantity,
+                    quantity_remaining=payload.quantity,
+                    unit_cost=unit_cost,
+                    note="Devolución de repuesto",
+                )
+            )
+            self.db.add(
+                StockMovement(
+                    filial_id=payload.filial_id,
+                    warehouse_id=warehouse.id,
+                    part_id=payload.part_id,
+                    movement_type=MovementType.ENTRADA,
+                    quantity=payload.quantity,
+                    unit_cost=unit_cost,
+                    note="Devolución de repuesto",
+                    responsible_user_id=responsible_user_id,
+                )
+            )
             part.stock_quantity += payload.quantity
             _sync_availability(part)
 

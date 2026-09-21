@@ -13,6 +13,7 @@ from app.modules.service_orders.enums import (
     ServiceOrderType,
     TaskStatus,
     TransferStatus,
+    UpsellApprovalChannel,
     UpsellStatus,
     WarrantyClaimStatus,
     WarrantyClaimType,
@@ -78,6 +79,15 @@ class ServiceOrderUpdate(BaseModel):
     clear_technician: bool = False
     clear_advisor: bool = False
     clear_bay: bool = False
+    # Only meaningful when transitioning status to "completado" while a task
+    # is still pendiente or an ODT hasn't been marked pedido — the server
+    # decides whether that's actually the case, this just carries the
+    # explicit confirmation to go ahead anyway.
+    confirm_incomplete_completion: bool = False
+
+
+class ServiceOrderCancelInput(BaseModel):
+    reason: str = Field(min_length=3, max_length=2000)
 
 
 class ServiceOrderCloseInput(BaseModel):
@@ -112,6 +122,14 @@ class ServiceOrderRead(BaseModel):
     closed_at: datetime | None
     total_amount: float | None
     invoiced_at: datetime | None
+    cancel_reason: str | None
+    cancelled_by_user_id: uuid.UUID | None
+    cancelled_at: datetime | None
+    reopened_by_user_id: uuid.UUID | None
+    reopened_at: datetime | None
+    completed_with_pending_items: bool
+    completed_override_by_user_id: uuid.UUID | None
+    completed_override_at: datetime | None
 
 
 class TaskCreate(BaseModel):
@@ -196,15 +214,58 @@ class OrderSummary(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class UpsellTaskInput(BaseModel):
+    tempario_id: uuid.UUID
+
+
+class UpsellPartInput(BaseModel):
+    part_id: uuid.UUID
+    quantity: int = Field(gt=0)
+
+
 class UpsellCreate(BaseModel):
     title: str = Field(min_length=2, max_length=150)
     description: str = Field(min_length=2)
     evidence_count: int = Field(default=0, ge=0)
     detected_by_user_id: uuid.UUID | None = None
+    tasks: list[UpsellTaskInput] = Field(default_factory=list)
+    parts: list[UpsellPartInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _requires_at_least_one_line(self) -> "UpsellCreate":
+        if not self.tasks and not self.parts:
+            raise ValueError("Agrega al menos una tarea del tempario o un repuesto.")
+        return self
 
 
-class UpsellStatusUpdate(BaseModel):
-    status: UpsellStatus
+class UpsellDecisionInput(BaseModel):
+    status: Literal["aprobado", "rechazado", "pospuesto"]
+    # Only meaningful (and required) for status="aprobado" — how the client
+    # actually agreed to pay for the additional work.
+    approval_channel: UpsellApprovalChannel | None = None
+
+    @model_validator(mode="after")
+    def _requires_channel_when_approved(self) -> "UpsellDecisionInput":
+        if self.status == "aprobado" and self.approval_channel is None:
+            raise ValueError("Indica por qué medio el cliente aprobó el trabajo adicional.")
+        return self
+
+
+class UpsellTaskRead(BaseModel):
+    id: uuid.UUID
+    tempario_id: uuid.UUID
+    code_snapshot: str
+    name_snapshot: str
+    hours_snapshot: float
+
+
+class UpsellPartRead(BaseModel):
+    id: uuid.UUID
+    part_id: uuid.UUID
+    name_snapshot: str
+    quantity: int
+    unit_cost_snapshot: float
+    line_total: float
 
 
 class UpsellRead(BaseModel):
@@ -215,6 +276,15 @@ class UpsellRead(BaseModel):
     detected_by_user_id: uuid.UUID | None
     evidence_count: int
     status: UpsellStatus
+    tasks: list[UpsellTaskRead]
+    parts: list[UpsellPartRead]
+    # A preview: labor at the filial's current hourly rate + parts at the
+    # cost they had when proposed, marked up by the order's own discount
+    # tier — the same formula that will actually price them on approval,
+    # give or take whatever moved (rate, stock cost) since this was built.
+    amount: float
+    approved_by_user_id: uuid.UUID | None
+    approval_channel: UpsellApprovalChannel | None
     created_at: datetime
     resolved_at: datetime | None
 
@@ -272,7 +342,7 @@ class WarrantyClaimRead(BaseModel):
     filial_id: uuid.UUID
     claim_type: WarrantyClaimType
     vehicle_id: uuid.UUID
-    vehicle_plate: str
+    vehicle_plate: str | None
     vehicle_vin: str | None
     client_name: str
     service_order_id: uuid.UUID | None

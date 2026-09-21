@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.venezuela_time import aging_bucket, venezuela_today
 from app.modules.administracion.enums import (
     AccountCurrency,
     ClaimResolution,
@@ -61,6 +62,7 @@ from app.modules.administracion.schemas import (
     MonthTrend,
     ProfitabilityAdjustmentRow,
     ProfitabilityDepartmentRow,
+    ProfitabilityLineItem,
     ProfitabilityReport,
     PurchaseRequestCreate,
     PurchaseRequestLineRead,
@@ -85,7 +87,7 @@ from app.modules.concesionario.enums import VehicleCondition
 from app.modules.concesionario.models import DealershipVehicle, VehicleSale
 from app.modules.filiales.models import Filial
 from app.modules.parts.enums import PartSaleStatus
-from app.modules.parts.models import PartSale, PartSaleLine
+from app.modules.parts.models import Part, PartSale, PartSaleLine
 from app.modules.post_ventas.models import Tempario
 from app.modules.post_ventas.service import PostVentasService
 from app.modules.clients.models import Client
@@ -274,6 +276,7 @@ class AdministracionService:
         quotes: list | None,
         warehouse_id: uuid.UUID | None,
         location: str | None = None,
+        responsible_user_id: uuid.UUID | None = None,
     ) -> PurchaseRequestRead:
         request = await self._get_request_model(request_id)
         if new_status != request.status:
@@ -307,6 +310,7 @@ class AdministracionService:
                             location=location,
                         ),
                         note=f"Compra {request.code}",
+                        responsible_user_id=responsible_user_id,
                     )
                 request.warehouse_id = warehouse_id
 
@@ -386,7 +390,7 @@ class AdministracionService:
             supplier = await self.db.get(Supplier, claim.supplier_id)
             expense = ExpenseEntry(
                 filial_id=claim.filial_id,
-                entry_date=date.today(),
+                entry_date=venezuela_today(),
                 category=ExpenseCategory.GARANTIA_RECHAZADA,
                 beneficiary=supplier.business_name if supplier else "Importador",
                 description=f"Factura rechazada por el importador — reclamo {claim.id}",
@@ -572,7 +576,7 @@ class AdministracionService:
 
         income = IncomeEntry(
             filial_id=submission.filial_id,
-            entry_date=date.today(),
+            entry_date=venezuela_today(),
             source=IncomeSource.MANUAL,
             origin_reference=submission.code,
             description=f"Reembolso de garantías del holding — {submission.code}",
@@ -795,7 +799,7 @@ class AdministracionService:
 
         entry = IncomeEntry(
             filial_id=filial_id,
-            entry_date=date.today(),
+            entry_date=venezuela_today(),
             source=IncomeSource.AUTOMATICO,
             origin_reference=origin_reference,
             description=description,
@@ -840,7 +844,7 @@ class AdministracionService:
         """"Open period" = the current calendar month, no future dates — no
         Período entity, no close/reopen screen; a month is "closed" purely
         by no longer being the current one."""
-        today = date.today()
+        today = venezuela_today()
         if entry_date > today:
             raise FutureEntryDateError()
         if (entry_date.year, entry_date.month) != (today.year, today.month):
@@ -925,7 +929,7 @@ class AdministracionService:
 
         reversal = IncomeEntry(
             filial_id=original.filial_id,
-            entry_date=date.today(),
+            entry_date=venezuela_today(),
             source=IncomeSource.MANUAL,
             concept=original.concept,
             description=f"Reverso de: {original.description}",
@@ -996,7 +1000,7 @@ class AdministracionService:
 
         reversal = ExpenseEntry(
             filial_id=original.filial_id,
-            entry_date=date.today(),
+            entry_date=venezuela_today(),
             category=original.category,
             beneficiary=original.beneficiary,
             description=f"Reverso de: {original.description}",
@@ -1029,7 +1033,7 @@ class AdministracionService:
     async def get_dashboard(self, filial_id: uuid.UUID) -> FinanceDashboard:
         settings = await PostVentasService(self.db).get_labor_settings(filial_id)
         bcv_rate = float(settings.bcv_rate) if settings.bcv_rate else 0.0
-        today = date.today()
+        today = venezuela_today()
 
         income_result = await self.db.execute(select(IncomeEntry).where(IncomeEntry.filial_id == filial_id))
         incomes = list(income_result.scalars().all())
@@ -1112,7 +1116,7 @@ class AdministracionService:
         condition: "VehicleCondition",
         key: str,
         label: str,
-    ) -> tuple[ProfitabilityDepartmentRow, int, int]:
+    ) -> tuple[ProfitabilityDepartmentRow, int, int, list[ProfitabilityLineItem]]:
         result = await self.db.execute(
             select(VehicleSale, DealershipVehicle)
             .join(DealershipVehicle, DealershipVehicle.id == VehicleSale.vehicle_id)
@@ -1127,18 +1131,46 @@ class AdministracionService:
         net_sales = sum(float(sale.final_price) for sale, _ in pairs)
         direct_cost = sum(float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0 for _, vehicle in pairs)
         estimated_count = sum(1 for _, vehicle in pairs if vehicle.cost_is_estimated)
-        return _profitability_department_row(key, label, net_sales, direct_cost), len(pairs), estimated_count
+
+        negative_lines = []
+        for sale, vehicle in pairs:
+            cost = float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0
+            margin = float(sale.final_price) - cost
+            if margin < 0:
+                negative_lines.append(
+                    ProfitabilityLineItem(
+                        department_key=key,
+                        document_type="vehicle_sale",
+                        document_id=sale.id,
+                        document_code=sale.code,
+                        description=f"{vehicle.brand} {vehicle.model} {vehicle.year} · {sale.client_name}",
+                        date=sale.created_at.date(),
+                        net_sales=float(sale.final_price),
+                        direct_cost=cost,
+                        margin=margin,
+                        note=sale.below_cost_override_note,
+                        authorized_by_user_id=sale.authorized_by_user_id,
+                        authorized_at=sale.authorized_at,
+                    )
+                )
+
+        return (
+            _profitability_department_row(key, label, net_sales, direct_cost),
+            len(pairs),
+            estimated_count,
+            negative_lines,
+        )
 
     async def _parts_department(
         self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
-    ) -> ProfitabilityDepartmentRow:
+    ) -> tuple[ProfitabilityDepartmentRow, list[ProfitabilityLineItem]]:
         # Mostrador only (parts consumed by a service order are folded into
         # "Taller · mano de obra" instead, matching the shop's actual
         # one-document-per-order billing). Cancelled sales are excluded from
         # both sides — the existing cost calc didn't exclude them either,
         # a real (low-risk) fix bundled in here.
         result = await self.db.execute(
-            select(PartSaleLine)
+            select(PartSaleLine, PartSale)
             .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
             .where(
                 PartSale.filial_id.in_(filial_ids),
@@ -1147,24 +1179,42 @@ class AdministracionService:
                 PartSale.status != PartSaleStatus.CANCELADO,
             )
         )
-        lines = list(result.scalars().all())
+        pairs = result.all()
         almacen = AlmacenService(self.db)
-        net_sales = sum(float(line.line_total) for line in lines)
+        net_sales = sum(float(line.line_total) for line, _ in pairs)
         direct_cost = 0.0
-        for line in lines:
+        negative_lines = []
+        for line, sale in pairs:
             cost = float(line.unit_cost) if line.unit_cost is not None else (await almacen.get_average_cost(line.part_id) or 0.0)
-            direct_cost += line.quantity * cost
-        return _profitability_department_row("repuestos", "Repuestos", net_sales, direct_cost)
+            line_cost = line.quantity * cost
+            direct_cost += line_cost
+            margin = float(line.line_total) - line_cost
+            if margin < 0:
+                part = await self.db.get(Part, line.part_id)
+                negative_lines.append(
+                    ProfitabilityLineItem(
+                        department_key="repuestos",
+                        document_type="part_sale",
+                        document_id=sale.id,
+                        document_code=sale.code,
+                        description=part.name if part else "Repuesto",
+                        date=sale.created_at.date(),
+                        net_sales=float(line.line_total),
+                        direct_cost=line_cost,
+                        margin=margin,
+                    )
+                )
+        return _profitability_department_row("repuestos", "Repuestos", net_sales, direct_cost), negative_lines
 
     async def _taller_department(
         self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
-    ) -> ProfitabilityDepartmentRow:
+    ) -> tuple[ProfitabilityDepartmentRow, list[ProfitabilityLineItem]]:
         # Revenue = the full invoiced total at issuance — accrual, not cash
         # collected — so a pending receivable still counts in the period it
         # was actually billed in. ServiceOrderInvoice has no filial_id of its
         # own; join through ServiceOrder for it.
         result = await self.db.execute(
-            select(ServiceOrderInvoice)
+            select(ServiceOrderInvoice, ServiceOrder)
             .join(ServiceOrder, ServiceOrder.id == ServiceOrderInvoice.service_order_id)
             .where(
                 ServiceOrder.filial_id.in_(filial_ids),
@@ -1172,22 +1222,27 @@ class AdministracionService:
                 ServiceOrderInvoice.issued_at <= date_to,
             )
         )
-        invoices = list(result.scalars().all())
-        net_sales = sum(float(invoice.total_usd) for invoice in invoices)
+        pairs = result.all()
+        net_sales = sum(float(invoice.total_usd) for invoice, _ in pairs)
 
-        direct_cost = 0.0
-        if invoices:
-            order_ids = [invoice.service_order_id for invoice in invoices]
+        # Cost is bucketed per order — includes every dispatched line
+        # regardless of payer, since a comeback/warranty-covered part still
+        # costs the shop even though it isn't billed to the client. That's
+        # exactly what can make a single order's own margin negative even
+        # though the department total nets out positive.
+        cost_by_order: dict[uuid.UUID, float] = {}
+        if pairs:
+            order_ids = [order.id for _, order in pairs]
             lines_result = await self.db.execute(
-                select(ServiceOrderTransferLine)
+                select(ServiceOrderTransferLine, ServiceOrderTransfer.service_order_id)
                 .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
                 .where(
                     ServiceOrderTransfer.service_order_id.in_(order_ids),
                     ServiceOrderTransfer.status == TransferStatus.PEDIDO,
                 )
             )
-            lines = list(lines_result.scalars().all())
-            line_ids = [line.id for line in lines]
+            transfer_lines = lines_result.all()
+            line_ids = [line.id for line, _ in transfer_lines]
             allocation_cost_by_line: dict[uuid.UUID, float] = {}
             if line_ids:
                 allocation_result = await self.db.execute(
@@ -1199,14 +1254,39 @@ class AdministracionService:
                     allocation_cost_by_line[allocation.transfer_line_id] = allocation_cost_by_line.get(
                         allocation.transfer_line_id, 0.0
                     ) + allocation.quantity * float(allocation.unit_cost)
-            for line in lines:
+            for line, service_order_id in transfer_lines:
                 line_cost = allocation_cost_by_line.get(line.id, 0.0)
                 # Dispatched before F0-01 (or otherwise never allocated to a
                 # lot) — the line's own recorded cost is the best real number
                 # available; never guess a quantity that isn't there.
-                direct_cost += line_cost if line_cost > 0 else float(line.cost_total)
+                line_cost = line_cost if line_cost > 0 else float(line.cost_total)
+                cost_by_order[service_order_id] = cost_by_order.get(service_order_id, 0.0) + line_cost
 
-        return _profitability_department_row("taller_mano_obra", "Taller · mano de obra", net_sales, direct_cost)
+        direct_cost = sum(cost_by_order.values())
+
+        negative_lines = []
+        for invoice, order in pairs:
+            cost = cost_by_order.get(order.id, 0.0)
+            margin = float(invoice.total_usd) - cost
+            if margin < 0:
+                negative_lines.append(
+                    ProfitabilityLineItem(
+                        department_key="taller_mano_obra",
+                        document_type="service_order_invoice",
+                        document_id=order.id,
+                        document_code=order.code,
+                        description=f"Factura {invoice.code}",
+                        date=invoice.issued_at.date(),
+                        net_sales=float(invoice.total_usd),
+                        direct_cost=cost,
+                        margin=margin,
+                    )
+                )
+
+        return (
+            _profitability_department_row("taller_mano_obra", "Taller · mano de obra", net_sales, direct_cost),
+            negative_lines,
+        )
 
     async def _manual_income_department(
         self,
@@ -1270,6 +1350,55 @@ class AdministracionService:
         expense_diff = sum(_diff(e) for e in expense_result.scalars().all())
         return income_diff - expense_diff
 
+    async def list_receivables(self, filial_id: uuid.UUID) -> list["ReceivableRead"]:
+        """Cuentas por Cobrar — every document sold but not yet collected.
+        ODS invoices already track this precisely (billing.py's own
+        collect_invoice flow); a parts counter sale has no such flow at
+        all — this system only ever books its income when it reaches
+        COMPLETADO (PartsService.update_sale_status), so any non-cancelled
+        sale that hasn't gotten there yet is, by the system's own definition
+        of "collected," still outstanding. That's also what makes
+        CxC + ingresos reconcile exactly against Rentabilidad's net_sales
+        for repuestos, which counts every non-cancelled sale as revenue."""
+        from app.modules.service_orders.billing import BillingService
+        from app.modules.service_orders.billing_schemas import ReceivableRead
+
+        invoice_receivables = await BillingService(self.db).list_receivables(filial_id)
+
+        result = await self.db.execute(
+            select(PartSale)
+            .options(selectinload(PartSale.lines))
+            .where(
+                PartSale.filial_id == filial_id,
+                PartSale.status.not_in([PartSaleStatus.COMPLETADO, PartSaleStatus.CANCELADO]),
+            )
+        )
+        today = venezuela_today()
+        part_sale_receivables = []
+        for sale in result.scalars().all():
+            days_outstanding = (today - sale.created_at.date()).days
+            total = sale.total
+            part_sale_receivables.append(
+                ReceivableRead(
+                    document_type="part_sale",
+                    invoice_id=sale.id,
+                    code=sale.code,
+                    filial_id=sale.filial_id,
+                    billed_client_name=sale.client_name,
+                    total_usd=total,
+                    iva_retention_amount=0.0,
+                    islr_retention_amount=0.0,
+                    net_expected=total,
+                    amount_paid_at_issuance=0.0,
+                    pending_amount=total,
+                    issued_at=sale.created_at,
+                    days_outstanding=days_outstanding,
+                    aging_bucket=aging_bucket(days_outstanding),
+                )
+            )
+
+        return sorted(invoice_receivables + part_sale_receivables, key=lambda r: r.issued_at)
+
     async def _compute_profitability(
         self,
         filial_ids: list[uuid.UUID],
@@ -1278,17 +1407,17 @@ class AdministracionService:
         report_filial_id: uuid.UUID | None,
     ) -> ProfitabilityReport:
         bcv_rate, bcv_rate_date = await self._bcv_rate_as_of(date_to)
-        today = date.today()
+        today = venezuela_today()
         period_is_closed = (date_to.year, date_to.month) != (today.year, today.month)
 
-        nuevos_row, nuevos_count, nuevos_estimated = await self._vehicle_department(
+        nuevos_row, nuevos_count, nuevos_estimated, nuevos_negative = await self._vehicle_department(
             filial_ids, date_from, date_to, VehicleCondition.NUEVO, "vehiculos_nuevos", "Vehículos nuevos"
         )
-        usados_row, usados_count, usados_estimated = await self._vehicle_department(
+        usados_row, usados_count, usados_estimated, usados_negative = await self._vehicle_department(
             filial_ids, date_from, date_to, VehicleCondition.USADO, "vehiculos_usados", "Vehículos usados"
         )
-        repuestos_row = await self._parts_department(filial_ids, date_from, date_to)
-        taller_row = await self._taller_department(filial_ids, date_from, date_to)
+        repuestos_row, repuestos_negative = await self._parts_department(filial_ids, date_from, date_to)
+        taller_row, taller_negative = await self._taller_department(filial_ids, date_from, date_to)
         garantia_marca_row = await self._manual_income_department(
             filial_ids, date_from, date_to, IncomeConcept.GARANTIA_MARCA, bcv_rate,
             "garantia_marca", "Garantía · marca",
@@ -1297,6 +1426,10 @@ class AdministracionService:
             filial_ids, date_from, date_to, IncomeConcept.FI_INTERMEDIACION, bcv_rate,
             "fi_intermediacion", "F&I · intermediación",
         )
+
+        negative_margin_lines = [
+            *nuevos_negative, *usados_negative, *repuestos_negative, *taller_negative,
+        ]
 
         departments = [nuevos_row, usados_row, repuestos_row, taller_row, garantia_marca_row, fi_row]
         net_sales_total = sum(d.net_sales for d in departments)
@@ -1389,6 +1522,7 @@ class AdministracionService:
             adjustments=adjustments,
             net_profit=net_profit,
             net_margin=net_margin,
+            negative_margin_lines=negative_margin_lines,
             vehicles_sold_count=nuevos_count + usados_count,
             vehicles_with_estimated_cost_count=nuevos_estimated + usados_estimated,
             manual_movements_rate=manual_movements_rate,

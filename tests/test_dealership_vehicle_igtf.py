@@ -1,7 +1,12 @@
 """IGTF taxes the actual payment amount, which already includes IVA — it is
 not computed on the pre-tax base alone. DealershipVehicle.igtf_amount used
 to apply the 3% only to price_cash, understating IGTF relative to
-service_orders/billing.py's (correct) IVA-inclusive base."""
+service_orders/billing.py's (correct) IVA-inclusive base.
+
+igtf_amount is also only an ESTIMATE ("if paid entirely in USD") — it is
+never part of cash_total (the vehicle's list price), since the real IGTF
+charged depends on how a sale is actually paid, computed at sale time by
+ConcesionarioService.update_vehicle (see test_vehicle_sale_igtf.py)."""
 
 import uuid
 
@@ -26,10 +31,10 @@ def test_igtf_is_computed_on_the_iva_inclusive_base():
     assert vehicle.igtf_amount == 348.0
 
 
-def test_cash_total_includes_the_corrected_igtf():
+def test_cash_total_excludes_igtf():
     vehicle = _vehicle(price_cash=10_000, iva_percentage=16, igtf_percentage=3, luxury_tax_percentage=0)
 
-    assert vehicle.cash_total == 10_000 + 1_600.0 + 348.0
+    assert vehicle.cash_total == 10_000 + 1_600.0
 
 
 def test_igtf_is_zero_when_not_paid_in_usd():

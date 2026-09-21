@@ -157,12 +157,36 @@ async def test_quote_and_persist_fifo(inventory, quantity, total, cost):
 @pytest.mark.asyncio
 async def test_insufficient_stock_is_atomic_and_warehouse_scoped(inventory):
     service, session, data, lots, _ = inventory
+    part_id = data["lines"][0]["part_id"]
     data["lines"][0]["quantity"] = 31
-    with pytest.raises(InsufficientStockError):
+    with pytest.raises(InsufficientStockError) as excinfo:
         await service.create_sale(PartSaleCreate(**data))
     assert [lot.quantity_remaining for lot in lots] == [10, 10, 10]
     assert session.scalar(select(func.count()).select_from(PartSale)) == 0
     assert session.scalar(select(func.count()).select_from(PartSaleLine)) == 0
+    assert excinfo.value.details == [{"field": str(part_id), "message": excinfo.value.message}]
+    assert "Repuesto" in excinfo.value.message
+
+
+@pytest.mark.asyncio
+async def test_sale_and_cancellation_stamp_the_responsible_user_on_stock_movements(inventory):
+    service, session, data, _lots, _ = inventory
+    seller_id = uuid.uuid4()
+    canceller_id = uuid.uuid4()
+    data["lines"][0]["quantity"] = 5
+    sale = await service.create_sale(PartSaleCreate(**data), seller_id)
+
+    sale_movement = session.scalar(select(StockMovement).where(StockMovement.reference == sale.code))
+    assert sale_movement.responsible_user_id == seller_id
+
+    await service.update_sale_status(sale.id, PartSaleStatus.CANCELADO, responsible_user_id=canceller_id)
+    session.expire_all()
+    restock_movement = session.scalar(
+        select(StockMovement)
+        .where(StockMovement.reference == sale.code, StockMovement.movement_type == "entrada")
+        .order_by(StockMovement.created_at.desc())
+    )
+    assert restock_movement.responsible_user_id == canceller_id
 
 
 @pytest.mark.asyncio
@@ -211,6 +235,8 @@ async def test_fractional_unit_price_does_not_round_total_early(inventory):
 
 @pytest.mark.asyncio
 async def test_http_quote_and_create_contract(inventory, monkeypatch):
+    from types import SimpleNamespace
+
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
 
@@ -223,7 +249,7 @@ async def test_http_quote_and_create_contract(inventory, monkeypatch):
     app.include_router(routes.router, prefix="/api/v1")
     register_exception_handlers(app)
     app.dependency_overrides[routes.get_service] = lambda: service
-    app.dependency_overrides[get_current_user] = lambda: object()
+    app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(user_id=uuid.uuid4())
 
     async def allowed(*args, **kwargs):
         pass
@@ -245,6 +271,14 @@ async def test_http_quote_and_create_contract(inventory, monkeypatch):
         del body["warehouse_id"]
         missing = await client.post("/api/v1/part-sales", json=body)
         assert missing.status_code == 422
+
+        body["warehouse_id"] = str(data["warehouse_id"])
+        body["lines"][0]["quantity"] = 999
+        oversold = await client.post("/api/v1/part-sales/quote", json=body)
+        assert oversold.status_code == 400
+        error = oversold.json()
+        assert error["errorCode"] == "insufficient_stock"
+        assert error["details"] == [{"field": str(data["lines"][0]["part_id"]), "message": error["message"]}]
 
 
 @pytest.mark.asyncio

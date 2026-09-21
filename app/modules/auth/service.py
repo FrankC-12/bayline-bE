@@ -41,6 +41,7 @@ class AuthService:
         claims = {
             "sub": str(user.id),
             "email": user.email,
+            "full_name": user.full_name,
             "role_id": str(role.id),
             "role_slug": role.slug,
             "scope": role.scope.value,

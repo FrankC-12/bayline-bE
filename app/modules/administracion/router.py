@@ -150,7 +150,8 @@ async def update_purchase_request_status(
     existing = await service.get_request(request_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_request_status(
-        request_id, payload.status, payload.quotes, payload.warehouse_id, payload.location
+        request_id, payload.status, payload.quotes, payload.warehouse_id, payload.location,
+        current_user.user_id,
     )
 
 

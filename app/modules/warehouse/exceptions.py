@@ -1,3 +1,5 @@
+import uuid
+
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 
 
@@ -39,11 +41,21 @@ class SameWarehouseError(BadRequestError):
 
 
 class InsufficientStockError(BadRequestError):
-    def __init__(self, available: int, requested: int) -> None:
-        super().__init__(
-            f"Solo hay {available} unidades disponibles en el almacén de origen, se pidieron {requested}.",
-            error_code="insufficient_stock",
-        )
+    def __init__(
+        self,
+        available: int,
+        requested: int,
+        *,
+        part_id: uuid.UUID | None = None,
+        part_name: str | None = None,
+    ) -> None:
+        label = f" de {part_name}" if part_name else ""
+        message = f"Solo hay {available} unidades disponibles{label} en el almacén de origen, se pidieron {requested}."
+        # Anchors the message to the specific line/part that ran short — a
+        # sale or transfer can have several lines, and without this the
+        # caller has no way to tell which one it was about.
+        details = [{"field": str(part_id), "message": message}] if part_id is not None else None
+        super().__init__(message, error_code="insufficient_stock", details=details)
 
 
 class InvalidTransferStatusTransitionError(BadRequestError):

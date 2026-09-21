@@ -37,3 +37,17 @@ class RoleRead(RoleBase):
     permissions: list[ModulePermissionSchema]
     created_at: datetime
     updated_at: datetime
+
+
+class RoleDirectoryEntry(BaseModel):
+    """The minimal shape a role-picker dropdown needs — id/name/slug/scope to
+    filter and label a user by role. Excludes `permissions`, the field that
+    makes RoleRead admin-only data, so this can stay open to any
+    authenticated user without exposing the authorization matrix."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    slug: str
+    scope: RoleScope

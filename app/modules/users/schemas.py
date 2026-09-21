@@ -39,3 +39,17 @@ class UserRead(BaseModel):
     permission_overrides: list[ModulePermissionSchema]
     created_at: datetime
     updated_at: datetime
+
+
+class UserDirectoryEntry(BaseModel):
+    """The minimal shape every "asignar técnico/asesor" picker across the app
+    actually needs — id, display name, and role for filtering. Deliberately
+    excludes email and permission_overrides, the two fields that make
+    UserRead admin-only data, so this can stay open to any authenticated
+    filial user without leaking who-can-do-what."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    full_name: str
+    role_id: uuid.UUID

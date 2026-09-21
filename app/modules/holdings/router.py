@@ -6,10 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.modules.administracion.schemas import ProfitabilityReport
-from app.modules.auth.dependencies import get_current_user, require_holding_user, require_platform_user
+from app.modules.auth.dependencies import require_holding_user, require_platform_user
 from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
-from app.modules.holdings.schemas import HoldingCreate, HoldingRead, HoldingUpdate
+from app.modules.holdings.schemas import (
+    HoldingCreate,
+    HoldingDashboardReport,
+    HoldingRead,
+    HoldingUpdate,
+)
 from app.modules.holdings.service import HoldingService
 from app.modules.service_orders.billing_schemas import HoldingWarrantyReceivablesReport
 
@@ -27,23 +32,25 @@ def get_holding_service(db: AsyncSession = Depends(get_db)) -> HoldingService:
 
 @router.get("", response_model=list[HoldingRead])
 async def list_holdings(
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_platform_user),
     service: HoldingService = Depends(get_holding_service),
 ) -> list[HoldingRead]:
-    """List holdings. Platform sees every holding; Holding/Filial callers see only their own."""
-    holdings = await service.list_holdings()
-    if current_user.holding_id is not None:
-        holdings = [h for h in holdings if h.id == current_user.holding_id]
-    return holdings
+    """List every holding. Platform-only, same as create/update/activate —
+    the only consumer is the platform-level Holdings screen; a holding or
+    filial caller has no legitimate reason to enumerate every tenant."""
+    return await service.list_holdings()
 
 
 @router.get("/{holding_id}", response_model=HoldingRead)
 async def get_holding(
     holding_id: uuid.UUID,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser = Depends(require_platform_user),
     service: HoldingService = Depends(get_holding_service),
 ) -> HoldingRead:
-    """Retrieve a single holding by its id."""
+    """Retrieve a single holding by its id. Platform-only — unlike the
+    holding-scoped sub-resources below (garantías, rentabilidad), nothing
+    in the app fetches a bare holding record by id for a holding-level
+    caller, so there's no self-service case to preserve here."""
     return await service.get_holding(holding_id)
 
 
@@ -86,6 +93,21 @@ async def deactivate_holding(
 ) -> HoldingRead:
     """Deactivate a holding without deleting its historical data. Platform-only."""
     return await service.set_active_status(holding_id, is_active=False)
+
+
+@router.get("/{holding_id}/dashboard", response_model=HoldingDashboardReport)
+async def get_holding_dashboard(
+    holding_id: uuid.UUID,
+    current_user: CurrentUser = Depends(require_holding_user),
+    db: AsyncSession = Depends(get_db),
+) -> HoldingDashboardReport:
+    """Per-filial KPI rollup (ODS, ODT, ventas, clientes, usuarios,
+    almacenes) for the holding's own summary dashboard. Only the owning
+    Holding may view it."""
+    from app.modules.holdings.dashboard import HoldingDashboardService
+
+    _ensure_owns_holding(current_user, holding_id)
+    return await HoldingDashboardService(db).get_dashboard(holding_id)
 
 
 @router.get("/{holding_id}/garantias-consolidado", response_model=HoldingWarrantyReceivablesReport)

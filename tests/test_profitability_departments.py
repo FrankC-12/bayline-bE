@@ -99,6 +99,32 @@ async def test_vehicles_split_by_condition_and_estimated_cost_count(env):
 
 
 @pytest.mark.asyncio
+async def test_a_below_cost_vehicle_sale_is_flagged_as_a_negative_margin_line(env):
+    admin, session, filial_id, _holding_id, _client = env
+    now = datetime(2026, 6, 15, tzinfo=timezone.utc)
+    make_vehicle_sale(session, filial_id, VehicleCondition.NUEVO, 20000, True, 25000, now)
+    below_cost_sale, below_cost_vehicle = make_vehicle_sale(
+        session, filial_id, VehicleCondition.USADO, 10000, False, 8000, now
+    )
+    below_cost_sale.below_cost_override = True
+    below_cost_sale.below_cost_override_note = "Autorizado para liquidar inventario."
+    session.commit()
+
+    report = await admin.get_profitability(filial_id, date(2026, 6, 1), date(2026, 6, 30))
+
+    negative_lines = [
+        line for line in report.negative_margin_lines if line.document_type == "vehicle_sale"
+    ]
+    assert len(negative_lines) == 1
+    line = negative_lines[0]
+    assert line.document_id == below_cost_sale.id
+    assert line.margin == -2000
+    assert line.note == "Autorizado para liquidar inventario."
+    # The clean, at-or-above-cost sale must never show up as negative.
+    assert all(l.document_id != below_cost_vehicle.id for l in report.negative_margin_lines)
+
+
+@pytest.mark.asyncio
 async def test_repuestos_excludes_cancelled_sales(env):
     admin, session, filial_id, _holding_id, _client = env
     part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro", price=10)

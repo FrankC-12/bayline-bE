@@ -299,7 +299,7 @@ async def create_part_sale(
     service: PartsService = Depends(get_service),
 ) -> PartSaleRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_sale(payload)
+    return await service.create_sale(payload, current_user.user_id)
 
 
 @router.patch("/part-sales/{sale_id}", response_model=PartSaleRead)
@@ -313,7 +313,9 @@ async def update_part_sale(
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     if payload.status is None:
         return existing
-    return await service.update_sale_status(sale_id, payload.status, payload.dispatched_lines)
+    return await service.update_sale_status(
+        sale_id, payload.status, payload.dispatched_lines, current_user.user_id
+    )
 
 
 @router.get("/part-returns", response_model=list[PartReturnRead])

@@ -18,7 +18,7 @@ class KpiReport(BaseModel):
 
 class MaintenanceDueRow(BaseModel):
     vehicle_id: uuid.UUID
-    plate: str
+    plate: str | None
     brand: str
     model: str
     client_id: uuid.UUID

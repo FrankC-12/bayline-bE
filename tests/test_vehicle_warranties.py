@@ -13,6 +13,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 from app.core.database import Base
 from app.core.exceptions import ConflictError
+from app.modules.auth.schemas import CurrentUser
 from app.modules.concesionario.enums import SaleType, VehicleCondition, VehicleStatus
 from app.modules.concesionario.models import DealershipVehicle
 from app.modules.concesionario.schemas import VehicleSaleInput, VehicleUpdate
@@ -24,6 +25,12 @@ from app.modules.post_ventas.schemas import (
     VehicleWarrantyCreate,
 )
 from app.modules.post_ventas.service import PostVentasService
+from app.modules.roles.enums import RoleScope
+
+_CALLER = CurrentUser(
+    user_id=uuid.uuid4(), email="vendedor@test.com", role_id=uuid.uuid4(), role_slug="vendedor",
+    scope=RoleScope.FILIAL, holding_id=None, filial_id=uuid.uuid4(),
+)
 
 
 @pytest.fixture
@@ -197,8 +204,9 @@ async def test_marking_a_dealership_vehicle_sold_auto_creates_the_warranty(env):
         dealership_vehicle.id,
         VehicleUpdate(
             status=VehicleStatus.VENDIDO,
-            sale=VehicleSaleInput(client_name="Juan Pérez", sale_type=SaleType.CONTADO, final_price=25000),
+            sale=VehicleSaleInput(client_name="Juan Pérez", sale_type=SaleType.CONTADO, payment_method="usd"),
         ),
+        _CALLER,
     )
 
     warranty = session.query(VehicleWarranty).filter_by(filial_id=filial_id, vin=VIN).one()

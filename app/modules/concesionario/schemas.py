@@ -1,7 +1,8 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.modules.concesionario.enums import (
     FuelType,
@@ -41,7 +42,34 @@ class VehicleSaleInput(BaseModel):
     client_document: str | None = None
     advisor_user_id: uuid.UUID | None = None
     sale_type: SaleType
-    final_price: float = Field(ge=0)
+    # Only meaningful for sale_type=contado — how the payment splits between
+    # foreign currency and bolívares, since IGTF only taxes the USD portion.
+    # The server computes igtf_amount/final_price from this; a client-sent
+    # total is never trusted, the same way service_orders/billing.py freezes
+    # its own quote server-side rather than accepting a submitted amount.
+    payment_method: Literal["usd", "bs", "mixed"] | None = None
+    usd_base: float | None = Field(default=None, ge=0)
+    # Only meaningful when the computed final_price comes out below the
+    # vehicle's cost_price — the caller must explicitly opt in and justify
+    # it; the server itself decides whether the sale actually is below cost.
+    below_cost_override: bool = False
+    below_cost_override_note: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _check_payment_method_for_contado(self) -> "VehicleSaleInput":
+        if self.sale_type == SaleType.CONTADO and self.payment_method is None:
+            raise ValueError("Indica cómo se cobra (divisas, bolívares o mixto) para una venta de contado.")
+        return self
+
+
+class VehicleReservationInput(BaseModel):
+    client_id: uuid.UUID
+    # The vendedor the reservation — and the unit — is locked to, distinct
+    # from whoever is submitting the request (e.g. an admin reserving on a
+    # vendedor's behalf).
+    advisor_user_id: uuid.UUID
+    deposit_amount: float = Field(gt=0)
+    expires_at: date
 
 
 class VehicleUpdate(BaseModel):
@@ -99,6 +127,11 @@ class VehicleRead(BaseModel):
     financing_provider: str | None
     financing_external_id: str | None
     images: list[str]
+    reserved_client_id: uuid.UUID | None
+    reserved_by_user_id: uuid.UUID | None
+    deposit_amount: float | None
+    reservation_expires_at: date | None
+    reserved_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -113,5 +146,13 @@ class VehicleSaleRead(BaseModel):
     client_document: str | None
     advisor_user_id: uuid.UUID | None
     sale_type: SaleType
+    payment_method: str | None
+    usd_base: float | None
+    igtf_amount: float
+    bcv_rate: float | None
     final_price: float
+    below_cost_override: bool
+    below_cost_override_note: str | None
+    authorized_by_user_id: uuid.UUID | None
+    authorized_at: datetime | None
     created_at: datetime

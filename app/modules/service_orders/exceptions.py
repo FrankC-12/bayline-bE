@@ -46,6 +46,14 @@ class ServiceOrderReadOnlyError(ConflictError):
         )
 
 
+class ServiceOrderNotCancelledError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Solo se puede reabrir una orden cancelada.",
+            error_code="service_order_not_cancelled",
+        )
+
+
 class InvoiceNotFoundError(NotFoundError):
     def __init__(self, invoice_id: str) -> None:
         super().__init__(f"Invoice '{invoice_id}' was not found.", error_code="invoice_not_found")

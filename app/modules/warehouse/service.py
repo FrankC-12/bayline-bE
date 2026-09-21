@@ -765,7 +765,7 @@ class AlmacenService:
                     code=transfer.code,
                     service_order_id=order.id,
                     service_order_code=order.code,
-                    vehicle_label=f"{vehicle.brand} {vehicle.model} · {vehicle.plate}",
+                    vehicle_label=f"{vehicle.brand} {vehicle.model} · {vehicle.plate or 'Sin placa'}",
                     fulfilled_at=transfer.fulfilled_at,
                     warehouse_seen=transfer.warehouse_seen,
                     lines=lines,

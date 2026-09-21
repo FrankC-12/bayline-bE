@@ -25,3 +25,42 @@ class HoldingRead(HoldingBase):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class OdsSummary(BaseModel):
+    total: int
+    pendiente: int
+    en_progreso: int
+    completado: int
+    orden_cerrada: int
+    cancelado: int
+
+
+class OdtSummary(BaseModel):
+    total: int
+    pendiente: int
+    pedido: int
+
+
+class SalesSummary(BaseModel):
+    count: int
+    total_usd: float
+
+
+class FilialDashboardRow(BaseModel):
+    filial_id: uuid.UUID
+    filial_name: str
+    ods: OdsSummary
+    odt: OdtSummary
+    ventas_repuestos: SalesSummary
+    ventas_vehiculos: SalesSummary
+    clientes: int
+    usuarios_total: int
+    usuarios_activos: int
+    almacenes_total: int
+    almacenes_activos: int
+
+
+class HoldingDashboardReport(BaseModel):
+    holding_id: uuid.UUID
+    filiales: list[FilialDashboardRow]

@@ -9,6 +9,7 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.concesionario.schemas import (
     VehicleCreate,
     VehicleRead,
+    VehicleReservationInput,
     VehicleSaleRead,
     VehicleUpdate,
 )
@@ -64,7 +65,19 @@ async def update_vehicle(
 ) -> VehicleRead:
     existing = await service.get_vehicle(vehicle_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.update_vehicle(vehicle_id, payload)
+    return await service.update_vehicle(vehicle_id, payload, current_user)
+
+
+@router.post("/dealership-vehicles/{vehicle_id}/reserve", response_model=VehicleRead)
+async def reserve_vehicle(
+    vehicle_id: uuid.UUID,
+    payload: VehicleReservationInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+) -> VehicleRead:
+    existing = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.reserve_vehicle(vehicle_id, payload, current_user)
 
 
 @router.delete("/dealership-vehicles/{vehicle_id}", status_code=status.HTTP_204_NO_CONTENT)

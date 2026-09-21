@@ -38,13 +38,13 @@ async def prepare(ready):
     session.commit()
 
 
-def make_holding_client(session, filial_id, is_holding_billing=True):
+def make_holding_client(session, filial_id, is_holding_billing=True, document_number="123456789"):
     client = Client(
         filial_id=filial_id,
-        full_name="Grupo Holding C.A.",
+        full_name="Grupo Holding C.A." if is_holding_billing else "Cliente Regular C.A.",
         client_type=ClientType.EMPRESA,
         document_type=DocumentType.J,
-        document_number="123456789",
+        document_number=document_number,
         phone_primary="02121234567",
         address="Caracas",
         is_holding_billing=is_holding_billing,
@@ -197,7 +197,9 @@ async def test_holding_consolidated_report_sums_only_holding_billed_invoices(rea
     holding_id = uuid.uuid4()
     session.get(Filial, order.filial_id).holding_id = holding_id
     holding_client = make_holding_client(session, order.filial_id)
-    regular_client = make_holding_client(session, order.filial_id, is_holding_billing=False)
+    regular_client = make_holding_client(
+        session, order.filial_id, is_holding_billing=False, document_number="987654321"
+    )
 
     # One invoice billed to the holding, unpaid at issuance (pending).
     payload = await invoice_payload(billing, order, accounts)

@@ -4,11 +4,19 @@ class DomainError(Exception):
     status_code: int = 500
     error_code: str = "internal_error"
 
-    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, error_code: str | None = None, details: list[dict] | None = None
+    ) -> None:
         super().__init__(message)
         self.message = message
         if error_code:
             self.error_code = error_code
+        # Same {"field": ..., "message": ...} shape the frontend's ApiError
+        # already parses out of a 422's validation details — reused here so
+        # a business error that's really "about" one specific line/field
+        # (e.g. InsufficientStockError, anchored to a part_id) can be
+        # attributed the exact same way, with zero new frontend plumbing.
+        self.details = details
 
 
 class BadRequestError(DomainError):

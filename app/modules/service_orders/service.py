@@ -7,10 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
+from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
-from app.modules.parts.pricing import price_parts_cost
-from app.modules.parts.service import _sync_availability
+from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS, price_parts_cost
+from app.modules.parts.service import PartsService, _sync_availability
 from app.modules.post_ventas.models import LaborSettings, Tempario
 from app.modules.service_orders.enums import (
     ReworkFailureCategory,
@@ -28,6 +29,7 @@ from app.modules.service_orders.exceptions import (
     FailureCategoryRequiredError,
     InvalidStatusTransitionError,
     OrderNotInvoicedError,
+    ServiceOrderNotCancelledError,
     ServiceOrderNotFoundError,
     ServiceOrderRequiredForComebackError,
     TaskNotFoundError,
@@ -51,6 +53,8 @@ from app.modules.service_orders.models import (
     ServiceOrderTransferLine,
     ServiceOrderTransferLotAllocation,
     Upsell,
+    UpsellPart,
+    UpsellTask,
     WarrantyClaim,
 )
 from app.modules.service_orders.schemas import (
@@ -63,6 +67,10 @@ from app.modules.service_orders.schemas import (
     TransferLineRead,
     TransferRead,
     UpsellCreate,
+    UpsellDecisionInput,
+    UpsellPartRead,
+    UpsellRead,
+    UpsellTaskRead,
     WarrantyClaimAuthorizationInput,
     WarrantyClaimContext,
     WarrantyClaimConvertInput,
@@ -90,6 +98,21 @@ ACTIVE_STATUSES = [
 HISTORY_STATUSES = [ServiceOrderStatus.ORDEN_CERRADA, ServiceOrderStatus.CANCELADO]
 
 
+def _incomplete_completion_message(
+    pending_tasks: list["ServiceOrderTask"], pending_transfers: list["ServiceOrderTransfer"]
+) -> str:
+    parts = []
+    if pending_tasks:
+        names = ", ".join(t.name_snapshot for t in pending_tasks)
+        word = "tarea" if len(pending_tasks) == 1 else "tareas"
+        parts.append(f"{len(pending_tasks)} {word} sin terminar ({names})")
+    if pending_transfers:
+        codes = ", ".join(t.code for t in pending_transfers)
+        word = "ODT" if len(pending_transfers) == 1 else "ODTs"
+        parts.append(f"{len(pending_transfers)} {word} sin despachar ({codes})")
+    return "No se puede completar la orden — pendiente: " + " y ".join(parts) + "."
+
+
 class ServiceOrderService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -108,6 +131,19 @@ class ServiceOrderService:
         query = query.order_by(ServiceOrder.created_at.desc())
         result = await self.db.execute(query)
         return list(result.scalars().all())
+
+    async def count_transfers_by_status(self, filial_id: uuid.UUID) -> dict[TransferStatus, int]:
+        """ServiceOrderTransfer (an "ODT") has no filial_id of its own —
+        it's scoped to a filial only through the ServiceOrder it belongs
+        to, same join used by billing.py's _warranty_cost."""
+        result = await self.db.execute(
+            select(ServiceOrderTransfer.status, func.count())
+            .select_from(ServiceOrderTransfer)
+            .join(ServiceOrder, ServiceOrder.id == ServiceOrderTransfer.service_order_id)
+            .where(ServiceOrder.filial_id == filial_id)
+            .group_by(ServiceOrderTransfer.status)
+        )
+        return dict(result.all())
 
     async def get_order(self, order_id: uuid.UUID) -> ServiceOrder:
         order = await self.db.get(ServiceOrder, order_id)
@@ -160,12 +196,39 @@ class ServiceOrderService:
         await self.db.refresh(order)
         return order
 
-    async def update_order(self, order_id: uuid.UUID, payload: ServiceOrderUpdate) -> ServiceOrder:
+    async def update_order(
+        self,
+        order_id: uuid.UUID,
+        payload: ServiceOrderUpdate,
+        current_user: CurrentUser | None = None,
+    ) -> ServiceOrder:
         if payload.status == ServiceOrderStatus.ORDEN_CERRADA:
             if payload.model_fields_set != {"status"}:
                 raise BadRequestError("Cerrar la orden es una operación separada de la edición.")
             return await self.close_order(order_id)
+        if payload.status == ServiceOrderStatus.CANCELADO:
+            raise BadRequestError(
+                "Cancelar la orden requiere confirmar un motivo; usa la acción de cancelar."
+            )
         order = await require_editable_order(self.db, order_id)
+
+        becoming_completado = (
+            payload.status == ServiceOrderStatus.COMPLETADO and order.status != ServiceOrderStatus.COMPLETADO
+        )
+        if becoming_completado:
+            pending_tasks = [t for t in await self.list_tasks(order_id) if t.status != TaskStatus.COMPLETADA]
+            pending_transfers = [
+                t for t in await self.list_transfers(order_id) if t.status != TransferStatus.PEDIDO
+            ]
+            if pending_tasks or pending_transfers:
+                if not payload.confirm_incomplete_completion:
+                    raise BadRequestError(
+                        _incomplete_completion_message(pending_tasks, pending_transfers),
+                        error_code="order_incomplete",
+                    )
+                order.completed_with_pending_items = True
+                order.completed_override_by_user_id = current_user.user_id if current_user else None
+                order.completed_override_at = datetime.now(UTC)
 
         if payload.discount_label is not None and payload.discount_label != order.discount_label:
             order.discount_label = payload.discount_label
@@ -234,6 +297,43 @@ class ServiceOrderService:
                     vehicle.next_maintenance_due_at = next_maintenance_due_at
                 if next_maintenance_tempario_id is not None:
                     vehicle.next_maintenance_tempario_id = next_maintenance_tempario_id
+        await self.db.commit()
+        await self.db.refresh(order)
+        return order
+
+    async def cancel_order(
+        self, order_id: uuid.UUID, reason: str, cancelled_by_user_id: uuid.UUID
+    ) -> ServiceOrder:
+        order = await require_editable_order(self.db, order_id)
+        if ServiceOrderStatus.CANCELADO not in ALLOWED_TRANSITIONS.get(order.status, set()):
+            raise InvalidStatusTransitionError(order.status.value, ServiceOrderStatus.CANCELADO.value)
+        order.status = ServiceOrderStatus.CANCELADO
+        order.cancel_reason = reason
+        order.cancelled_by_user_id = cancelled_by_user_id
+        order.cancelled_at = datetime.now(UTC)
+        # A fresh cancellation starts a new cycle — clear any reopen trail
+        # from a previous cycle so it doesn't look stale next to it.
+        order.reopened_by_user_id = None
+        order.reopened_at = None
+        await self.db.commit()
+        await self.db.refresh(order)
+        return order
+
+    async def reopen_order(self, order_id: uuid.UUID, reopened_by_user_id: uuid.UUID) -> ServiceOrder:
+        result = await self.db.execute(
+            select(ServiceOrder)
+            .where(ServiceOrder.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        order = result.scalar_one_or_none()
+        if order is None:
+            raise ServiceOrderNotFoundError(str(order_id))
+        if order.status != ServiceOrderStatus.CANCELADO:
+            raise ServiceOrderNotCancelledError()
+        order.status = ServiceOrderStatus.PENDIENTE
+        order.reopened_by_user_id = reopened_by_user_id
+        order.reopened_at = datetime.now(UTC)
         await self.db.commit()
         await self.db.refresh(order)
         return order
@@ -469,7 +569,7 @@ class ServiceOrderService:
                     .scalars()
                     .all()
                 )
-                allocations = allocate_fifo(lots, line.quantity)
+                allocations = allocate_fifo(lots, line.quantity, part_id=part.id, part_name=part.name)
                 # Replace the add-time preview with the real, final
                 # consumption — inventory may have shifted since the line
                 # was added (another order could have taken the cheaper
@@ -495,6 +595,7 @@ class ServiceOrderService:
                             quantity=take,
                             unit_cost=lot.unit_cost,
                             reference=transfer.code,
+                            responsible_user_id=fulfilled_by_user_id,
                         )
                     )
                 part.stock_quantity = max(0, part.stock_quantity - line.quantity)
@@ -780,25 +881,78 @@ class ServiceOrderService:
 
     # Upsells
 
-    async def list_upsells(self, filial_id: uuid.UUID) -> list[Upsell]:
-        """All upsells across every order in the filial — this is a filial-wide
-        list, not scoped to a single ODS."""
-        result = await self.db.execute(
-            select(Upsell)
-            .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
-            .where(ServiceOrder.filial_id == filial_id)
-            .order_by(Upsell.created_at.desc())
-        )
-        return list(result.scalars().all())
-
-    async def get_upsell(self, upsell_id: uuid.UUID) -> Upsell:
+    async def _get_upsell_model(self, upsell_id: uuid.UUID) -> Upsell:
         upsell = await self.db.get(Upsell, upsell_id)
         if upsell is None:
             raise UpsellNotFoundError(str(upsell_id))
         return upsell
 
-    async def create_upsell(self, service_order_id: uuid.UUID, payload: UpsellCreate) -> Upsell:
-        await require_editable_order(self.db, service_order_id)
+    async def _hourly_rate(self, filial_id: uuid.UUID) -> float:
+        result = await self.db.execute(select(LaborSettings).where(LaborSettings.filial_id == filial_id))
+        settings = result.scalar_one_or_none()
+        return float(settings.hourly_rate) if settings else 25.0
+
+    def _upsell_to_read(self, upsell: Upsell, hourly_rate: float, discount_label: str) -> UpsellRead:
+        multiplier = float(PARTS_MULTIPLIERS[discount_label])
+        labor_cost = sum(float(t.hours_snapshot) for t in upsell.tasks) * hourly_rate
+        parts = [
+            UpsellPartRead(
+                id=p.id,
+                part_id=p.part_id,
+                name_snapshot=p.name_snapshot,
+                quantity=p.quantity,
+                unit_cost_snapshot=float(p.unit_cost_snapshot),
+                line_total=p.quantity * float(p.unit_cost_snapshot) * multiplier,
+            )
+            for p in upsell.parts
+        ]
+        return UpsellRead(
+            id=upsell.id,
+            service_order_id=upsell.service_order_id,
+            title=upsell.title,
+            description=upsell.description,
+            detected_by_user_id=upsell.detected_by_user_id,
+            evidence_count=upsell.evidence_count,
+            status=upsell.status,
+            tasks=[
+                UpsellTaskRead(
+                    id=t.id,
+                    tempario_id=t.tempario_id,
+                    code_snapshot=t.code_snapshot,
+                    name_snapshot=t.name_snapshot,
+                    hours_snapshot=float(t.hours_snapshot),
+                )
+                for t in upsell.tasks
+            ],
+            parts=parts,
+            amount=labor_cost + sum(p.line_total for p in parts),
+            approved_by_user_id=upsell.approved_by_user_id,
+            approval_channel=upsell.approval_channel,
+            created_at=upsell.created_at,
+            resolved_at=upsell.resolved_at,
+        )
+
+    async def list_upsells(self, filial_id: uuid.UUID) -> list[UpsellRead]:
+        """All upsells across every order in the filial — this is a filial-wide
+        list, not scoped to a single ODS."""
+        result = await self.db.execute(
+            select(Upsell, ServiceOrder.discount_label)
+            .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
+            .where(ServiceOrder.filial_id == filial_id)
+            .order_by(Upsell.created_at.desc())
+        )
+        rows = result.all()
+        hourly_rate = await self._hourly_rate(filial_id)
+        return [self._upsell_to_read(upsell, hourly_rate, discount_label) for upsell, discount_label in rows]
+
+    async def get_upsell(self, upsell_id: uuid.UUID) -> UpsellRead:
+        upsell = await self._get_upsell_model(upsell_id)
+        order = await self.get_order(upsell.service_order_id)
+        hourly_rate = await self._hourly_rate(order.filial_id)
+        return self._upsell_to_read(upsell, hourly_rate, order.discount_label)
+
+    async def create_upsell(self, service_order_id: uuid.UUID, payload: UpsellCreate) -> UpsellRead:
+        order = await require_editable_order(self.db, service_order_id)
         upsell = Upsell(
             service_order_id=service_order_id,
             title=payload.title,
@@ -807,21 +961,67 @@ class ServiceOrderService:
             detected_by_user_id=payload.detected_by_user_id,
         )
         self.db.add(upsell)
-        await self.db.commit()
-        await self.db.refresh(upsell)
-        return upsell
+        await self.db.flush()
 
-    async def update_upsell_status(self, upsell_id: uuid.UUID, status: UpsellStatus) -> Upsell:
-        upsell = await self.get_upsell(upsell_id)
-        await require_editable_order(self.db, upsell.service_order_id)
-        upsell.status = status
-        if status != UpsellStatus.PENDIENTE:
-            upsell.resolved_at = datetime.now(UTC)
-        else:
-            upsell.resolved_at = None
+        parts_service = PartsService(self.db)
+        for task_input in payload.tasks:
+            tempario = await self.db.get(Tempario, task_input.tempario_id)
+            if tempario is None or tempario.filial_id != order.filial_id:
+                raise TaskNotFoundError(str(task_input.tempario_id))
+            self.db.add(
+                UpsellTask(
+                    upsell_id=upsell.id,
+                    tempario_id=tempario.id,
+                    code_snapshot=tempario.code,
+                    name_snapshot=tempario.name,
+                    hours_snapshot=tempario.estimated_hours,
+                )
+            )
+        for part_input in payload.parts:
+            part = await self.db.get(Part, part_input.part_id)
+            if part is None or part.filial_id != order.filial_id:
+                raise TransferNotFoundError(str(part_input.part_id))
+            cost = await parts_service.get_latest_cost(part.id)
+            self.db.add(
+                UpsellPart(
+                    upsell_id=upsell.id,
+                    part_id=part.id,
+                    name_snapshot=part.name,
+                    quantity=part_input.quantity,
+                    unit_cost_snapshot=cost or 0.0,
+                )
+            )
+
         await self.db.commit()
         await self.db.refresh(upsell)
-        return upsell
+        return await self.get_upsell(upsell.id)
+
+    async def decide_upsell(
+        self, upsell_id: uuid.UUID, payload: UpsellDecisionInput, decided_by_user_id: uuid.UUID | None
+    ) -> UpsellRead:
+        upsell = await self._get_upsell_model(upsell_id)
+        await require_editable_order(self.db, upsell.service_order_id)
+        status = UpsellStatus(payload.status)
+
+        if status == UpsellStatus.APROBADO:
+            # Approving doesn't replay the upsell's own preview snapshots —
+            # it adds the same tasks/parts fresh, exactly as if an advisor
+            # had added them by hand right now, so they price off today's
+            # tempario/labor rate/FIFO cost, not whatever they were when
+            # the upsell was first proposed.
+            for task in upsell.tasks:
+                await self.add_task(upsell.service_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE)
+            for part in upsell.parts:
+                await self.add_transfer_line(
+                    upsell.service_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE
+                )
+            upsell.approved_by_user_id = decided_by_user_id
+            upsell.approval_channel = payload.approval_channel
+
+        upsell.status = status
+        upsell.resolved_at = datetime.now(UTC)
+        await self.db.commit()
+        return await self.get_upsell(upsell.id)
 
     # Warranty claims (unified "reclamo de garantía") — covers all four
     # responsible-party cases: factory/importer, a shop-assumed comeback, a

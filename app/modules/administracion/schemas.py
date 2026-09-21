@@ -1,5 +1,6 @@
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -464,6 +465,26 @@ class ProfitabilityAdjustmentRow(BaseModel):
     amount: float  # signed — already the effect on net profit
 
 
+class ProfitabilityLineItem(BaseModel):
+    """A single document whose margin came out negative — surfaced so it can
+    be opened and investigated, instead of only diluting a department's
+    aggregate total."""
+
+    department_key: str
+    document_type: Literal["vehicle_sale", "part_sale", "service_order_invoice"]
+    document_id: uuid.UUID
+    document_code: str
+    description: str
+    date: date
+    net_sales: float
+    direct_cost: float
+    margin: float
+    # Only set for a vehicle_sale sold below cost with an authorized override.
+    note: str | None = None
+    authorized_by_user_id: uuid.UUID | None = None
+    authorized_at: datetime | None = None
+
+
 class ProfitabilityReport(BaseModel):
     period_label: str
     filial_id: uuid.UUID | None  # null = consolidated across the holding
@@ -480,6 +501,7 @@ class ProfitabilityReport(BaseModel):
     adjustments: list[ProfitabilityAdjustmentRow]
     net_profit: float
     net_margin: float
+    negative_margin_lines: list[ProfitabilityLineItem] = []
     vehicles_sold_count: int
     vehicles_with_estimated_cost_count: int
     manual_movements_rate: float

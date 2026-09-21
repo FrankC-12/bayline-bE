@@ -38,6 +38,18 @@ class UpsellStatus(str, enum.Enum):
     RECHAZADO = "rechazado"
 
 
+class UpsellApprovalChannel(str, enum.Enum):
+    """How the client actually agreed to pay for the additional work —
+    distinct from Client.contact_preference (a durable profile setting),
+    this is a point-in-time record of this one approval."""
+
+    WHATSAPP = "whatsapp"
+    LLAMADA = "llamada"
+    CORREO = "correo"
+    SMS = "sms"
+    PRESENCIAL = "presencial"
+
+
 class ReworkFailureCategory(str, enum.Enum):
     MANO_DE_OBRA = "mano_de_obra"
     REPUESTO_DEFECTUOSO = "repuesto_defectuoso"

@@ -1,13 +1,18 @@
 import calendar
+import re
+import unicodedata
 import uuid
 from datetime import date, datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
-from app.modules.clients.enums import MaintenancePlanEntryStatus
+from app.modules.administracion.exceptions import SupplierNotFoundError
+from app.modules.administracion.models import Supplier
+from app.modules.clients.enums import ClientType, DocumentType, MaintenancePlanEntryStatus
 from app.modules.clients.exceptions import (
     ClientNotFoundError,
     DocumentAlreadyExistsError,
@@ -15,6 +20,7 @@ from app.modules.clients.exceptions import (
 )
 from app.modules.clients.models import Client, Vehicle
 from app.modules.clients.schemas import (
+    DOCUMENT_REGEX,
     ClientCreate,
     ClientUpdate,
     VehicleInput,
@@ -23,6 +29,30 @@ from app.modules.clients.schemas import (
     VehiclePlanStatusRead,
 )
 from app.modules.inspections.models import PreliminaryInspection
+
+_RIF_PREFIX_TO_DOCUMENT_TYPE = {t.value: t for t in DocumentType}
+
+
+def _document_from_rif(rif: str) -> tuple[DocumentType, str]:
+    """A Supplier's RIF ("J-12345678-9") isn't split into type+number the
+    way a Client's document is — derive the same shape from it so a
+    supplier-backed billing client can satisfy Client's document columns."""
+    prefix = rif.strip()[:1].upper()
+    document_type = _RIF_PREFIX_TO_DOCUMENT_TYPE.get(prefix, DocumentType.J)
+    digits = re.sub(r"\D", "", rif)
+    if not DOCUMENT_REGEX.match(digits):
+        raise BadRequestError(
+            f"El RIF del proveedor ('{rif}') no tiene un formato válido para facturar a su nombre. "
+            "Corrígelo en Administración antes de facturar a este proveedor."
+        )
+    return document_type, digits
+
+
+def _fold(value: str) -> str:
+    """Lowercase and strip accents/diacritics, so search matches regardless
+    of how the user types them (e.g. "jose"/"JOSÉ" both match "José")."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
 
 
 def _add_months(base: date, months: int) -> date:
@@ -50,11 +80,11 @@ class ClientService:
         clients = list(result.scalars().all())
 
         if search:
-            term = search.lower()
+            term = _fold(search)
             clients = [
                 c
                 for c in clients
-                if term in c.full_name.lower()
+                if term in _fold(c.full_name)
                 or term in c.document_number.lower()
                 or any(
                     term in (v.plate or "").lower() or term in (v.vin or "").lower()
@@ -237,6 +267,51 @@ class ClientService:
             for i in inspections
         ]
 
+    async def get_or_create_supplier_billing_client(self, filial_id: uuid.UUID, supplier_id: uuid.UUID) -> Client:
+        """Resolves the Client that stands in for a Supplier when an ODS is
+        billed to it (e.g. the manufacturer or a parts supplier covering a
+        warranty claim) — same idea as is_holding_billing, generalized to
+        any Supplier instead of one manually-flagged client per filial.
+        Creates the linked client on first use, reuses it after that."""
+        supplier = await self.db.get(Supplier, supplier_id)
+        if supplier is None or supplier.filial_id != filial_id:
+            raise SupplierNotFoundError(str(supplier_id))
+
+        existing = await self.db.execute(
+            select(Client).where(Client.linked_supplier_id == supplier.id)
+        )
+        client = existing.scalar_one_or_none()
+        if client is not None:
+            return client
+
+        document_type, document_number = _document_from_rif(supplier.rif)
+        client = Client(
+            filial_id=filial_id,
+            full_name=supplier.trade_name or supplier.business_name,
+            client_type=ClientType.EMPRESA,
+            document_type=document_type,
+            document_number=document_number,
+            phone_primary=supplier.phone or "00000000000",
+            address=supplier.address or "N/A",
+            linked_supplier_id=supplier.id,
+        )
+        try:
+            self.db.add(client)
+            await self.db.commit()
+        except IntegrityError:
+            # Another request created it first (concurrent double-click), or
+            # the supplier's RIF digits happen to collide with an existing
+            # client's document number — either way, use what's there.
+            await self.db.rollback()
+            existing = await self.db.execute(
+                select(Client).where(Client.linked_supplier_id == supplier.id)
+            )
+            client = existing.scalar_one_or_none()
+            if client is None:
+                raise DocumentAlreadyExistsError(document_number) from None
+        await self.db.refresh(client)
+        return client
+
     async def create_client(self, payload: ClientCreate) -> Client:
         await self._ensure_document_is_available(payload.filial_id, payload.document_number)
 
@@ -254,13 +329,20 @@ class ClientService:
             address_type=payload.address_type,
             is_holding_billing=payload.is_holding_billing,
         )
-        self.db.add(client)
-        await self.db.flush()
+        try:
+            self.db.add(client)
+            await self.db.flush()
 
-        for v in payload.vehicles:
-            self.db.add(self._build_vehicle(client.id, v))
+            for v in payload.vehicles:
+                self.db.add(self._build_vehicle(client.id, v))
 
-        await self.db.commit()
+            await self.db.commit()
+        except IntegrityError:
+            # The app-level check above is only a fast path — this is the
+            # real backstop against two concurrent creates (e.g. a
+            # double-click) racing past it with the same document.
+            await self.db.rollback()
+            raise DocumentAlreadyExistsError(payload.document_number) from None
         return await self.get_client(client.id)
 
     async def update_client(self, client_id: uuid.UUID, payload: ClientUpdate) -> Client:
@@ -289,7 +371,11 @@ class ClientService:
         if payload.vehicles is not None:
             await self._reconcile_vehicles(client, payload.vehicles)
 
-        await self.db.commit()
+        try:
+            await self.db.commit()
+        except IntegrityError:
+            await self.db.rollback()
+            raise DocumentAlreadyExistsError(client.document_number) from None
         return await self.get_client(client.id)
 
     async def delete_client(self, client_id: uuid.UUID) -> None:

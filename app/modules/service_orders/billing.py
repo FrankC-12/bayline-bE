@@ -5,12 +5,12 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
+from app.core.venezuela_time import aging_bucket, venezuela_today
 from app.modules.administracion.enums import AccountCurrency, IncomeSource, MovementSourceType
 from app.modules.administracion.models import Account, IncomeEntry
 from app.modules.clients.models import Client, Vehicle
@@ -45,7 +45,7 @@ from app.modules.service_orders.service import ServiceOrderService
 
 
 def billing_day():
-    return datetime.now(ZoneInfo("America/Caracas")).date()
+    return venezuela_today()
 
 
 def money(value):
@@ -131,9 +131,18 @@ class BillingService:
             accounts=[dict(id=str(a.id), name=a.name, currency=a.currency.value) for a in accounts],
         )
 
-    async def _resolve_billed_client(self, order, billed_client_id: uuid.UUID | None) -> Client | None:
-        """None means "bill the vehicle's own owner" — resolved later, once
-        the vehicle is loaded. Only validates an explicit override here."""
+    async def _resolve_billed_client(
+        self, order, billed_client_id: uuid.UUID | None, billed_supplier_id: uuid.UUID | None = None
+    ) -> Client | None:
+        """None/None means "bill the vehicle's own owner" — resolved later,
+        once the vehicle is loaded. billed_supplier_id bills a Supplier
+        instead, via its linked billing Client (created on first use)."""
+        if billed_supplier_id is not None:
+            from app.modules.clients.service import ClientService
+
+            return await ClientService(self.db).get_or_create_supplier_billing_client(
+                order.filial_id, billed_supplier_id
+            )
         if billed_client_id is None:
             return None
         client = await self.db.get(Client, billed_client_id)
@@ -145,7 +154,7 @@ class BillingService:
         order = await self.orders.get_order(order_id)
         if order.status != ServiceOrderStatus.COMPLETADO or order.invoiced_at is not None:
             raise ConflictError("La orden debe estar completada y sin facturar.")
-        await self._resolve_billed_client(order, payload.billed_client_id)
+        await self._resolve_billed_client(order, payload.billed_client_id, payload.billed_supplier_id)
         context = await self.context(order_id)
         summary = context["summary"]
         result = dict(
@@ -269,7 +278,7 @@ class BillingService:
             code = f"FAC-{order.code}"
             vehicle = await self.db.get(Vehicle, order.vehicle_id)
             filial = await self.db.get(Filial, order.filial_id)
-            client = await self._resolve_billed_client(order, payload.billed_client_id)
+            client = await self._resolve_billed_client(order, payload.billed_client_id, payload.billed_supplier_id)
             if client is None:
                 client = await self.db.get(Client, vehicle.client_id) if vehicle else None
             if vehicle is None or client is None or filial is None:
@@ -294,7 +303,7 @@ class BillingService:
                 client_name=client.full_name,
                 client_document=f"{client.document_type.value}-{client.document_number}",
                 client_address=client.address,
-                vehicle=f"{vehicle.brand} {vehicle.model} · {vehicle.plate}",
+                vehicle=f"{vehicle.brand} {vehicle.model} · {vehicle.plate or 'Sin placa'}",
                 parts={str(p.id): dict(name=p.name, code=p.code) for p in parts},
                 payments=payments,
                 payment_reference=payload.payment_reference,
@@ -444,7 +453,9 @@ class BillingService:
 
     def _receivable_to_read(self, invoice: ServiceOrderInvoice, order: ServiceOrder, client: Client) -> ReceivableRead:
         net_expected = self._net_expected(invoice)
+        days_outstanding = (venezuela_today() - invoice.issued_at.date()).days
         return ReceivableRead(
+            document_type="service_order_invoice",
             invoice_id=invoice.id,
             code=invoice.code,
             service_order_id=order.id,
@@ -459,6 +470,8 @@ class BillingService:
             amount_paid_at_issuance=float(invoice.amount_paid_at_issuance),
             pending_amount=net_expected - float(invoice.amount_paid_at_issuance),
             issued_at=invoice.issued_at,
+            days_outstanding=days_outstanding,
+            aging_bucket=aging_bucket(days_outstanding),
         )
 
     async def get_invoice_by_id(self, invoice_id: uuid.UUID) -> ServiceOrderInvoice:

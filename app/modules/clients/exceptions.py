@@ -5,14 +5,14 @@ class ClientNotFoundError(NotFoundError):
     """Raised when a client does not exist."""
 
     def __init__(self, client_id: str) -> None:
-        super().__init__(f"Client '{client_id}' was not found.", error_code="client_not_found")
+        super().__init__(f"El cliente '{client_id}' no fue encontrado.", error_code="client_not_found")
 
 
 class VehicleNotFoundError(NotFoundError):
     """Raised when a vehicle does not exist."""
 
     def __init__(self, vehicle_id: str) -> None:
-        super().__init__(f"Vehicle '{vehicle_id}' was not found.", error_code="vehicle_not_found")
+        super().__init__(f"El vehículo '{vehicle_id}' no fue encontrado.", error_code="vehicle_not_found")
 
 
 class DocumentAlreadyExistsError(ConflictError):
@@ -20,6 +20,6 @@ class DocumentAlreadyExistsError(ConflictError):
 
     def __init__(self, document: str) -> None:
         super().__init__(
-            f"A client with document '{document}' already exists in this filial.",
+            f"Ya existe un cliente registrado con la cédula/RIF '{document}' en esta filial.",
             error_code="document_already_exists",
         )

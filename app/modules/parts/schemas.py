@@ -102,6 +102,11 @@ class PartRead(BaseModel):
     is_active: bool
     stock_total: int = 0
     reference_price: float | None = None
+    # The real, unmarked-up cost from the latest received lot — distinct
+    # from reference_price (cost × margin, a sale price). Anything that
+    # needs to apply its own margin (e.g. a tempario) must start from this,
+    # not from reference_price, or the margin gets baked in twice.
+    latest_cost: float | None = None
     # Ubicación en almacén — jalada del lote recibido más recientemente que
     # registró una, nunca escrita a mano en el catálogo.
     location: str | None = None
@@ -152,6 +157,11 @@ class PartSaleQuoteLine(BaseModel):
 class PartSaleQuoteRead(BaseModel):
     lines: list[PartSaleQuoteLine]
     total: float
+    iva_percentage: float
+    iva_amount: float
+    igtf_percentage: float
+    igtf_amount: float
+    total_with_taxes: float
 
 
 class PartSaleQuoteInput(BaseModel):
@@ -219,6 +229,11 @@ class PartSaleRead(BaseModel):
     discount_label: str
     status: PartSaleStatus
     total: float
+    iva_percentage: float
+    iva_amount: float
+    igtf_percentage: float
+    igtf_amount: float
+    total_with_taxes: float
     lines: list[PartSaleLineRead]
     created_at: datetime
     updated_at: datetime
