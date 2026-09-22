@@ -95,11 +95,22 @@ class PartLotDetailRead(PartLotRead):
     outbound_movements: list[LotOutboundMovementRead]
 
 
+class ServiceOrderPartRequestLineWarehouse(BaseModel):
+    """How much of a line's quantity was actually pulled from one specific
+    warehouse — an ODT line isn't scoped to a single warehouse the way a
+    counter sale is, so a line can (rarely) split across more than one."""
+
+    warehouse_id: uuid.UUID
+    warehouse_name: str
+    quantity: int
+
+
 class ServiceOrderPartRequestLineRead(BaseModel):
     part_id: uuid.UUID
     part_code: str
     part_name: str
     quantity: int
+    warehouses: list[ServiceOrderPartRequestLineWarehouse]
 
 
 class ServiceOrderPartRequestRead(BaseModel):
@@ -113,9 +124,35 @@ class ServiceOrderPartRequestRead(BaseModel):
     service_order_id: uuid.UUID
     service_order_code: str
     vehicle_label: str
+    status: str
     fulfilled_at: datetime | None
+    completed_at: datetime | None
     warehouse_seen: bool
     lines: list[ServiceOrderPartRequestLineRead]
+
+
+class PartSaleRequestLineRead(BaseModel):
+    part_id: uuid.UUID
+    part_code: str
+    part_name: str
+    quantity: int
+    warehouse_id: uuid.UUID | None
+    warehouse_name: str | None
+
+
+class PartSaleRequestRead(BaseModel):
+    """A counter parts sale (Venta de Repuestos) surfaced to almacén staff
+    the same way a dispatched ODT is — its destination is the sales
+    counter/mostrador, not a taller bay, which is exactly what almacén
+    staff needs to tell apart at a glance from the Órdenes de Servicio
+    requests in the same screen."""
+
+    id: uuid.UUID
+    code: str
+    client_name: str
+    status: str
+    created_at: datetime
+    lines: list[PartSaleRequestLineRead]
 
 
 class BulkLotItem(BaseModel):

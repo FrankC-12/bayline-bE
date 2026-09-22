@@ -4,6 +4,7 @@ and validated when present, and parts are deactivated, never deleted."""
 
 import os
 import uuid
+from datetime import UTC, datetime
 
 os.environ["DEBUG"] = "false"
 
@@ -28,6 +29,7 @@ from app.modules.parts.schemas import (
 )
 from app.modules.parts.service import PartsService
 from app.modules.vehicle_catalog.models import VehicleBrand, VehicleModel
+from app.modules.warehouse.models import PartLot, Warehouse
 
 
 @pytest.fixture
@@ -228,6 +230,42 @@ async def test_get_or_create_category_reuses_existing_by_name(env):
     resolved = await service.get_or_create_category(holding_id, "suspensión")
 
     assert resolved.id == created.id
+
+
+@pytest.mark.asyncio
+async def test_list_parts_latest_cost_is_the_newest_lot_not_the_oldest(env):
+    """latest_cost documents itself as "the cost from the latest received
+    lot" — list_parts used to pick the oldest lot with stock instead (the
+    next one FIFO would consume), disagreeing with a single-part fetch for
+    the exact same part."""
+    service, session, filial_id, holding_id = env
+    category = await _create_category(service, holding_id)
+    part = await service.create_part(
+        PartCreate(filial_id=filial_id, code="P-11", name="Filtro", category_id=category.id, unit="Unidad")
+    )
+    warehouse = Warehouse(filial_id=filial_id, name="Principal")
+    session.add(warehouse)
+    session.commit()
+    session.add_all(
+        [
+            PartLot(
+                filial_id=filial_id, warehouse_id=warehouse.id, part_id=part.id,
+                quantity_received=2, quantity_remaining=2, unit_cost=10,
+                received_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+            PartLot(
+                filial_id=filial_id, warehouse_id=warehouse.id, part_id=part.id,
+                quantity_received=4, quantity_remaining=4, unit_cost=15,
+                received_at=datetime(2026, 2, 1, tzinfo=UTC),
+            ),
+        ]
+    )
+    session.commit()
+
+    listed = await service.list_parts(filial_id)
+
+    assert listed[0].latest_cost == 15.0
+    assert listed[0].reference_price == 19.50
 
 
 @pytest.mark.asyncio

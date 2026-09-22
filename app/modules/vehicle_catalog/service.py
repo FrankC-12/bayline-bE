@@ -134,7 +134,7 @@ class VehicleCatalogService:
     ) -> VehicleModel:
         await self.get_brand(brand_id, holding_id)  # 404s if it's not this holding's brand
         await self._ensure_model_name_is_available(brand_id, payload.name)
-        model = VehicleModel(brand_id=brand_id, name=payload.name.strip())
+        model = VehicleModel(brand_id=brand_id, name=payload.name.strip(), vehicle_type=payload.vehicle_type)
         self.db.add(model)
         await self.db.commit()
         await self.db.refresh(model)
@@ -147,6 +147,8 @@ class VehicleCatalogService:
         if payload.name and payload.name.strip() != model.name:
             await self._ensure_model_name_is_available(model.brand_id, payload.name)
             model.name = payload.name.strip()
+        if payload.vehicle_type is not None:
+            model.vehicle_type = payload.vehicle_type
         await self.db.commit()
         await self.db.refresh(model)
         return model

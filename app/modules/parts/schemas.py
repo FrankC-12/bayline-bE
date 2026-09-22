@@ -228,6 +228,8 @@ class PartSaleRead(BaseModel):
     request_reason: str
     discount_label: str
     status: PartSaleStatus
+    warehouse_id: uuid.UUID | None
+    warehouse_name: str | None
     total: float
     iva_percentage: float
     iva_amount: float

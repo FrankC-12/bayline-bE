@@ -13,6 +13,7 @@ from app.modules.warehouse.schemas import (
     InventoryRow,
     PartLotDetailRead,
     PartLotRead,
+    PartSaleRequestRead,
     ServiceOrderPartRequestRead,
     StockInCreate,
     StockInReasonCreate,
@@ -257,6 +258,32 @@ async def acknowledge_service_order_request(
 ) -> None:
     await _ensure_access(current_user, filial_id, service.db)
     await service.acknowledge_service_order_request(transfer_id)
+
+
+@router.post("/almacen/service-order-requests/{transfer_id}/complete", status_code=status.HTTP_204_NO_CONTENT)
+async def complete_service_order_request(
+    transfer_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> None:
+    """Almacén confirms the parts were physically handed over to the
+    técnico — pauses the elapsed-time counter running since 'Pedido'."""
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    await service.complete_service_order_request(transfer_id, current_user.user_id)
+
+
+@router.get("/almacen/part-sale-requests", response_model=list[PartSaleRequestRead])
+async def list_part_sale_requests(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> list[PartSaleRequestRead]:
+    """Counter parts sales (Venta de Repuestos), surfaced here so almacén
+    staff can see them alongside Órdenes de Servicio requests and tell
+    apart which destination (taller vs. mostrador) each one is headed to."""
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_part_sale_requests(filial_id)
 
 
 @router.get("/almacen/movements", response_model=list[StockMovementRead])

@@ -8,6 +8,7 @@ is rolled into `non_client_subtotal` for visibility, not billed."""
 import uuid
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from test_part_sales_fifo import AsyncAdapter
@@ -22,6 +23,12 @@ from app.modules.post_ventas.enums import TemparioCategory
 from app.modules.post_ventas.models import Tempario, TemparioPart
 from app.modules.service_orders.enums import ServiceOrderPayer
 from app.modules.service_orders.models import ServiceOrder
+from app.modules.service_orders.schemas import (
+    TaskCreate,
+    TaskPayerUpdate,
+    TransferLineInput,
+    TransferLinePayerUpdate,
+)
 from app.modules.service_orders.service import ServiceOrderService
 from app.modules.warehouse.models import PartLot, Warehouse
 
@@ -194,3 +201,36 @@ async def test_payer_breakdown_matches_client_and_covered_totals(env):
     legacy = summary.model_dump(mode="json")
     legacy.pop("payer_breakdown")
     assert OrderSummary.model_validate(legacy).payer_breakdown is None
+
+
+@pytest.mark.parametrize(
+    "schema_cls, kwargs",
+    [
+        (TaskCreate, {"tempario_id": uuid.uuid4()}),
+        (TaskPayerUpdate, {}),
+        (TransferLineInput, {"part_id": uuid.uuid4(), "quantity": 1}),
+        (TransferLinePayerUpdate, {}),
+    ],
+)
+def test_proveedor_can_no_longer_be_assigned_manually(schema_cls, kwargs):
+    """A human can't pick 'proveedor' as the payer through the API anymore —
+    only the warranty-claim-conversion flow may set it, and that flow calls
+    the service directly, bypassing these schemas entirely (see
+    test_converting_still_tags_the_new_line_as_proveedor_despite_the_manual_block
+    in test_rework_auto_supplier_claim.py)."""
+    with pytest.raises(ValidationError) as excinfo:
+        schema_cls(payer=ServiceOrderPayer.PROVEEDOR, **kwargs)
+    assert "proveedor" in str(excinfo.value).lower()
+
+
+@pytest.mark.parametrize(
+    "schema_cls, kwargs",
+    [
+        (TaskCreate, {"tempario_id": uuid.uuid4()}),
+        (TaskPayerUpdate, {}),
+        (TransferLineInput, {"part_id": uuid.uuid4(), "quantity": 1}),
+        (TransferLinePayerUpdate, {}),
+    ],
+)
+def test_other_payers_are_still_assignable_manually(schema_cls, kwargs):
+    schema_cls(payer=ServiceOrderPayer.GARANTIA_TALLER, **kwargs)

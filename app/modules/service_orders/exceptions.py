@@ -33,6 +33,22 @@ class TransferNotFoundError(NotFoundError):
         )
 
 
+class InvalidTransferStatusTransitionError(BadRequestError):
+    def __init__(self, current: str, target: str) -> None:
+        super().__init__(
+            f"No se puede mover un ODT de '{current}' a '{target}'.",
+            error_code="invalid_transfer_status_transition",
+        )
+
+
+class TransferLineNotEditableError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Ya no se puede modificar esta línea — el ODT fue marcado como Pedido.",
+            error_code="transfer_line_not_editable",
+        )
+
+
 class UpsellNotFoundError(NotFoundError):
     def __init__(self, upsell_id: str) -> None:
         super().__init__(f"Upsell '{upsell_id}' was not found.", error_code="upsell_not_found")

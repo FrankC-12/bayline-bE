@@ -40,6 +40,7 @@ class OdtSummary(BaseModel):
     total: int
     pendiente: int
     pedido: int
+    completado: int
 
 
 class SalesSummary(BaseModel):

@@ -35,6 +35,7 @@ from app.modules.service_orders.schemas import (
     TaskStatusUpdate,
     TransferLineInput,
     TransferLinePayerUpdate,
+    TransferLineQuantityUpdate,
     TransferRead,
     UpsellCreate,
     UpsellDecisionInput,
@@ -301,6 +302,38 @@ async def update_transfer_line_payer(
     return await service.get_order_summary(order_id)
 
 
+@router.patch("/service-orders/{order_id}/transfers/lines/{line_id}/quantity")
+async def update_transfer_line_quantity(
+    order_id: uuid.UUID,
+    line_id: uuid.UUID,
+    payload: TransferLineQuantityUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> OrderSummary:
+    """Changes a line's requested quantity — only while its ODT is still
+    Pendiente (see TransferLineNotEditableError)."""
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    transfer = await service.set_transfer_line_quantity(line_id, payload.quantity)
+    summary = await service.get_order_summary(order_id)
+    summary.warnings = getattr(transfer, "stock_warnings", [])
+    return summary
+
+
+@router.delete("/service-orders/{order_id}/transfers/lines/{line_id}")
+async def remove_transfer_line(
+    order_id: uuid.UUID,
+    line_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> OrderSummary:
+    """Drops a line entirely — only while its ODT is still Pendiente."""
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    await service.remove_transfer_line(line_id)
+    return await service.get_order_summary(order_id)
+
+
 @router.post("/service-order-transfers/{transfer_id}/mark-ordered", response_model=TransferRead)
 async def mark_transfer_ordered(
     transfer_id: uuid.UUID,
@@ -329,8 +362,11 @@ async def mark_transfer_ordered(
         subtotal=sum(float(line.line_total) for line in transfer.lines),
         fulfilled_by_user_id=transfer.fulfilled_by_user_id,
         fulfilled_at=transfer.fulfilled_at,
+        completed_by_user_id=transfer.completed_by_user_id,
+        completed_at=transfer.completed_at,
         created_at=transfer.created_at,
     )
+
 
 
 @router.get("/upsells", response_model=list[UpsellRead])

@@ -228,10 +228,15 @@ class PartsService:
             .correlate(Part)
             .scalar_subquery()
         )
-        fifo_cost = (
+        # Matches get_latest_cost / _part_to_read: latest_cost documents itself
+        # as "the cost from the latest received lot", not the next one FIFO
+        # would consume — this used to pick the oldest lot with stock instead,
+        # so the same part showed a different latest_cost in the list than
+        # when fetched singly.
+        latest_cost = (
             select(PartLot.unit_cost)
-            .where(PartLot.part_id == Part.id, PartLot.quantity_remaining > 0)
-            .order_by(PartLot.received_at, PartLot.id)
+            .where(PartLot.part_id == Part.id)
+            .order_by(PartLot.received_at.desc(), PartLot.id.desc())
             .limit(1)
             .correlate(Part)
             .scalar_subquery()
@@ -244,7 +249,7 @@ class PartsService:
             .correlate(Part)
             .scalar_subquery()
         )
-        query = select(Part, stock_total, fifo_cost, latest_location).where(Part.filial_id == filial_id)
+        query = select(Part, stock_total, latest_cost, latest_location).where(Part.filial_id == filial_id)
         if not include_inactive:
             query = query.where(Part.is_active.is_(True))
         if search:

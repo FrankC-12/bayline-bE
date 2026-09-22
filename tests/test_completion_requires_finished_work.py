@@ -138,3 +138,21 @@ async def test_completing_with_everything_finished_needs_no_confirmation(env):
     assert completed.completed_with_pending_items is False
     assert completed.completed_override_by_user_id is None
     assert completed.completed_override_at is None
+
+
+@pytest.mark.asyncio
+async def test_an_odt_already_marked_completado_by_almacen_also_needs_no_confirmation(env):
+    """Regression: this used to check status != PEDIDO, which wrongly
+    treated an ODT already confirmed as Completado by almacén as if it had
+    never been dispatched at all."""
+    service, order, tempario, user = env
+    task = await service.add_task(order.id, tempario.id)
+    await service.update_task_status(task.id, TaskStatus.COMPLETADA)
+    transfer = (await service.list_transfers(order.id))[0]
+    await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id, user.user_id)
+
+    completed = await service.update_order(order.id, ServiceOrderUpdate(status=ServiceOrderStatus.COMPLETADO), user)
+
+    assert completed.status == ServiceOrderStatus.COMPLETADO
+    assert completed.completed_with_pending_items is False

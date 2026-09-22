@@ -41,6 +41,11 @@ class VehicleModel(Base):
         UUID(as_uuid=True), ForeignKey("vehicle_brands.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(60), nullable=False)
+    # The vehicle "Tipo" (Sedán, SUV, ...) is set once per model here, so a
+    # vehicle intake can inherit it from the chosen Model instead of it being
+    # typed by hand every time. Nullable only for models created before this
+    # column existed — every new model requires one (see VehicleModelCreate).
+    vehicle_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

@@ -5,7 +5,7 @@ later trace a part back to the lot, the purchase order, and the supplier
 (F0-01)."""
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, func, select
@@ -100,6 +100,76 @@ async def test_dispatch_consumes_a_single_lot_and_traces_it(env):
     assert movements[0].quantity == 3
     assert movements[0].warehouse_id == warehouse.id
     assert movements[0].responsible_user_id == almacenista_id
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_reservation_blocks_another_line_from_the_same_lot(env):
+    """Two different ODTs request the same part when only one cheap layer
+    has enough stock for one of them — the first to preview it reserves
+    those units, so the second (previewed right after) must fall to the
+    pricier layer instead of pricing itself off units that are about to be
+    dispatched out from under it."""
+    service, session, filial_id, order, part, warehouse, _other = env
+    make_lot(session, filial_id, warehouse, part, quantity=2, unit_cost=10, received_at=datetime(2026, 1, 1, tzinfo=UTC))
+    make_lot(session, filial_id, warehouse, part, quantity=10, unit_cost=20, received_at=datetime(2026, 2, 1, tzinfo=UTC))
+
+    other_order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=order.vehicle_id)
+    session.add(other_order)
+    session.commit()
+
+    first_transfer = await service.add_transfer_line(order.id, part.id, 2)
+    second_transfer = await service.add_transfer_line(other_order.id, part.id, 2)
+
+    first_line = first_transfer.lines[0]
+    second_line = second_transfer.lines[0]
+    assert float(first_line.cost_total) == 20.0  # 2 units @ $10 (the cheap layer)
+    assert float(second_line.cost_total) == 40.0  # 2 units @ $20 — cheap layer already reserved
+
+
+@pytest.mark.asyncio
+async def test_a_lapsed_reservation_no_longer_blocks_another_line(env):
+    """Past RESERVATION_TTL, a reservation stops counting on its own — no
+    active cleanup needed — so a second line can then claim those units."""
+    service, session, filial_id, order, part, warehouse, _other = env
+    make_lot(session, filial_id, warehouse, part, quantity=2, unit_cost=10, received_at=datetime(2026, 1, 1, tzinfo=UTC))
+    make_lot(session, filial_id, warehouse, part, quantity=10, unit_cost=20, received_at=datetime(2026, 2, 1, tzinfo=UTC))
+
+    other_order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=order.vehicle_id)
+    session.add(other_order)
+    session.commit()
+
+    first_transfer = await service.add_transfer_line(order.id, part.id, 2)
+    stale_allocation = session.scalars(
+        select(ServiceOrderTransferLotAllocation).where(
+            ServiceOrderTransferLotAllocation.transfer_line_id == first_transfer.lines[0].id
+        )
+    ).one()
+    stale_allocation.created_at = datetime.now(UTC) - timedelta(minutes=6)
+    session.commit()
+
+    second_transfer = await service.add_transfer_line(other_order.id, part.id, 2)
+
+    assert float(second_transfer.lines[0].cost_total) == 20.0  # cheap layer, reservation lapsed
+
+
+@pytest.mark.asyncio
+async def test_dispatch_within_the_reservation_window_matches_the_previewed_price(env):
+    """Dispatching before the reservation lapses must land on the exact
+    same lots/price shown while the ODT was Pendiente — the whole point of
+    reserving them."""
+    service, session, filial_id, order, part, warehouse, _other = env
+    make_lot(session, filial_id, warehouse, part, quantity=2, unit_cost=10, received_at=datetime(2026, 1, 1, tzinfo=UTC))
+    make_lot(session, filial_id, warehouse, part, quantity=10, unit_cost=20, received_at=datetime(2026, 2, 1, tzinfo=UTC))
+
+    transfer = await service.add_transfer_line(order.id, part.id, 3)
+    previewed_line = transfer.lines[0]
+    previewed_cost, previewed_unit_price = float(previewed_line.cost_total), float(previewed_line.unit_price)
+
+    dispatched = await service.mark_transfer_ordered(transfer.id)
+
+    dispatched_line = dispatched.lines[0]
+    assert float(dispatched_line.cost_total) == previewed_cost == 40.0  # 2 @ $10 + 1 @ $20
+    assert float(dispatched_line.unit_price) == pytest.approx(previewed_unit_price)
 
 
 @pytest.mark.asyncio

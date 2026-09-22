@@ -1238,7 +1238,10 @@ class AdministracionService:
                 .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
                 .where(
                     ServiceOrderTransfer.service_order_id.in_(order_ids),
-                    ServiceOrderTransfer.status == TransferStatus.PEDIDO,
+                    # PEDIDO or COMPLETADO — both were actually dispatched
+                    # and cost the shop; COMPLETADO just confirms the same
+                    # dispatch was physically handed over.
+                    ServiceOrderTransfer.status.in_([TransferStatus.PEDIDO, TransferStatus.COMPLETADO]),
                 )
             )
             transfer_lines = lines_result.all()

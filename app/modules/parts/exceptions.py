@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 
 
@@ -95,4 +97,24 @@ class DispatchQuantityMismatchError(BadRequestError):
             "Dispatched quantity doesn't match what was sold for part(s): "
             f"{', '.join(mismatched_part_ids)}.",
             error_code="dispatch_quantity_mismatch",
+        )
+
+
+class NegativeMarginPriceError(BadRequestError):
+    """Every ODS discount tier multiplies cost by >= 1.00, so a computed
+    parts line price should never fall below its FIFO cost — this only
+    fires on a rounding edge case (a cost with more precision than the
+    quantized price, at the "Precio de costo" 0%-margin tier) or a future
+    change that ever adds a tier below 100%. Blocks outright rather than
+    offering an override — nothing legitimate should ever want to sell a
+    parts line below what it cost."""
+
+    def __init__(self, cost: Decimal, total: Decimal) -> None:
+        # cost keeps its full precision in the message (not rounded to 2
+        # decimals like total) — that's exactly what makes the shortfall
+        # visible instead of both amounts printing the same rounded value.
+        super().__init__(
+            f"El precio de venta calculado (${total:.2f}) quedó por debajo del costo (${cost}). "
+            "Revisa el margen configurado en la orden.",
+            error_code="negative_margin_price",
         )

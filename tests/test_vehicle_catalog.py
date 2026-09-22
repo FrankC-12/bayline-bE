@@ -25,6 +25,7 @@ from app.modules.vehicle_catalog.schemas import (
     VehicleBrandCreate,
     VehicleBrandUpdate,
     VehicleModelCreate,
+    VehicleModelUpdate,
 )
 from app.modules.vehicle_catalog.service import DEFAULT_BRANDS, VehicleCatalogService
 
@@ -84,8 +85,8 @@ async def test_create_and_list_models_under_a_brand(env):
     holding_id = uuid.uuid4()
     brand = await service.create_brand(holding_id, VehicleBrandCreate(name="Toyota"))
 
-    await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux"))
-    await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Corolla"))
+    await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux", vehicle_type="Pick-up"))
+    await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Corolla", vehicle_type="Sedán"))
 
     refreshed = await service.get_brand(brand.id, holding_id)
     assert [m.name for m in refreshed.models] == ["Corolla", "Hilux"]
@@ -96,10 +97,10 @@ async def test_duplicate_model_name_within_brand_is_rejected(env):
     service, _session = env
     holding_id = uuid.uuid4()
     brand = await service.create_brand(holding_id, VehicleBrandCreate(name="Toyota"))
-    await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux"))
+    await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux", vehicle_type="Pick-up"))
 
     with pytest.raises(VehicleModelNameAlreadyExistsError):
-        await service.create_model(brand.id, holding_id, VehicleModelCreate(name="hilux"))
+        await service.create_model(brand.id, holding_id, VehicleModelCreate(name="hilux", vehicle_type="Pick-up"))
 
 
 @pytest.mark.asyncio
@@ -109,8 +110,8 @@ async def test_same_model_name_allowed_under_different_brands(env):
     toyota = await service.create_brand(holding_id, VehicleBrandCreate(name="Toyota"))
     ford = await service.create_brand(holding_id, VehicleBrandCreate(name="Ford"))
 
-    await service.create_model(toyota.id, holding_id, VehicleModelCreate(name="Ranger"))
-    model = await service.create_model(ford.id, holding_id, VehicleModelCreate(name="Ranger"))
+    await service.create_model(toyota.id, holding_id, VehicleModelCreate(name="Ranger", vehicle_type="Pick-up"))
+    model = await service.create_model(ford.id, holding_id, VehicleModelCreate(name="Ranger", vehicle_type="Pick-up"))
     assert model.name == "Ranger"
 
 
@@ -121,7 +122,49 @@ async def test_cannot_add_a_model_to_another_holdings_brand(env):
     brand = await service.create_brand(holding_a, VehicleBrandCreate(name="Toyota"))
 
     with pytest.raises(VehicleBrandNotFoundError):
-        await service.create_model(brand.id, holding_b, VehicleModelCreate(name="Hilux"))
+        await service.create_model(brand.id, holding_b, VehicleModelCreate(name="Hilux", vehicle_type="Pick-up"))
+
+
+@pytest.mark.asyncio
+async def test_creating_a_model_requires_a_vehicle_type(env):
+    with pytest.raises(Exception):
+        VehicleModelCreate(name="Hilux")
+
+
+@pytest.mark.asyncio
+async def test_created_model_stores_its_vehicle_type(env):
+    service, _session = env
+    holding_id = uuid.uuid4()
+    brand = await service.create_brand(holding_id, VehicleBrandCreate(name="Toyota"))
+
+    model = await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux", vehicle_type="Pick-up"))
+
+    assert model.vehicle_type == "Pick-up"
+
+
+@pytest.mark.asyncio
+async def test_updating_a_model_can_change_its_vehicle_type(env):
+    service, _session = env
+    holding_id = uuid.uuid4()
+    brand = await service.create_brand(holding_id, VehicleBrandCreate(name="Toyota"))
+    model = await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux", vehicle_type="Pick-up"))
+
+    updated = await service.update_model(model.id, holding_id, VehicleModelUpdate(vehicle_type="Otro"))
+
+    assert updated.vehicle_type == "Otro"
+    assert updated.name == "Hilux"
+
+
+@pytest.mark.asyncio
+async def test_renaming_a_model_leaves_its_vehicle_type_untouched(env):
+    service, _session = env
+    holding_id = uuid.uuid4()
+    brand = await service.create_brand(holding_id, VehicleBrandCreate(name="Toyota"))
+    model = await service.create_model(brand.id, holding_id, VehicleModelCreate(name="Hilux", vehicle_type="Pick-up"))
+
+    updated = await service.update_model(model.id, holding_id, VehicleModelUpdate(name="Hilux SW4"))
+
+    assert updated.vehicle_type == "Pick-up"
 
 
 @pytest.mark.asyncio

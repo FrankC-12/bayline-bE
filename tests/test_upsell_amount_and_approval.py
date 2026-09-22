@@ -4,6 +4,7 @@ recalculates its own total automatically since nothing is cached. Approval
 also records who approved it and through what channel."""
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -102,6 +103,38 @@ async def test_upsell_amount_reflects_its_tasks_and_parts(env):
     assert upsell.amount == 102.0
     assert upsell.tasks[0].tempario_id == tempario.id
     assert upsell.parts[0].line_total == 52.0
+
+
+@pytest.mark.asyncio
+async def test_upsell_part_cost_is_weighted_across_multiple_fifo_lots(env):
+    """A proposed quantity spanning more than one cost layer must be priced
+    off the weighted average across every lot it would actually draw from —
+    not a single lot's cost. Regression for a bug that priced the whole
+    quantity off just the oldest (or just the newest) lot."""
+    service, session, order, _tempario, part = env
+    older_lot = session.query(PartLot).filter_by(part_id=part.id).one()
+    older_lot.received_at = datetime(2026, 1, 1, tzinfo=UTC)
+    session.add(
+        PartLot(
+            filial_id=order.filial_id, warehouse_id=older_lot.warehouse_id, part_id=part.id,
+            quantity_received=10, quantity_remaining=10, unit_cost=50,
+            received_at=datetime(2026, 2, 1, tzinfo=UTC),
+        )
+    )
+    session.commit()
+
+    upsell = await service.create_upsell(
+        order.id,
+        UpsellCreate(
+            title="Cambio mayor", description="Requiere más piezas de las estimadas.",
+            parts=[UpsellPartInput(part_id=part.id, quantity=8)],
+        ),
+    )
+
+    # 5 units @ $20 (older lot, all it has) + 3 units @ $50 (newer lot) = $250
+    # total cost -> weighted average $31.25/unit, not $20 (oldest) or $50 (newest).
+    assert upsell.parts[0].unit_cost_snapshot == pytest.approx(31.25)
+    assert upsell.parts[0].line_total == pytest.approx(325.0)
 
 
 @pytest.mark.asyncio

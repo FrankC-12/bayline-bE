@@ -23,7 +23,12 @@ from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
-from app.modules.service_orders.enums import ReworkFailureCategory, WarrantyClaimStatus, WarrantyClaimType
+from app.modules.service_orders.enums import (
+    ReworkFailureCategory,
+    ServiceOrderPayer,
+    WarrantyClaimStatus,
+    WarrantyClaimType,
+)
 from app.modules.service_orders.models import ServiceOrder, ServiceOrderInvoice
 from app.modules.service_orders.schemas import WarrantyClaimAuthorizationInput, WarrantyClaimConvertInput, WarrantyClaimCreate
 from app.modules.service_orders.service import ServiceOrderService
@@ -188,6 +193,30 @@ async def test_converting_with_a_known_po_auto_creates_the_supplier_claim(env):
     assert supplier_claim.supplier_id == supplier.id
     assert supplier_claim.purchase_request_id == request.id
     assert supplier_claim.warranty_claim_id == converted.id
+
+
+@pytest.mark.asyncio
+async def test_converting_still_tags_the_new_line_as_proveedor_despite_the_manual_block(env):
+    """A human can no longer pick 'proveedor' by hand in TransferLineInput/
+    TaskCreate (see test_service_order_payer.py), but this conversion sets it
+    by calling add_transfer_line/add_task directly, bypassing those schemas —
+    so it must keep working unchanged."""
+    service, session, filial_id, order, part, warehouse = env
+    make_supplier_and_po(session, filial_id)
+    make_lot(session, filial_id, warehouse, part, quantity=10, purchase_request_id=None)
+
+    transfer = await service.add_transfer_line(order.id, part.id, 2)
+    await service.mark_transfer_ordered(transfer.id)
+
+    claim = await service.create_warranty_claim(claim_payload(order, part), [], [], None)
+    converted = await _authorize_and_convert(
+        service, claim.id, failure_category=ReworkFailureCategory.REPUESTO_DEFECTUOSO
+    )
+
+    new_transfers = await service.list_transfers(converted.resulting_service_order_id)
+    new_lines = [line for tr in new_transfers for line in tr.lines]
+    assert len(new_lines) == 1
+    assert new_lines[0].payer == ServiceOrderPayer.PROVEEDOR
 
 
 @pytest.mark.asyncio

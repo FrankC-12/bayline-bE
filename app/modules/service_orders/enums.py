@@ -29,6 +29,11 @@ class TaskStatus(str, enum.Enum):
 class TransferStatus(str, enum.Enum):
     PENDIENTE = "pendiente"
     PEDIDO = "pedido"
+    # Parts physically handed over to the técnico — confirmed from the
+    # almacén side (see AlmacenService.list_service_order_requests), not
+    # automatic. Lets the elapsed-time counter shown there pause instead of
+    # running forever once the request is actually fulfilled.
+    COMPLETADO = "completado"
 
 
 class UpsellStatus(str, enum.Enum):

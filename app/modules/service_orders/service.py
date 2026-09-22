@@ -1,5 +1,6 @@
 import uuid
-from datetime import UTC, date, datetime
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -11,7 +12,7 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS, price_parts_cost
-from app.modules.parts.service import PartsService, _sync_availability
+from app.modules.parts.service import _sync_availability
 from app.modules.post_ventas.models import LaborSettings, Tempario
 from app.modules.service_orders.enums import (
     ReworkFailureCategory,
@@ -28,11 +29,13 @@ from app.modules.service_orders.exceptions import (
     BayNotFoundError,
     FailureCategoryRequiredError,
     InvalidStatusTransitionError,
+    InvalidTransferStatusTransitionError,
     OrderNotInvoicedError,
     ServiceOrderNotCancelledError,
     ServiceOrderNotFoundError,
     ServiceOrderRequiredForComebackError,
     TaskNotFoundError,
+    TransferLineNotEditableError,
     TransferNotFoundError,
     UpsellNotFoundError,
     VehicleWarrantyRequiredError,
@@ -81,6 +84,27 @@ from app.modules.warehouse.enums import MovementType
 from app.modules.warehouse.fifo import allocate_fifo, allocate_fifo_preview
 from app.modules.warehouse.models import PartLot, StockMovement
 from app.modules.administracion.models import PurchaseRequest, SupplierClaim
+
+# How long an ODT line's FIFO preview also acts as a soft reservation on the
+# specific lot units it drew from — long enough to cover the normal
+# add-then-dispatch flow, short enough that an abandoned/forgotten ODT
+# doesn't lock up inventory indefinitely.
+RESERVATION_TTL = timedelta(minutes=5)
+
+
+@dataclass
+class _AvailableLot:
+    """A PartLot's id/cost/warehouse with its quantity adjusted for
+    reservations held by other pending lines — allocate_fifo/allocate_fifo_preview
+    only ever read .quantity_remaining, so this drops in wherever a real
+    PartLot would go without risking a stray write to the tracked ORM
+    attribute they actually decrement at dispatch."""
+
+    id: uuid.UUID
+    unit_cost: float
+    warehouse_id: uuid.UUID
+    quantity_remaining: int
+
 
 ALLOWED_TRANSITIONS: dict[ServiceOrderStatus, set[ServiceOrderStatus]] = {
     ServiceOrderStatus.PENDIENTE: {ServiceOrderStatus.EN_PROGRESO, ServiceOrderStatus.CANCELADO},
@@ -172,6 +196,21 @@ class ServiceOrderService:
                 error_code="inspection_required",
             )
 
+        # customer_reason is inherited from the inspection's notes, the same
+        # way intake_mileage is — an inspection that has notes always wins
+        # over whatever the client sent. The client-sent value is only used
+        # as a fallback for a walk-in with no inspection, or an inspection
+        # from before notes became required to complete one.
+        inherited_reason = inspection.notes.strip() if inspection and inspection.notes else None
+        customer_reason = inherited_reason or (
+            payload.customer_reason.strip() if payload.customer_reason else None
+        )
+        if not customer_reason:
+            raise BadRequestError(
+                "Se requiere el motivo o síntoma reportado por el cliente.",
+                error_code="customer_reason_required",
+            )
+
         next_seq = await self._next_sequence_number(payload.filial_id)
         order = ServiceOrder(
             filial_id=payload.filial_id,
@@ -184,7 +223,7 @@ class ServiceOrderService:
             advisor_user_id=payload.advisor_user_id,
             bay_id=payload.bay_id,
             intake_mileage=inspection.mileage if inspection else None,
-            customer_reason=payload.customer_reason,
+            customer_reason=customer_reason,
             promised_at=payload.promised_at,
             sequence_number=next_seq,
         )
@@ -217,8 +256,11 @@ class ServiceOrderService:
         )
         if becoming_completado:
             pending_tasks = [t for t in await self.list_tasks(order_id) if t.status != TaskStatus.COMPLETADA]
+            # Only PENDIENTE (never dispatched) blocks closing — PEDIDO and
+            # COMPLETADO have both already left the shelf, "!= PEDIDO" would
+            # wrongly flag an already-Completado ODT as undispatched.
             pending_transfers = [
-                t for t in await self.list_transfers(order_id) if t.status != TransferStatus.PEDIDO
+                t for t in await self.list_transfers(order_id) if t.status == TransferStatus.PENDIENTE
             ]
             if pending_tasks or pending_transfers:
                 if not payload.confirm_incomplete_completion:
@@ -522,6 +564,65 @@ class ServiceOrderService:
         await self.db.refresh(line)
         return line
 
+    async def set_transfer_line_quantity(self, line_id: uuid.UUID, quantity: int) -> ServiceOrderTransfer:
+        """Changes how much of a part is requested — e.g. an oil change line
+        for 6 liters drops to 2 once the client says they're bringing 4 of
+        their own. Only while the ODT is still Pendiente: once dispatched
+        (Pedido), stock has already been decremented against the original
+        quantity and the line is frozen (see mark_transfer_ordered)."""
+        line = await self.db.get(ServiceOrderTransferLine, line_id)
+        if line is None:
+            raise TransferNotFoundError(str(line_id))
+        transfer = await self.db.get(ServiceOrderTransfer, line.transfer_id)
+        await require_editable_order(self.db, transfer.service_order_id)
+        if transfer.status != TransferStatus.PENDIENTE:
+            raise TransferLineNotEditableError()
+
+        order = await self.get_order(transfer.service_order_id)
+        cost, allocations, shortfall = await self._fifo_preview_cost(
+            order.filial_id, line.part_id, quantity, exclude_line_id=line.id
+        )
+        warning: str | None = None
+        if shortfall > 0:
+            part = await self.db.get(Part, line.part_id)
+            available = quantity - shortfall
+            warning = (
+                f"Stock insuficiente para \"{part.name if part else line.part_id}\": disponible "
+                f"{available} de {quantity} solicitadas. Se guardó el cambio de todas formas — "
+                "solicítalo a almacén cuando haya existencia."
+            )
+
+        line.quantity = quantity
+        line.cost_total = cost
+        line.unit_price, line.line_total = price_parts_cost(cost, quantity, order.discount_label)
+        line.allocations = [
+            ServiceOrderTransferLotAllocation(
+                lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost, warehouse_id=lot.warehouse_id
+            )
+            for lot, take in allocations
+        ]
+        await self.db.commit()
+        await self.db.refresh(transfer)
+        transfer.stock_warnings = [warning] if warning else []
+        return transfer
+
+    async def remove_transfer_line(self, line_id: uuid.UUID) -> ServiceOrderTransfer:
+        """Drops a line entirely — e.g. the client is bringing every unit
+        themselves, so nothing needs to be requested from almacén at all.
+        Only while the ODT is still Pendiente, same as set_transfer_line_quantity."""
+        line = await self.db.get(ServiceOrderTransferLine, line_id)
+        if line is None:
+            raise TransferNotFoundError(str(line_id))
+        transfer = await self.db.get(ServiceOrderTransfer, line.transfer_id)
+        await require_editable_order(self.db, transfer.service_order_id)
+        if transfer.status != TransferStatus.PENDIENTE:
+            raise TransferLineNotEditableError()
+
+        await self.db.delete(line)
+        await self.db.commit()
+        await self.db.refresh(transfer)
+        return transfer
+
     async def get_transfer_filial(self, transfer_id: uuid.UUID) -> uuid.UUID:
         transfer = await self.db.get(ServiceOrderTransfer, transfer_id)
         if transfer is None:
@@ -553,7 +654,7 @@ class ServiceOrderService:
                 # warehouse in the filial — ODTs have never been scoped to a
                 # single warehouse) so the part can later be traced to a lot,
                 # a purchase order, and a supplier. Mirrors PartsService.create_sale.
-                lots = list(
+                real_lots = list(
                     (
                         await self.db.execute(
                             select(PartLot)
@@ -569,7 +670,26 @@ class ServiceOrderService:
                     .scalars()
                     .all()
                 )
-                allocations = allocate_fifo(lots, line.quantity, part_id=part.id, part_name=part.name)
+                # Net of whatever OTHER pending lines still have reserved —
+                # this line's own reservation is excluded, so as long as
+                # nothing else touched inventory since it was previewed, this
+                # lands on the exact same lots at the exact same price. If
+                # its reservation lapsed (or a rare concurrent-preview race
+                # let two lines reserve the same units), this simply falls
+                # back to whatever's actually available now, same as before
+                # this line-level reservation existed.
+                reserved = await self._reserved_quantity_by_lot(line.part_id, exclude_line_id=line.id)
+                real_lots_by_id = {lot.id: lot for lot in real_lots}
+                available_lots = [
+                    _AvailableLot(
+                        id=lot.id,
+                        unit_cost=lot.unit_cost,
+                        warehouse_id=lot.warehouse_id,
+                        quantity_remaining=max(0, lot.quantity_remaining - reserved.get(lot.id, 0)),
+                    )
+                    for lot in real_lots
+                ]
+                allocations = allocate_fifo(available_lots, line.quantity, part_id=part.id, part_name=part.name)
                 # Replace the add-time preview with the real, final
                 # consumption — inventory may have shifted since the line
                 # was added (another order could have taken the cheaper
@@ -585,7 +705,8 @@ class ServiceOrderService:
                 line.cost_total = cost
                 line.unit_price, line.line_total = price_parts_cost(cost, line.quantity, order.discount_label)
                 for lot, take in allocations:
-                    lot.quantity_remaining -= take
+                    real_lot = real_lots_by_id[lot.id]
+                    real_lot.quantity_remaining -= take
                     self.db.add(
                         StockMovement(
                             filial_id=order.filial_id,
@@ -604,6 +725,25 @@ class ServiceOrderService:
             transfer.fulfilled_by_user_id = fulfilled_by_user_id
             transfer.fulfilled_at = datetime.now(UTC)
 
+        await self.db.commit()
+        await self.db.refresh(transfer)
+        return transfer
+
+    async def complete_transfer(
+        self, transfer_id: uuid.UUID, completed_by_user_id: uuid.UUID | None = None
+    ) -> ServiceOrderTransfer:
+        """Confirms almacén physically handed the parts over — from
+        Pedido only, never automatic. Pauses the elapsed-time counter
+        running since fulfilled_at (see AlmacenService.list_service_order_requests)."""
+        transfer = await self.db.get(ServiceOrderTransfer, transfer_id)
+        if transfer is None:
+            raise TransferNotFoundError(str(transfer_id))
+        if transfer.status != TransferStatus.PEDIDO:
+            raise InvalidTransferStatusTransitionError(transfer.status.value, TransferStatus.COMPLETADO.value)
+
+        transfer.status = TransferStatus.COMPLETADO
+        transfer.completed_by_user_id = completed_by_user_id
+        transfer.completed_at = datetime.now(UTC)
         await self.db.commit()
         await self.db.refresh(transfer)
         return transfer
@@ -671,37 +811,19 @@ class ServiceOrderService:
 
         # Price via real FIFO consumption (oldest lot first, filial-wide —
         # same scope mark_transfer_ordered uses at dispatch), exactly like
-        # the counter-sale flow — never off a single "latest" lot. This is
-        # a read-only preview: no stock is touched until dispatch, and it's
-        # fully recomputed from whatever's actually consumed at that point.
-        lots = list(
-            (
-                await self.db.execute(
-                    select(PartLot)
-                    .where(
-                        PartLot.filial_id == order.filial_id,
-                        PartLot.part_id == part_id,
-                        PartLot.quantity_remaining > 0,
-                    )
-                    .order_by(PartLot.received_at, PartLot.id)
-                )
-            ).scalars()
+        # the counter-sale flow — never off a single "latest" lot. Net of
+        # whatever other pending lines have already reserved (excluding this
+        # same line, which never competes against its own reservation) —
+        # this IS also a soft reservation: the specific units it lands on
+        # are unavailable to any other line's preview for RESERVATION_TTL,
+        # so the price doesn't drift before dispatch. Still no stock is
+        # actually touched until dispatch.
+        cost, allocations, shortfall = await self._fifo_preview_cost(
+            order.filial_id, part_id, new_quantity, exclude_line_id=existing.id if existing else None
         )
-        allocations, shortfall = allocate_fifo_preview(lots, new_quantity)
-        cost = sum((Decimal(str(lot.unit_cost)) * take for lot, take in allocations), Decimal(0))
 
         warning: str | None = None
         if shortfall > 0:
-            # Best-effort estimate for the part of the quantity the shelf
-            # can't currently cover — priced at the last known cost for this
-            # part so the preview isn't wildly off; dispatch recomputes the
-            # real price from whatever's actually consumed then anyway.
-            fallback_cost = (
-                allocations[-1][0].unit_cost
-                if allocations
-                else await self._last_known_unit_cost(part_id)
-            )
-            cost += Decimal(str(fallback_cost)) * shortfall
             part = await self.db.get(Part, part_id)
             available = new_quantity - shortfall
             warning = (
@@ -730,6 +852,88 @@ class ServiceOrderService:
         # Subsequent additions of this part in the same task must see this line.
         await self.db.flush()
         return warning
+
+    async def _reserved_quantity_by_lot(
+        self, part_id: uuid.UUID, exclude_line_id: uuid.UUID | None
+    ) -> dict[uuid.UUID, int]:
+        """How much of each of this part's lots is currently claimed by
+        OTHER pending ODT lines' still-fresh (< RESERVATION_TTL old) price
+        preview — so a second line can't preview or dispatch against the
+        exact same units before the first one actually consumes them. A
+        lapsed reservation just stops counting here; nothing needs to
+        actively clear it. Once a transfer is PEDIDO, its lines' allocations
+        are real consumption already reflected in PartLot.quantity_remaining
+        — counting them again here would double-subtract, so only PENDIENTE
+        transfers are considered."""
+        cutoff = datetime.now(UTC) - RESERVATION_TTL
+        query = (
+            select(ServiceOrderTransferLotAllocation.lot_id, func.sum(ServiceOrderTransferLotAllocation.quantity))
+            .join(PartLot, PartLot.id == ServiceOrderTransferLotAllocation.lot_id)
+            .join(
+                ServiceOrderTransferLine,
+                ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
+            )
+            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+            .where(
+                PartLot.part_id == part_id,
+                ServiceOrderTransferLotAllocation.created_at >= cutoff,
+                ServiceOrderTransfer.status == TransferStatus.PENDIENTE,
+            )
+            .group_by(ServiceOrderTransferLotAllocation.lot_id)
+        )
+        if exclude_line_id is not None:
+            query = query.where(ServiceOrderTransferLotAllocation.transfer_line_id != exclude_line_id)
+        result = await self.db.execute(query)
+        return dict(result.all())
+
+    async def _fifo_preview_cost(
+        self,
+        filial_id: uuid.UUID,
+        part_id: uuid.UUID,
+        quantity: int,
+        exclude_line_id: uuid.UUID | None = None,
+    ) -> tuple[Decimal, list[tuple[_AvailableLot, int]], int]:
+        """Total cost FIFO would actually charge for this quantity — oldest
+        lots first, filial-wide, weighted across every lot it spans, net of
+        whatever other pending lines have already reserved (see
+        _reserved_quantity_by_lot) — with any shortfall (the shelf can't
+        fully cover it) priced at the last known cost as a best-effort
+        estimate. Shared by the ODT add-time preview and the Upsell proposal
+        amount, so neither prices a quantity spanning more than one cost
+        layer off a single lot's cost. Returns (total_cost, allocations,
+        shortfall) — a read-only preview, no stock is touched here."""
+        lots = list(
+            (
+                await self.db.execute(
+                    select(PartLot)
+                    .where(
+                        PartLot.filial_id == filial_id,
+                        PartLot.part_id == part_id,
+                        PartLot.quantity_remaining > 0,
+                    )
+                    .order_by(PartLot.received_at, PartLot.id)
+                )
+            ).scalars()
+        )
+        reserved = await self._reserved_quantity_by_lot(part_id, exclude_line_id)
+        available_lots = [
+            _AvailableLot(
+                id=lot.id,
+                unit_cost=lot.unit_cost,
+                warehouse_id=lot.warehouse_id,
+                quantity_remaining=max(0, lot.quantity_remaining - reserved.get(lot.id, 0)),
+            )
+            for lot in lots
+        ]
+        available_lots = [lot for lot in available_lots if lot.quantity_remaining > 0]
+        allocations, shortfall = allocate_fifo_preview(available_lots, quantity)
+        cost = sum((Decimal(str(lot.unit_cost)) * take for lot, take in allocations), Decimal(0))
+        if shortfall > 0:
+            fallback_cost = (
+                allocations[-1][0].unit_cost if allocations else await self._last_known_unit_cost(part_id)
+            )
+            cost += Decimal(str(fallback_cost)) * shortfall
+        return cost, allocations, shortfall
 
     async def _last_known_unit_cost(self, part_id: uuid.UUID) -> Decimal:
         """The most recent cost this part was ever received at, regardless of
@@ -963,7 +1167,6 @@ class ServiceOrderService:
         self.db.add(upsell)
         await self.db.flush()
 
-        parts_service = PartsService(self.db)
         for task_input in payload.tasks:
             tempario = await self.db.get(Tempario, task_input.tempario_id)
             if tempario is None or tempario.filial_id != order.filial_id:
@@ -981,14 +1184,21 @@ class ServiceOrderService:
             part = await self.db.get(Part, part_input.part_id)
             if part is None or part.filial_id != order.filial_id:
                 raise TransferNotFoundError(str(part_input.part_id))
-            cost = await parts_service.get_latest_cost(part.id)
+            # Weighted average across every FIFO lot this quantity would
+            # actually draw from — a proposed quantity spanning more than
+            # one cost layer must not be priced off a single lot's cost,
+            # same reasoning as the ODT add-time preview.
+            total_cost, _allocations, _shortfall = await self._fifo_preview_cost(
+                order.filial_id, part.id, part_input.quantity
+            )
+            unit_cost = total_cost / part_input.quantity if part_input.quantity else Decimal(0)
             self.db.add(
                 UpsellPart(
                     upsell_id=upsell.id,
                     part_id=part.id,
                     name_snapshot=part.name,
                     quantity=part_input.quantity,
-                    unit_cost_snapshot=cost or 0.0,
+                    unit_cost_snapshot=unit_cost,
                 )
             )
 
@@ -1077,7 +1287,12 @@ class ServiceOrderService:
                             .where(
                                 ServiceOrderTransfer.service_order_id == claim.service_order_id,
                                 ServiceOrderTransferLine.part_id == claim.part_id,
-                                ServiceOrderTransfer.status == TransferStatus.PEDIDO,
+                                # PEDIDO or COMPLETADO — both mean it was actually
+                                # dispatched; COMPLETADO is just a later confirmation
+                                # of the same allocation, not a different one.
+                                ServiceOrderTransfer.status.in_(
+                                    [TransferStatus.PEDIDO, TransferStatus.COMPLETADO]
+                                ),
                             )
                             .limit(1)
                         )
@@ -1156,7 +1371,10 @@ class ServiceOrderService:
                 .where(
                     ServiceOrderTransfer.service_order_id == order.id,
                     ServiceOrderTransferLine.part_id == claim.part_id,
-                    ServiceOrderTransfer.status == TransferStatus.PEDIDO,
+                    # PEDIDO or COMPLETADO — both mean it was actually
+                    # dispatched; COMPLETADO is just a later confirmation of
+                    # the same allocation, not a different one.
+                    ServiceOrderTransfer.status.in_([TransferStatus.PEDIDO, TransferStatus.COMPLETADO]),
                 )
             )
         ).all()

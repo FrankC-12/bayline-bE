@@ -131,6 +131,39 @@ async def test_already_linked_inspection_is_rejected(env):
 
 
 @pytest.mark.asyncio
+async def test_create_order_inherits_customer_reason_from_inspection_notes(env):
+    """customer_reason is heredado from the inspection's notes just like
+    intake_mileage — whatever the client sends in customer_reason is
+    ignored once the inspection has its own notes recorded."""
+    service, session = env
+    filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    inspection = _make_inspection(session, vehicle_id, mileage=15000)
+    inspection.notes = "Ruido metálico en suspensión delantera"
+    session.flush()
+
+    order = await service.create_order(
+        _payload(
+            filial_id, vehicle_id, advisor_id,
+            inspection_id=inspection.id, customer_reason="Motivo distinto tecleado en el panel",
+        )
+    )
+
+    assert order.customer_reason == "Ruido metálico en suspensión delantera"
+
+
+@pytest.mark.asyncio
+async def test_create_order_requires_a_reason_when_neither_side_has_one(env):
+    service, session = env
+    filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    inspection = _make_inspection(session, vehicle_id, mileage=15000)
+
+    with pytest.raises(BadRequestError):
+        await service.create_order(
+            _payload(filial_id, vehicle_id, advisor_id, inspection_id=inspection.id, customer_reason=None)
+        )
+
+
+@pytest.mark.asyncio
 async def test_scheduled_order_can_omit_inspection_and_mileage(env):
     service, _session = env
     filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()

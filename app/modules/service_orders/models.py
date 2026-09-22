@@ -190,6 +190,13 @@ class ServiceOrderTransfer(Base):
     # Whether almacén staff has acknowledged this dispatched request in the
     # "Órdenes de Transferencia" screen — drives the unseen-count badge there.
     warehouse_seen: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Set when almacén marks the parts as physically handed over (status ->
+    # COMPLETADO) — the counter running since fulfilled_at (Pedido) pauses
+    # here instead of counting forever.
+    completed_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     lines: Mapped[list["ServiceOrderTransferLine"]] = relationship(
@@ -263,6 +270,14 @@ class ServiceOrderTransferLotAllocation(Base):
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    # A preview allocation also acts as a soft reservation: while the
+    # parent line's transfer is still PENDIENTE and this row is younger
+    # than RESERVATION_TTL, another line's own preview treats this lot's
+    # reserved quantity as unavailable — so its price doesn't drift from
+    # what actually gets dispatched. Reassigning a line's allocations
+    # (cascade delete-orphan) replaces these rows outright, so touching a
+    # line always resets its own reservation clock.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Upsell(Base):

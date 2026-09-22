@@ -3,9 +3,11 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.inspections.enums import InspectionStatus
 from app.modules.inspections.exceptions import (
     CannotDeleteLinkedInspectionError,
     InspectionAlreadyLinkedError,
+    InspectionNotesRequiredError,
     InspectionNotFoundError,
 )
 from app.modules.inspections.models import PreliminaryInspection
@@ -44,6 +46,8 @@ class InspectionService:
     async def create_inspection(
         self, payload: InspectionCreate, inspector_user_id: uuid.UUID
     ) -> PreliminaryInspection:
+        if payload.status == InspectionStatus.COMPLETADA and not (payload.notes and payload.notes.strip()):
+            raise InspectionNotesRequiredError()
         inspection = PreliminaryInspection(
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
@@ -65,12 +69,25 @@ class InspectionService:
         for order_id in sorted(order_ids):
             await require_editable_order(self.db, order_id)
 
+        # Notes are only required at the moment an inspection actually
+        # becomes completada — an inspection that was already completada
+        # before this rule existed (and so has no notes) can still have its
+        # other fields (mileage, service_order_id, ...) updated freely.
+        was_already_completada = inspection.status == InspectionStatus.COMPLETADA
+
         if payload.mileage is not None:
             inspection.mileage = payload.mileage
         if payload.notes is not None:
             inspection.notes = payload.notes
         if payload.status is not None:
             inspection.status = payload.status
+
+        if (
+            inspection.status == InspectionStatus.COMPLETADA
+            and not was_already_completada
+            and not (inspection.notes and inspection.notes.strip())
+        ):
+            raise InspectionNotesRequiredError()
 
         if payload.clear_service_order:
             inspection.service_order_id = None

@@ -157,6 +157,19 @@ class PartSale(Base):
     def total_with_taxes(self) -> float:
         return self.total + float(self.iva_amount) + float(self.igtf_amount)
 
+    @property
+    def warehouse_id(self) -> uuid.UUID | None:
+        """The warehouse this sale dispatches from — chosen once at creation
+        and copied onto every line (a counter sale, unlike an ODT, is always
+        scoped to a single warehouse), so any line's value speaks for the
+        whole sale."""
+        return self.lines[0].warehouse_id if self.lines else None
+
+    @property
+    def warehouse_name(self) -> str | None:
+        line = self.lines[0] if self.lines else None
+        return line.warehouse.name if line and line.warehouse else None
+
 
 class PartSaleLine(Base):
     __tablename__ = "part_sale_lines"
@@ -188,6 +201,7 @@ class PartSaleLine(Base):
     warranties: Mapped[list["PartWarranty"]] = relationship(
         cascade="all, delete-orphan", lazy="selectin"
     )
+    warehouse: Mapped["Warehouse | None"] = relationship(lazy="selectin")
 
     sale: Mapped["PartSale"] = relationship(back_populates="lines")
 

@@ -22,3 +22,12 @@ class CannotDeleteLinkedInspectionError(BadRequestError):
             "Cannot delete an inspection that is linked to a service order.",
             error_code="cannot_delete_linked_inspection",
         )
+
+
+class InspectionNotesRequiredError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Las notas son obligatorias para completar una inspección — la ODS heredará de aquí "
+            "el motivo o síntoma reportado por el cliente.",
+            error_code="inspection_notes_required",
+        )

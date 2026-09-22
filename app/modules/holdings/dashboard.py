@@ -63,6 +63,7 @@ class HoldingDashboardService:
                 total=sum(transfer_counts.values()),
                 pendiente=transfer_counts.get(TransferStatus.PENDIENTE, 0),
                 pedido=transfer_counts.get(TransferStatus.PEDIDO, 0),
+                completado=transfer_counts.get(TransferStatus.COMPLETADO, 0),
             )
 
             part_sales = await parts_service.list_sales(filial.id)

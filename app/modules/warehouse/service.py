@@ -33,7 +33,10 @@ from app.modules.warehouse.schemas import (
     LotOutboundMovementRead,
     PartLotDetailRead,
     PartLotRead,
+    PartSaleRequestLineRead,
+    PartSaleRequestRead,
     ServiceOrderPartRequestLineRead,
+    ServiceOrderPartRequestLineWarehouse,
     ServiceOrderPartRequestRead,
     StockInCreate,
     StockInReasonCreate,
@@ -690,8 +693,12 @@ class AlmacenService:
             .where(
                 ServiceOrderTransferLotAllocation.lot_id == lot.id,
                 # Only real, dispatched consumption — a line just added but
-                # not yet "pedida a almacén" only carries a preview allocation.
-                ServiceOrderTransfer.status == ServiceOrderTransferStatus.PEDIDO,
+                # not yet "pedida a almacén" only carries a preview
+                # allocation. PEDIDO or COMPLETADO both mean it shipped;
+                # COMPLETADO just confirms the same dispatch was handed over.
+                ServiceOrderTransfer.status.in_(
+                    [ServiceOrderTransferStatus.PEDIDO, ServiceOrderTransferStatus.COMPLETADO]
+                ),
             )
         )
         for allocation, transfer, order in odt_rows.all():
@@ -741,22 +748,47 @@ class AlmacenService:
             .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
             .where(
                 ServiceOrder.filial_id == filial_id,
-                ServiceOrderTransfer.status == ServiceOrderTransferStatus.PEDIDO,
+                ServiceOrderTransfer.status.in_(
+                    [ServiceOrderTransferStatus.PEDIDO, ServiceOrderTransferStatus.COMPLETADO]
+                ),
             )
             .order_by(ServiceOrderTransfer.fulfilled_at.desc())
         )
+
+        warehouse_names = {
+            w.id: w.name
+            for w in (await self.db.execute(select(Warehouse).where(Warehouse.filial_id == filial_id))).scalars()
+        }
 
         results: list[ServiceOrderPartRequestRead] = []
         for transfer, order, vehicle in rows.all():
             lines: list[ServiceOrderPartRequestLineRead] = []
             for line in transfer.lines:
                 part = await self.db.get(Part, line.part_id)
+                # A line isn't scoped to one warehouse — dispatch draws FIFO
+                # across every warehouse in the filial, so its quantity can
+                # (rarely) split across more than one. Group its real,
+                # already-dispatched allocations by warehouse so almacén
+                # staff can see exactly where each unit is coming from.
+                quantity_by_warehouse: dict[uuid.UUID, int] = {}
+                for allocation in line.allocations:
+                    quantity_by_warehouse[allocation.warehouse_id] = (
+                        quantity_by_warehouse.get(allocation.warehouse_id, 0) + allocation.quantity
+                    )
                 lines.append(
                     ServiceOrderPartRequestLineRead(
                         part_id=line.part_id,
                         part_code=part.code if part else "",
                         part_name=part.name if part else "",
                         quantity=line.quantity,
+                        warehouses=[
+                            ServiceOrderPartRequestLineWarehouse(
+                                warehouse_id=warehouse_id,
+                                warehouse_name=warehouse_names.get(warehouse_id, "Almacén desconocido"),
+                                quantity=quantity,
+                            )
+                            for warehouse_id, quantity in quantity_by_warehouse.items()
+                        ],
                     )
                 )
             results.append(
@@ -766,12 +798,58 @@ class AlmacenService:
                     service_order_id=order.id,
                     service_order_code=order.code,
                     vehicle_label=f"{vehicle.brand} {vehicle.model} · {vehicle.plate or 'Sin placa'}",
+                    status=transfer.status.value,
                     fulfilled_at=transfer.fulfilled_at,
+                    completed_at=transfer.completed_at,
                     warehouse_seen=transfer.warehouse_seen,
                     lines=lines,
                 )
             )
         return results
+
+    async def list_part_sale_requests(self, filial_id: uuid.UUID) -> list[PartSaleRequestRead]:
+        """Counter parts sales (Venta de Repuestos) for this filial, surfaced
+        alongside Órdenes de Servicio requests — same idea, different
+        destination: a técnico waiting at a bay vs. a customer at the sales
+        counter. A sale's stock is pulled FIFO the moment it's created (not
+        at a separate dispatch step like an ODT), so every non-cancelled
+        sale already reflects real consumption worth showing here."""
+        from app.modules.parts.enums import PartSaleStatus
+        from app.modules.parts.models import PartSale
+
+        result = await self.db.execute(
+            select(PartSale)
+            .options(selectinload(PartSale.lines))
+            .where(PartSale.filial_id == filial_id, PartSale.status != PartSaleStatus.CANCELADO)
+            .order_by(PartSale.created_at.desc())
+        )
+
+        requests: list[PartSaleRequestRead] = []
+        for sale in result.scalars():
+            lines: list[PartSaleRequestLineRead] = []
+            for line in sale.lines:
+                part = await self.db.get(Part, line.part_id)
+                lines.append(
+                    PartSaleRequestLineRead(
+                        part_id=line.part_id,
+                        part_code=part.code if part else "",
+                        part_name=part.name if part else "",
+                        quantity=line.quantity,
+                        warehouse_id=line.warehouse_id,
+                        warehouse_name=line.warehouse.name if line.warehouse else None,
+                    )
+                )
+            requests.append(
+                PartSaleRequestRead(
+                    id=sale.id,
+                    code=sale.code,
+                    client_name=sale.client_name,
+                    status=sale.status.value,
+                    created_at=sale.created_at,
+                    lines=lines,
+                )
+            )
+        return requests
 
     async def acknowledge_service_order_request(self, transfer_id: uuid.UUID) -> None:
         from app.modules.service_orders.exceptions import TransferNotFoundError as ServiceOrderTransferNotFoundError
@@ -782,6 +860,17 @@ class AlmacenService:
             raise ServiceOrderTransferNotFoundError(str(transfer_id))
         transfer.warehouse_seen = True
         await self.db.commit()
+
+    async def complete_service_order_request(
+        self, transfer_id: uuid.UUID, completed_by_user_id: uuid.UUID
+    ) -> None:
+        """Almacén confirms the parts were physically handed over — pauses
+        the elapsed-time counter running since the ODT was marked 'Pedido'.
+        Delegates to ServiceOrderService, which owns the ServiceOrderTransfer
+        model and its status transitions."""
+        from app.modules.service_orders.service import ServiceOrderService
+
+        await ServiceOrderService(self.db).complete_transfer(transfer_id, completed_by_user_id)
 
     async def list_movements(
         self, filial_id: uuid.UUID, part_id: uuid.UUID | None = None, warehouse_id: uuid.UUID | None = None

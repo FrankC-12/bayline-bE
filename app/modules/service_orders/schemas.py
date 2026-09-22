@@ -2,7 +2,7 @@ import uuid
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, DiscountLabel
 from app.modules.post_ventas.schemas import VehicleWarrantyRead, WorkshopWarrantyRead
@@ -43,18 +43,20 @@ class ServiceOrderCreate(BaseModel):
     filial_id: uuid.UUID
     vehicle_id: uuid.UUID
     order_type: ServiceOrderType = ServiceOrderType.REGULAR
-    # Reception data. customer_reason can be inherited from an unlinked
-    # PreliminaryInspection for this vehicle; advisor_user_id/promised_at
-    # have no inspection equivalent and are always entered by hand.
-    # intake_mileage is never entered by hand — it's always a read-only
-    # view inherited from a PreliminaryInspection, set server-side (see
-    # ServiceOrderService.create_order). A walk-in ODS (no scheduled_at)
-    # must reference an existing unlinked inspection for this vehicle here;
-    # one scheduled ahead via "Agendar Orden de Servicio" can't know it yet
-    # (the vehicle isn't there), so inspection_id may be omitted and gets
-    # linked later, from the order detail screen, once it arrives.
+    # Reception data. customer_reason is inherited from the linked
+    # PreliminaryInspection's notes whenever it has any — same as
+    # intake_mileage, never re-entered by hand in that case (see
+    # ServiceOrderService.create_order). It's only actually taken from this
+    # field when there's no inspection, or an older inspection predating the
+    # notes-required-to-complete rule left it blank.
+    # advisor_user_id/promised_at have no inspection equivalent and are
+    # always entered by hand. A walk-in ODS (no scheduled_at) must reference
+    # an existing unlinked inspection for this vehicle here; one scheduled
+    # ahead via "Agendar Orden de Servicio" can't know it yet (the vehicle
+    # isn't there), so inspection_id may be omitted and gets linked later,
+    # from the order detail screen, once it arrives.
     inspection_id: uuid.UUID | None = None
-    customer_reason: str = Field(min_length=1, max_length=2000)
+    customer_reason: str | None = Field(default=None, min_length=1, max_length=2000)
     advisor_user_id: uuid.UUID
     promised_at: date
     notes: str | None = None
@@ -132,9 +134,21 @@ class ServiceOrderRead(BaseModel):
     completed_override_at: datetime | None
 
 
+def _reject_manual_proveedor_payer(cls, value: ServiceOrderPayer) -> ServiceOrderPayer:
+    if value == ServiceOrderPayer.PROVEEDOR:
+        raise ValueError(
+            "El proveedor ya no puede asignarse manualmente como responsable de pago; "
+            "se asigna automáticamente solo al convertir un reclamo de garantía de tipo "
+            "'Repuesto — proveedor'."
+        )
+    return value
+
+
 class TaskCreate(BaseModel):
     tempario_id: uuid.UUID
     payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE
+
+    _validate_payer = field_validator("payer")(_reject_manual_proveedor_payer)
 
 
 class TaskStatusUpdate(BaseModel):
@@ -143,6 +157,8 @@ class TaskStatusUpdate(BaseModel):
 
 class TaskPayerUpdate(BaseModel):
     payer: ServiceOrderPayer
+
+    _validate_payer = field_validator("payer")(_reject_manual_proveedor_payer)
 
 
 class TaskRead(BaseModel):
@@ -161,9 +177,17 @@ class TransferLineInput(BaseModel):
     quantity: int = Field(ge=1)
     payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE
 
+    _validate_payer = field_validator("payer")(_reject_manual_proveedor_payer)
+
 
 class TransferLinePayerUpdate(BaseModel):
     payer: ServiceOrderPayer
+
+    _validate_payer = field_validator("payer")(_reject_manual_proveedor_payer)
+
+
+class TransferLineQuantityUpdate(BaseModel):
+    quantity: int = Field(ge=1)
 
 
 class TransferLineRead(BaseModel):
@@ -183,6 +207,8 @@ class TransferRead(BaseModel):
     subtotal: float | None
     fulfilled_by_user_id: uuid.UUID | None = None
     fulfilled_at: datetime | None = None
+    completed_by_user_id: uuid.UUID | None = None
+    completed_at: datetime | None = None
     created_at: datetime
 
 
