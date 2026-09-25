@@ -88,15 +88,41 @@ class ServiceOrder(Base):
         UUID(as_uuid=True), ForeignKey("bays.id", ondelete="SET NULL"), nullable=True
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Only ever set when order_type is garantia_fabrica/comeback/campana — the
+    # existing, authorized WarrantyClaim (same vehicle, matching claim_type)
+    # this order was opened for. Distinct from WarrantyClaim.resulting_service_order_id,
+    # which is the automatic "Convertir a ODS" path's own one-way link.
+    warranty_claim_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_claims.id", ondelete="SET NULL"), nullable=True
+    )
+    # Live selection while the order is open — one policy for labor, one for
+    # parts, applied to the whole ODS (not per task). Editable only until
+    # invoiced: require_editable_order() already blocks any change past
+    # that point. The actual freeze happens in the WorkshopWarranty rows
+    # BillingService.issue() creates from whatever is selected here at that
+    # moment, not in a snapshot on this row.
+    labor_warranty_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="SET NULL"), nullable=True
+    )
+    parts_warranty_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="SET NULL"), nullable=True
+    )
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     intake_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
     customer_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
-    promised_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Labeled "Fecha de inicio de ODS" in the UI — a date + 30-minute time
+    # slot (picked the same way as scheduled_at's "Hora" select), not just a date.
+    promised_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set the moment the order first becomes completado — never cleared,
+    # since completado can only ever move forward to orden_cerrada (see
+    # ALLOWED_TRANSITIONS). Lets the frontend elapsed-time counter freeze
+    # here instead of ticking forever past completion.
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discount_label: Mapped[str] = mapped_column(
         String(60),
         nullable=False,

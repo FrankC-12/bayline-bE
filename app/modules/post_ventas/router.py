@@ -17,6 +17,9 @@ from app.modules.post_ventas.schemas import (
     VehicleWarrantyBulkResult,
     VehicleWarrantyCreate,
     VehicleWarrantyRead,
+    WarrantyPolicyCreate,
+    WarrantyPolicyRead,
+    WarrantyPolicyUpdate,
     WorkshopWarrantyRead,
 )
 from app.modules.post_ventas.service import PostVentasService
@@ -198,3 +201,54 @@ async def list_workshop_warranties_by_vin(
 ) -> list[WorkshopWarrantyRead]:
     await _ensure_access(current_user, filial_id, service.db)
     return await service.list_workshop_warranties_by_vin(filial_id, vin)
+
+
+# Warranty policies — catalog selected on an ODS (see service_orders'
+# labor_warranty_policy_id/parts_warranty_policy_id), never hard-deleted.
+
+
+@router.get("/warranty-policies", response_model=list[WarrantyPolicyRead])
+async def list_warranty_policies(
+    filial_id: uuid.UUID = Query(...),
+    search: str | None = Query(default=None),
+    policy_status: str | None = Query(default=None),
+    applies_to: str | None = Query(default=None),
+    covered_by: str | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> list[WarrantyPolicyRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_warranty_policies(filial_id, search, policy_status, applies_to, covered_by)
+
+
+@router.get("/warranty-policies/{policy_id}", response_model=WarrantyPolicyRead)
+async def get_warranty_policy(
+    policy_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> WarrantyPolicyRead:
+    policy = await service.get_warranty_policy(policy_id)
+    await _ensure_access(current_user, policy.filial_id, service.db)
+    return policy
+
+
+@router.post("/warranty-policies", response_model=WarrantyPolicyRead, status_code=status.HTTP_201_CREATED)
+async def create_warranty_policy(
+    payload: WarrantyPolicyCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> WarrantyPolicyRead:
+    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_warranty_policy(payload)
+
+
+@router.patch("/warranty-policies/{policy_id}", response_model=WarrantyPolicyRead)
+async def update_warranty_policy(
+    policy_id: uuid.UUID,
+    payload: WarrantyPolicyUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> WarrantyPolicyRead:
+    existing = await service.get_warranty_policy(policy_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.update_warranty_policy(policy_id, payload)

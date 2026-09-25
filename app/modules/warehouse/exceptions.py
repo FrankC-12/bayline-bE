@@ -13,6 +13,14 @@ class PartLotNotFoundError(NotFoundError):
         super().__init__(f"Part lot '{lot_id}' was not found.", error_code="part_lot_not_found")
 
 
+class NoStockAtWarehouseError(NotFoundError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Este repuesto no tiene existencia en este almacén.",
+            error_code="no_stock_at_warehouse",
+        )
+
+
 class StockInReasonNotFoundError(NotFoundError):
     def __init__(self, reason_id: str) -> None:
         super().__init__(

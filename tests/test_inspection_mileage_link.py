@@ -5,7 +5,7 @@ the inspection's mileage onto the order."""
 
 import os
 import uuid
-from datetime import date
+from datetime import datetime
 
 os.environ["DEBUG"] = "false"
 
@@ -41,7 +41,7 @@ async def _make_scheduled_order(service: ServiceOrderService, vehicle_id: uuid.U
             vehicle_id=vehicle_id,
             customer_reason="Mantenimiento programado",
             advisor_user_id=uuid.uuid4(),
-            promised_at=date(2026, 9, 10),
+            promised_at=datetime(2026, 9, 10, 9, 0),
             scheduled_at="2026-09-15T10:00:00+00:00",
         )
     )

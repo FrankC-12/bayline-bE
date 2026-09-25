@@ -10,6 +10,7 @@ from app.modules.warehouse.schemas import (
     BulkLotCreate,
     BulkLotReview,
     BulkLotResult,
+    InventoryLocationUpdate,
     InventoryRow,
     PartLotDetailRead,
     PartLotRead,
@@ -114,6 +115,22 @@ async def get_inventory(
 ) -> list[InventoryRow]:
     await _ensure_access(current_user, filial_id, service.db)
     return await service.get_inventory(filial_id, warehouse_id, search, part_id)
+
+
+@router.patch("/almacen/inventory/location", response_model=InventoryRow)
+async def update_inventory_location(
+    payload: InventoryLocationUpdate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> InventoryRow:
+    """Edits a part's shelf location within one warehouse (see
+    AlmacenService.set_inventory_location for why this writes to every
+    in-stock lot rather than a single field)."""
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    return await service.set_inventory_location(
+        filial_id, payload.part_id, payload.warehouse_id, payload.location
+    )
 
 
 @router.get("/almacen/lots", response_model=list[PartLotRead])

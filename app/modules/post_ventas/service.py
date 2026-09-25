@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
 from app.modules.exchange_rates.models import ExchangeRate
+from app.modules.parts.models import Part
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
 from app.modules.post_ventas.enums import CATEGORY_PREFIXES, TemparioCategory, VehicleWarrantySource
 from app.modules.post_ventas.exceptions import (
@@ -16,6 +17,7 @@ from app.modules.post_ventas.exceptions import (
     TemparioNotFoundError,
     VehicleWarrantyAlreadyExistsError,
     VehicleWarrantyNotFoundError,
+    WarrantyPolicyNotFoundError,
 )
 from app.modules.post_ventas.models import (
     LaborSettings,
@@ -24,6 +26,9 @@ from app.modules.post_ventas.models import (
     Tempario,
     TemparioPart,
     VehicleWarranty,
+    WarrantyPolicy,
+    WarrantyPolicyPart,
+    WarrantyPolicyTempario,
     WorkshopWarranty,
 )
 from app.modules.post_ventas.schemas import (
@@ -40,6 +45,11 @@ from app.modules.post_ventas.schemas import (
     VehicleWarrantyBulkItem,
     VehicleWarrantyCreate,
     VehicleWarrantyRead,
+    WarrantyPolicyCreate,
+    WarrantyPolicyPartRead,
+    WarrantyPolicyRead,
+    WarrantyPolicyTemparioRead,
+    WarrantyPolicyUpdate,
     WorkshopWarrantyRead,
 )
 
@@ -120,6 +130,38 @@ def _plan_to_read(plan: MaintenancePlan) -> MaintenancePlanRead:
         entries=[_plan_entry_to_read(e) for e in entries],
         created_at=plan.created_at,
         updated_at=plan.updated_at,
+    )
+
+
+def _warranty_policy_to_read(policy: WarrantyPolicy) -> WarrantyPolicyRead:
+    return WarrantyPolicyRead(
+        id=policy.id,
+        filial_id=policy.filial_id,
+        name=policy.name,
+        applies_to=policy.applies_to,
+        covered_by=policy.covered_by,
+        scope=policy.scope,
+        no_expiration=policy.no_expiration,
+        duration_days=policy.duration_days,
+        duration_km=policy.duration_km,
+        status=policy.status,
+        temparios=[
+            WarrantyPolicyTemparioRead(
+                id=link.id,
+                tempario_id=link.tempario_id,
+                tempario_code=link.tempario.code,
+                tempario_name=link.tempario.name,
+            )
+            for link in policy.temparios
+        ],
+        parts=[
+            WarrantyPolicyPartRead(
+                id=link.id, part_id=link.part_id, part_code=link.part.code, part_name=link.part.name
+            )
+            for link in policy.parts
+        ],
+        created_at=policy.created_at,
+        updated_at=policy.updated_at,
     )
 
 
@@ -608,8 +650,9 @@ class PostVentasService:
         return warranty
 
     def workshop_warranty_to_read(self, w: WorkshopWarranty) -> WorkshopWarrantyRead:
-        status = "vencida" if w.expires_at < date.today() else "vigente"
-        days_remaining = max((w.expires_at - date.today()).days, 0)
+        # expires_at is null for a "sin vencimiento" policy — never expires.
+        status = "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
+        days_remaining = max((w.expires_at - date.today()).days, 0) if w.expires_at is not None else None
         return WorkshopWarrantyRead(
             id=w.id,
             filial_id=w.filial_id,
@@ -625,6 +668,9 @@ class PostVentasService:
             duration_km=w.duration_km,
             expires_at=w.expires_at,
             expiration_mileage=w.expiration_mileage,
+            warranty_policy_id=w.warranty_policy_id,
+            warranty_policy_name_snapshot=w.warranty_policy_name_snapshot,
+            covered_by_snapshot=w.covered_by_snapshot,
             status=status,
             days_remaining=days_remaining,
             created_at=w.created_at,
@@ -637,3 +683,151 @@ class PostVentasService:
             .order_by(WorkshopWarranty.created_at.desc())
         )
         return [self.workshop_warranty_to_read(w) for w in result.scalars()]
+
+    # Warranty policies
+
+    async def _get_warranty_policy_model(self, policy_id: uuid.UUID) -> WarrantyPolicy:
+        # populate_existing: same reasoning as _get_plan_model — update_warranty_policy
+        # re-reads this same identity-mapped row after replacing its links.
+        query = (
+            select(WarrantyPolicy)
+            .options(
+                selectinload(WarrantyPolicy.temparios).selectinload(WarrantyPolicyTempario.tempario),
+                selectinload(WarrantyPolicy.parts).selectinload(WarrantyPolicyPart.part),
+            )
+            .where(WarrantyPolicy.id == policy_id)
+            .execution_options(populate_existing=True)
+        )
+        result = await self.db.execute(query)
+        policy = result.scalar_one_or_none()
+        if policy is None:
+            raise WarrantyPolicyNotFoundError(str(policy_id))
+        return policy
+
+    async def _ensure_parts_belong(self, filial_id: uuid.UUID, part_ids: set[uuid.UUID]) -> None:
+        if not part_ids:
+            return
+        result = await self.db.execute(
+            select(func.count()).select_from(Part).where(Part.id.in_(part_ids), Part.filial_id == filial_id)
+        )
+        if result.scalar_one() != len(part_ids):
+            raise BadRequestError("Uno o más repuestos no pertenecen a esta filial.")
+
+    async def list_warranty_policies(
+        self,
+        filial_id: uuid.UUID,
+        search: str | None = None,
+        status: str | None = None,
+        applies_to: str | None = None,
+        covered_by: str | None = None,
+    ) -> list[WarrantyPolicyRead]:
+        query = (
+            select(WarrantyPolicy)
+            .options(
+                selectinload(WarrantyPolicy.temparios).selectinload(WarrantyPolicyTempario.tempario),
+                selectinload(WarrantyPolicy.parts).selectinload(WarrantyPolicyPart.part),
+            )
+            .where(WarrantyPolicy.filial_id == filial_id)
+            .order_by(WarrantyPolicy.name)
+        )
+        if status:
+            query = query.where(WarrantyPolicy.status == status)
+        if applies_to:
+            query = query.where(WarrantyPolicy.applies_to == applies_to)
+        if covered_by:
+            query = query.where(WarrantyPolicy.covered_by == covered_by)
+        result = await self.db.execute(query)
+        policies = list(result.scalars().all())
+
+        if search:
+            term = search.lower()
+            policies = [p for p in policies if term in p.name.lower()]
+
+        return [_warranty_policy_to_read(p) for p in policies]
+
+    async def get_warranty_policy(self, policy_id: uuid.UUID) -> WarrantyPolicyRead:
+        policy = await self._get_warranty_policy_model(policy_id)
+        return _warranty_policy_to_read(policy)
+
+    async def create_warranty_policy(self, payload: WarrantyPolicyCreate) -> WarrantyPolicyRead:
+        await self._ensure_temparios_belong(payload.filial_id, set(payload.tempario_ids))
+        await self._ensure_parts_belong(payload.filial_id, set(payload.part_ids))
+
+        policy = WarrantyPolicy(
+            filial_id=payload.filial_id,
+            name=payload.name,
+            applies_to=payload.applies_to,
+            covered_by=payload.covered_by,
+            scope=payload.scope,
+            no_expiration=payload.no_expiration,
+            duration_days=payload.duration_days,
+            duration_km=payload.duration_km,
+            status=payload.status,
+        )
+        self.db.add(policy)
+        await self.db.flush()
+
+        for tempario_id in payload.tempario_ids:
+            self.db.add(WarrantyPolicyTempario(policy_id=policy.id, tempario_id=tempario_id))
+        for part_id in payload.part_ids:
+            self.db.add(WarrantyPolicyPart(policy_id=policy.id, part_id=part_id))
+
+        await self.db.commit()
+        return await self.get_warranty_policy(policy.id)
+
+    async def update_warranty_policy(
+        self, policy_id: uuid.UUID, payload: WarrantyPolicyUpdate
+    ) -> WarrantyPolicyRead:
+        policy = await self._get_warranty_policy_model(policy_id)
+
+        if payload.tempario_ids is not None:
+            await self._ensure_temparios_belong(policy.filial_id, set(payload.tempario_ids))
+        if payload.part_ids is not None:
+            await self._ensure_parts_belong(policy.filial_id, set(payload.part_ids))
+
+        if payload.name is not None:
+            policy.name = payload.name
+        if payload.applies_to is not None:
+            policy.applies_to = payload.applies_to
+        if payload.covered_by is not None:
+            policy.covered_by = payload.covered_by
+        if payload.scope is not None:
+            policy.scope = payload.scope
+        if payload.no_expiration is not None:
+            policy.no_expiration = payload.no_expiration
+        if payload.clear_duration_days:
+            policy.duration_days = None
+        elif payload.duration_days is not None:
+            policy.duration_days = payload.duration_days
+        if payload.clear_duration_km:
+            policy.duration_km = None
+        elif payload.duration_km is not None:
+            policy.duration_km = payload.duration_km
+        if payload.status is not None:
+            policy.status = payload.status
+
+        if policy.no_expiration and (policy.duration_days is not None or policy.duration_km is not None):
+            raise BadRequestError(
+                "Una política sin vencimiento no debe tener días ni kilómetros de vigencia."
+            )
+        if not policy.no_expiration and policy.duration_days is None and policy.duration_km is None:
+            raise BadRequestError(
+                "Define los días y/o kilómetros de vigencia, o marca la política como sin vencimiento."
+            )
+
+        if payload.tempario_ids is not None:
+            for existing in list(policy.temparios):
+                await self.db.delete(existing)
+            await self.db.flush()
+            for tempario_id in payload.tempario_ids:
+                self.db.add(WarrantyPolicyTempario(policy_id=policy.id, tempario_id=tempario_id))
+
+        if payload.part_ids is not None:
+            for existing in list(policy.parts):
+                await self.db.delete(existing)
+            await self.db.flush()
+            for part_id in payload.part_ids:
+                self.db.add(WarrantyPolicyPart(policy_id=policy.id, part_id=part_id))
+
+        await self.db.commit()
+        return await self.get_warranty_policy(policy_id)

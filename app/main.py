@@ -28,6 +28,7 @@ from app.modules.vehicle_catalog.router import router as vehicle_catalog_router
 from app.modules.warehouse.router import router as almacen_router
 from app.modules.concesionario.router import router as concesionario_router
 from app.modules.administracion.router import router as administracion_router
+from app.modules.compras.router import router as compras_router
 from app.modules.kpis.router import router as kpis_router
 from app.modules.exchange_rates.router import router as exchange_rates_router
 from app.modules.exchange_rates.service import ExchangeRateService
@@ -96,6 +97,7 @@ app.include_router(vehicle_catalog_router, prefix=settings.api_v1_prefix)
 app.include_router(almacen_router, prefix=settings.api_v1_prefix)
 app.include_router(concesionario_router, prefix=settings.api_v1_prefix)
 app.include_router(administracion_router, prefix=settings.api_v1_prefix)
+app.include_router(compras_router, prefix=settings.api_v1_prefix)
 app.include_router(kpis_router, prefix=settings.api_v1_prefix)
 app.include_router(exchange_rates_router, prefix=settings.api_v1_prefix)
 

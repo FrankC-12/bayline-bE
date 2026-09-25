@@ -18,8 +18,14 @@ from test_parts_discounts import order_inventory as discount_inventory
 
 from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
-from app.modules.post_ventas.enums import TemparioCategory, WorkshopWarrantyCoverage
-from app.modules.post_ventas.models import Tempario, TemparioPart, WorkshopWarranty
+from app.modules.post_ventas.enums import (
+    TemparioCategory,
+    WarrantyPolicyAppliesTo,
+    WarrantyPolicyCoveredBy,
+    WarrantyPolicyScope,
+    WorkshopWarrantyCoverage,
+)
+from app.modules.post_ventas.models import Tempario, TemparioPart, WarrantyPolicy, WorkshopWarranty
 from app.modules.post_ventas.service import PostVentasService
 from app.modules.service_orders.enums import ServiceOrderStatus
 from app.modules.service_orders.models import ServiceOrderTask
@@ -296,3 +302,95 @@ async def test_labor_and_parts_terms_can_differ(ready):
     assert parts.duration_days == 365 and parts.duration_km == 50000
     assert parts.expires_at == starts_at + timedelta(days=365)
     assert parts.expiration_mileage == 60000
+
+
+@pytest.mark.asyncio
+async def test_selected_labor_policy_overrides_settings(ready):
+    service, session, order, part_id, lots, billing, accounts, settings = ready
+    vehicle = session.get(Vehicle, order.vehicle_id)
+    vehicle.vin = "1HGCM82633A123456"
+    order.intake_mileage = 10000
+    settings.workshop_warranty_days = 90
+    settings.workshop_warranty_km = 5000
+
+    policy = WarrantyPolicy(
+        filial_id=order.filial_id, name="Estándar de taller",
+        applies_to=WarrantyPolicyAppliesTo.MANO_DE_OBRA, covered_by=WarrantyPolicyCoveredBy.LA_CASA,
+        scope=WarrantyPolicyScope.PIEZA_MAS_INSTALACION, duration_days=30, duration_km=2000,
+    )
+    session.add(policy)
+    session.commit()
+    order.labor_warranty_policy_id = policy.id
+
+    add_two_tasks(session, order)
+    order.status = ServiceOrderStatus.COMPLETADO
+    session.commit()
+
+    payload = await invoice_payload(billing, order, accounts)
+    invoice = await billing.issue(order.id, payload, None)
+
+    warranties = workshop_warranties_for(session, order.id)
+    assert len(warranties) == 2
+    for w in warranties:
+        assert w.duration_days == 30
+        assert w.duration_km == 2000
+        assert w.expires_at == invoice.issued_at.date() + timedelta(days=30)
+        assert w.expiration_mileage == 12000
+        assert w.warranty_policy_id == policy.id
+        assert w.warranty_policy_name_snapshot == "Estándar de taller"
+        assert w.covered_by_snapshot == WarrantyPolicyCoveredBy.LA_CASA
+
+
+@pytest.mark.asyncio
+async def test_no_expiration_policy_yields_null_expiry_and_stays_vigente(ready):
+    service, session, order, part_id, lots, billing, accounts, settings = ready
+    vehicle = session.get(Vehicle, order.vehicle_id)
+    vehicle.vin = "1HGCM82633A123456"
+    order.intake_mileage = 10000
+
+    policy = WarrantyPolicy(
+        filial_id=order.filial_id, name="Campaña recall",
+        applies_to=WarrantyPolicyAppliesTo.MANO_DE_OBRA, covered_by=WarrantyPolicyCoveredBy.FABRICA_IMPORTADOR,
+        scope=WarrantyPolicyScope.SOLO_PIEZA, no_expiration=True, duration_days=None, duration_km=None,
+    )
+    session.add(policy)
+    session.commit()
+    order.labor_warranty_policy_id = policy.id
+
+    add_two_tasks(session, order)
+    order.status = ServiceOrderStatus.COMPLETADO
+    session.commit()
+
+    payload = await invoice_payload(billing, order, accounts)
+    await billing.issue(order.id, payload, None)
+
+    warranties = workshop_warranties_for(session, order.id)
+    assert all(w.expires_at is None for w in warranties)
+    assert all(w.duration_days is None and w.duration_km is None for w in warranties)
+    assert all(w.expiration_mileage is None for w in warranties)
+    assert all(w.covered_by_snapshot == WarrantyPolicyCoveredBy.FABRICA_IMPORTADOR for w in warranties)
+
+    post_ventas = PostVentasService(service.db)
+    reads = await post_ventas.list_workshop_warranties_by_vin(order.filial_id, vehicle.vin)
+    assert all(r.status == "vigente" for r in reads)
+    assert all(r.days_remaining is None for r in reads)
+
+
+@pytest.mark.asyncio
+async def test_no_policy_selected_keeps_using_labor_settings_fallback(ready):
+    service, session, order, part_id, lots, billing, accounts, settings = ready
+    vehicle = session.get(Vehicle, order.vehicle_id)
+    vehicle.vin = "1HGCM82633A123456"
+    settings.workshop_warranty_days = 77
+    settings.workshop_warranty_km = 4000
+    add_two_tasks(session, order)
+    order.status = ServiceOrderStatus.COMPLETADO
+    session.commit()
+
+    payload = await invoice_payload(billing, order, accounts)
+    await billing.issue(order.id, payload, None)
+
+    warranties = workshop_warranties_for(session, order.id)
+    assert all(w.duration_days == 77 and w.duration_km == 4000 for w in warranties)
+    assert all(w.warranty_policy_id is None for w in warranties)
+    assert all(w.covered_by_snapshot is None for w in warranties)

@@ -258,3 +258,9 @@ class InventoryRow(BaseModel):
     fifo_unit_cost: float | None
     location: str | None
     min_stock: int
+
+
+class InventoryLocationUpdate(BaseModel):
+    part_id: uuid.UUID
+    warehouse_id: uuid.UUID
+    location: str | None = Field(default=None, max_length=30)

@@ -9,6 +9,7 @@ from app.modules.warehouse.enums import MovementReason, MovementType, TransferSt
 from app.modules.warehouse.exceptions import (
     InsufficientStockError,
     InvalidTransferStatusTransitionError,
+    NoStockAtWarehouseError,
     PartLotNotFoundError,
     SameWarehouseError,
     StockInReasonNameAlreadyExistsError,
@@ -596,6 +597,38 @@ class AlmacenService:
 
         rows.sort(key=lambda r: (r.part_name, r.warehouse_name))
         return rows
+
+    async def set_inventory_location(
+        self, filial_id: uuid.UUID, part_id: uuid.UUID, warehouse_id: uuid.UUID, location: str | None
+    ) -> InventoryRow:
+        """Edits where a part sits in a warehouse — e.g. "Estante A3". Since
+        location isn't its own field (get_inventory derives it from the most
+        recently received lot that has one, see the docstring there), the
+        edit writes to every lot of this part still in stock at this
+        warehouse, not just the newest — otherwise the edit would silently
+        "revert" the moment an older lot with stale stock became the one
+        left with quantity_remaining once the newest lot sold out. A future
+        stock-in that itself sets a location still wins, which is correct:
+        that's a real relocation, not an unrelated write clobbering this one."""
+        result = await self.db.execute(
+            select(PartLot).where(
+                PartLot.filial_id == filial_id,
+                PartLot.part_id == part_id,
+                PartLot.warehouse_id == warehouse_id,
+                PartLot.quantity_remaining > 0,
+            )
+        )
+        lots = list(result.scalars().all())
+        if not lots:
+            raise NoStockAtWarehouseError()
+
+        clean_location = location.strip() if location and location.strip() else None
+        for lot in lots:
+            lot.location = clean_location
+        await self.db.commit()
+
+        rows = await self.get_inventory(filial_id, warehouse_id, part_id=part_id)
+        return rows[0]
 
     async def get_average_cost(
         self, part_id: uuid.UUID, warehouse_id: uuid.UUID | None = None

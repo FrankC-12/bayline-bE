@@ -19,6 +19,7 @@ from app.modules.service_orders.billing_schemas import (
     ReceivableRead,
 )
 from app.modules.service_orders.enums import ReworkFailureCategory, ServiceOrderStatus, WarrantyClaimStatus, WarrantyClaimType
+from app.modules.service_orders.exceptions import TaskAndTechnicianRequiredError
 from app.modules.service_orders.schemas import (
     BayCreate,
     BayRead,
@@ -279,9 +280,20 @@ async def add_transfer_line(
     service: ServiceOrderService = Depends(get_service),
 ) -> OrderSummary:
     """Adds a part line to the order's pending ODT (creating one if needed) and
-    returns the refreshed summary."""
+    returns the refreshed summary. Blocked (see TaskAndTechnicianRequiredError)
+    until the order has at least one task and an assigned técnico — checked
+    here, not in the service method, so the automatic warranty-claim-to-order
+    conversion (which can add a transfer line before a técnico is ever
+    assigned) stays unaffected."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    from app.modules.service_orders.guards import require_editable_order
+
+    await require_editable_order(service.db, order_id)
+    missing_task = not await service.list_tasks(order_id)
+    missing_technician = order.technician_user_id is None
+    if missing_task or missing_technician:
+        raise TaskAndTechnicianRequiredError(missing_task, missing_technician)
     transfer = await service.add_transfer_line(order_id, payload.part_id, payload.quantity, payer=payload.payer)
     summary = await service.get_order_summary(order_id)
     summary.warnings = getattr(transfer, "stock_warnings", [])

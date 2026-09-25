@@ -22,6 +22,10 @@ from app.modules.post_ventas.enums import (
     CATEGORY_PREFIXES,
     TemparioCategory,
     VehicleWarrantySource,
+    WarrantyPolicyAppliesTo,
+    WarrantyPolicyCoveredBy,
+    WarrantyPolicyScope,
+    WarrantyPolicyStatus,
     WorkshopWarrantyCoverage,
 )
 
@@ -289,11 +293,113 @@ class WorkshopWarranty(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     starts_at: Mapped[date] = mapped_column(Date, nullable=False)
-    # The settings values actually used, snapshotted so a later Ajustes
-    # change never retroactively rewrites an already-issued warranty.
-    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
-    duration_km: Mapped[int] = mapped_column(Integer, nullable=False)
-    expires_at: Mapped[date] = mapped_column(Date, nullable=False)
-    # Null only when the order never recorded an intake mileage.
+    # The settings/policy values actually used, snapshotted so a later
+    # Ajustes change or WarrantyPolicy edit never retroactively rewrites an
+    # already-issued warranty. Null when the policy selected (if any) has
+    # no_expiration=True — a campaign-style warranty with no cutoff.
+    duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Null only when the order never recorded an intake mileage, or the
+    # applicable duration_km is itself null (no-expiration policy).
     expiration_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Traceability only, never re-read for terms (those are snapshotted
+    # above) — set only when a WarrantyPolicy was selected on the ODS;
+    # null means this warranty used the filial's LaborSettings fallback.
+    warranty_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="SET NULL"), nullable=True
+    )
+    warranty_policy_name_snapshot: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    covered_by_snapshot: Mapped[WarrantyPolicyCoveredBy | None] = mapped_column(
+        Enum(WarrantyPolicyCoveredBy, name="warranty_policy_covered_by"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class WarrantyPolicy(Base):
+    """A named, reusable warranty policy an advisor selects on an ODS (one
+    for labor, one for parts) — replaces the old implicit "every order gets
+    the filial's LaborSettings term" behavior with an explicit, catalogued
+    choice. Never hard-deleted: `status` is toggled to INACTIVA instead,
+    since issued WorkshopWarranty rows may still reference it (see
+    `warranty_policy_id` there) even after it's retired."""
+
+    __tablename__ = "warranty_policies"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filial_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    applies_to: Mapped[WarrantyPolicyAppliesTo] = mapped_column(
+        Enum(WarrantyPolicyAppliesTo, name="warranty_policy_applies_to"), nullable=False
+    )
+    covered_by: Mapped[WarrantyPolicyCoveredBy] = mapped_column(
+        Enum(WarrantyPolicyCoveredBy, name="warranty_policy_covered_by"), nullable=False
+    )
+    scope: Mapped[WarrantyPolicyScope] = mapped_column(
+        Enum(WarrantyPolicyScope, name="warranty_policy_scope"), nullable=False
+    )
+    # Vigencia: either "sin vencimiento" (campaigns — both durations null)
+    # or at least one of duration_days/duration_km, whichever comes first —
+    # enforced by the create/update schema, not here.
+    no_expiration: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duration_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[WarrantyPolicyStatus] = mapped_column(
+        Enum(WarrantyPolicyStatus, name="warranty_policy_status"),
+        nullable=False,
+        default=WarrantyPolicyStatus.ACTIVA,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    temparios: Mapped[list["WarrantyPolicyTempario"]] = relationship(
+        back_populates="policy", cascade="all, delete-orphan"
+    )
+    parts: Mapped[list["WarrantyPolicyPart"]] = relationship(
+        back_populates="policy", cascade="all, delete-orphan"
+    )
+
+
+class WarrantyPolicyTempario(Base):
+    """Informational link: which temparios this policy is documented to
+    cover — shown on the policy's detail screen, does not restrict which
+    policies an ODS can select (confirmed with the user)."""
+
+    __tablename__ = "warranty_policy_temparios"
+    __table_args__ = (
+        UniqueConstraint("policy_id", "tempario_id", name="uq_warranty_policy_tempario"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    policy_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tempario_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("temparios.id", ondelete="RESTRICT"), nullable=False
+    )
+
+    policy: Mapped["WarrantyPolicy"] = relationship(back_populates="temparios")
+    tempario: Mapped["Tempario"] = relationship(lazy="selectin")
+
+
+class WarrantyPolicyPart(Base):
+    """Informational link: which parts this policy is documented to cover —
+    same reasoning as WarrantyPolicyTempario."""
+
+    __tablename__ = "warranty_policy_parts"
+    __table_args__ = (UniqueConstraint("policy_id", "part_id", name="uq_warranty_policy_part"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    policy_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    part_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
+    )
+
+    policy: Mapped["WarrantyPolicy"] = relationship(back_populates="parts")
+    part: Mapped["Part"] = relationship(lazy="selectin")

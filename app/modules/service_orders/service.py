@@ -13,7 +13,8 @@ from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS, price_parts_cost
 from app.modules.parts.service import _sync_availability
-from app.modules.post_ventas.models import LaborSettings, Tempario
+from app.modules.post_ventas.enums import WarrantyPolicyAppliesTo, WarrantyPolicyStatus
+from app.modules.post_ventas.models import LaborSettings, Tempario, WarrantyPolicy
 from app.modules.service_orders.enums import (
     ReworkFailureCategory,
     ServiceOrderPayer,
@@ -43,7 +44,9 @@ from app.modules.service_orders.exceptions import (
     WarrantyClaimAlreadyDecidedError,
     WarrantyClaimNotAuthorizedError,
     WarrantyClaimNotFoundError,
+    WarrantyClaimOrderMismatchError,
     WarrantyClaimReferenceMismatchError,
+    WarrantyClaimRequiredForOrderTypeError,
     WarrantyOverrideNoteRequiredError,
 )
 from app.modules.service_orders.guards import require_editable_order
@@ -120,6 +123,14 @@ ACTIVE_STATUSES = [
     ServiceOrderStatus.COMPLETADO,
 ]
 HISTORY_STATUSES = [ServiceOrderStatus.ORDEN_CERRADA, ServiceOrderStatus.CANCELADO]
+
+# order_type values that require linking an existing, authorized WarrantyClaim
+# of the matching claim_type for the same vehicle — see create_order.
+CLAIM_LINKED_ORDER_TYPES: dict[ServiceOrderType, WarrantyClaimType] = {
+    ServiceOrderType.GARANTIA_FABRICA: WarrantyClaimType.FABRICA,
+    ServiceOrderType.COMEBACK: WarrantyClaimType.COMEBACK,
+    ServiceOrderType.CAMPANA: WarrantyClaimType.CAMPANA_RECALL,
+}
 
 
 def _incomplete_completion_message(
@@ -211,11 +222,33 @@ class ServiceOrderService:
                 error_code="customer_reason_required",
             )
 
+        # garantia_fabrica/comeback/campana must reference an existing,
+        # authorized claim for THIS vehicle, of the matching claim_type —
+        # otherwise "Reclamo" is meaningless metadata anyone could type.
+        required_claim_type = CLAIM_LINKED_ORDER_TYPES.get(payload.order_type)
+        if required_claim_type is not None:
+            if payload.warranty_claim_id is None:
+                raise WarrantyClaimRequiredForOrderTypeError()
+            claim = await self.db.get(WarrantyClaim, payload.warranty_claim_id)
+            if claim is None:
+                raise WarrantyClaimNotFoundError(str(payload.warranty_claim_id))
+            if claim.vehicle_id != payload.vehicle_id:
+                raise WarrantyClaimOrderMismatchError(
+                    "El reclamo seleccionado no corresponde al vehículo de esta orden."
+                )
+            if claim.claim_type != required_claim_type:
+                raise WarrantyClaimOrderMismatchError(
+                    "El reclamo seleccionado no corresponde al tipo de orden elegido."
+                )
+            if claim.status != WarrantyClaimStatus.AUTORIZADO:
+                raise WarrantyClaimOrderMismatchError("El reclamo seleccionado todavía no está autorizado.")
+
         next_seq = await self._next_sequence_number(payload.filial_id)
         order = ServiceOrder(
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
             order_type=payload.order_type,
+            warranty_claim_id=payload.warranty_claim_id if required_claim_type is not None else None,
             discount_label=payload.discount_label,
             notes=payload.notes,
             scheduled_at=payload.scheduled_at,
@@ -255,7 +288,14 @@ class ServiceOrderService:
             payload.status == ServiceOrderStatus.COMPLETADO and order.status != ServiceOrderStatus.COMPLETADO
         )
         if becoming_completado:
-            pending_tasks = [t for t in await self.list_tasks(order_id) if t.status != TaskStatus.COMPLETADA]
+            order.completed_at = datetime.now(UTC)
+            # A cancelada task was deliberately dropped, not left unfinished —
+            # it must not block closing the order any more than a completada one does.
+            pending_tasks = [
+                t
+                for t in await self.list_tasks(order_id)
+                if t.status not in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA)
+            ]
             # Only PENDIENTE (never dispatched) blocks closing — PEDIDO and
             # COMPLETADO have both already left the shelf, "!= PEDIDO" would
             # wrongly flag an already-Completado ODT as undispatched.
@@ -303,6 +343,24 @@ class ServiceOrderService:
             await self.get_bay(payload.bay_id)
             order.bay_id = payload.bay_id
 
+        if payload.clear_labor_warranty_policy:
+            order.labor_warranty_policy_id = None
+        elif payload.labor_warranty_policy_id is not None:
+            await self._validate_warranty_policy(
+                payload.labor_warranty_policy_id,
+                {WarrantyPolicyAppliesTo.MANO_DE_OBRA, WarrantyPolicyAppliesTo.AMBAS},
+            )
+            order.labor_warranty_policy_id = payload.labor_warranty_policy_id
+
+        if payload.clear_parts_warranty_policy:
+            order.parts_warranty_policy_id = None
+        elif payload.parts_warranty_policy_id is not None:
+            await self._validate_warranty_policy(
+                payload.parts_warranty_policy_id,
+                {WarrantyPolicyAppliesTo.REPUESTOS, WarrantyPolicyAppliesTo.AMBAS},
+            )
+            order.parts_warranty_policy_id = payload.parts_warranty_policy_id
+
         if payload.scheduled_at is not None:
             order.scheduled_at = payload.scheduled_at
 
@@ -312,6 +370,25 @@ class ServiceOrderService:
         await self.db.commit()
         await self.db.refresh(order)
         return order
+
+    async def _validate_warranty_policy(
+        self, policy_id: uuid.UUID, allowed_applies_to: set[WarrantyPolicyAppliesTo]
+    ) -> None:
+        policy = (
+            await self.db.execute(select(WarrantyPolicy).where(WarrantyPolicy.id == policy_id))
+        ).scalar_one_or_none()
+        if policy is None:
+            raise BadRequestError("La política de garantía seleccionada no existe.", error_code="warranty_policy_not_found")
+        if policy.status != WarrantyPolicyStatus.ACTIVA:
+            raise BadRequestError(
+                "Esa política de garantía está inactiva y no puede seleccionarse.",
+                error_code="warranty_policy_inactive",
+            )
+        if policy.applies_to not in allowed_applies_to:
+            raise BadRequestError(
+                "Esa política de garantía no aplica a este tipo de cobertura.",
+                error_code="warranty_policy_wrong_applies_to",
+            )
 
     async def close_order(
         self,
@@ -1657,7 +1734,7 @@ class ServiceOrderService:
             advisor_user_id=original_order.advisor_user_id if original_order else None,
             intake_mileage=intake_mileage,
             customer_reason=f"Retrabajo de garantía — {cause_label}",
-            promised_at=payload.promised_at or date.today(),
+            promised_at=payload.promised_at or datetime.now(UTC),
             sequence_number=next_seq,
         )
         self.db.add(new_order)

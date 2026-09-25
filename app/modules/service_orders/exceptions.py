@@ -49,6 +49,20 @@ class TransferLineNotEditableError(BadRequestError):
         )
 
 
+class TaskAndTechnicianRequiredError(BadRequestError):
+    def __init__(self, missing_task: bool, missing_technician: bool) -> None:
+        parts = []
+        if missing_task:
+            parts.append("una tarea agregada")
+        if missing_technician:
+            parts.append("un técnico asignado")
+        joined = " y ".join(parts)
+        super().__init__(
+            f"No se pueden pedir repuestos sin tener {joined} en la orden.",
+            error_code="task_and_technician_required",
+        )
+
+
 class UpsellNotFoundError(NotFoundError):
     def __init__(self, upsell_id: str) -> None:
         super().__init__(f"Upsell '{upsell_id}' was not found.", error_code="upsell_not_found")
@@ -105,6 +119,19 @@ class WarrantyClaimReferenceMismatchError(BadRequestError):
             "El servicio o el repuesto elegido no pertenece a esta orden.",
             error_code="warranty_claim_reference_mismatch",
         )
+
+
+class WarrantyClaimRequiredForOrderTypeError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Selecciona el reclamo asociado a esta orden.",
+            error_code="warranty_claim_required_for_order_type",
+        )
+
+
+class WarrantyClaimOrderMismatchError(BadRequestError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, error_code="warranty_claim_order_mismatch")
 
 
 class WarrantyClaimNotFoundError(NotFoundError):

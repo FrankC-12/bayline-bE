@@ -33,3 +33,10 @@ class VehicleWarrantyNotFoundError(NotFoundError):
         super().__init__(
             f"Vehicle warranty '{identifier}' was not found.", error_code="vehicle_warranty_not_found"
         )
+
+
+class WarrantyPolicyNotFoundError(NotFoundError):
+    def __init__(self, policy_id: str) -> None:
+        super().__init__(
+            f"Warranty policy '{policy_id}' was not found.", error_code="warranty_policy_not_found"
+        )

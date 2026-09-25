@@ -58,6 +58,22 @@ async def _ensure_access(
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
 
 
+# Suppliers / Compras a Proveedores / Reclamos a Proveedor moved to their own
+# "Compras" module — the underlying tables/service methods stayed in
+# administracion, only the permission gate changed. Same pattern as
+# MANUAL_MOVEMENTS_MODULE_ID below.
+COMPRAS_MODULE_ID = "compras"
+
+
+async def _ensure_compras_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, COMPRAS_MODULE_ID, level)
+
+
 # Suppliers
 
 
@@ -68,7 +84,7 @@ async def list_suppliers(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> list[SupplierRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_compras_access(current_user, filial_id, service.db)
     return await service.list_suppliers(filial_id, search)
 
 
@@ -78,7 +94,7 @@ async def create_supplier(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> SupplierRead:
-    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_supplier(payload)
 
 
@@ -89,7 +105,7 @@ async def get_supplier_detail(
     service: AdministracionService = Depends(get_service),
 ) -> SupplierDetailRead:
     existing = await service.get_supplier(supplier_id)
-    await _ensure_access(current_user, existing.filial_id, service.db)
+    await _ensure_compras_access(current_user, existing.filial_id, service.db)
     return await service.get_supplier_detail(supplier_id)
 
 
@@ -101,7 +117,7 @@ async def update_supplier(
     service: AdministracionService = Depends(get_service),
 ) -> SupplierRead:
     existing = await service.get_supplier(supplier_id)
-    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_supplier(supplier_id, payload)
 
 
@@ -115,7 +131,7 @@ async def list_purchase_requests(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> list[PurchaseRequestRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_compras_access(current_user, filial_id, service.db)
     return await service.list_requests(filial_id, search)
 
 
@@ -126,7 +142,7 @@ async def get_purchase_request(
     service: AdministracionService = Depends(get_service),
 ) -> PurchaseRequestRead:
     request = await service.get_request(request_id)
-    await _ensure_access(current_user, request.filial_id, service.db)
+    await _ensure_compras_access(current_user, request.filial_id, service.db)
     return request
 
 
@@ -136,7 +152,7 @@ async def create_purchase_request(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> PurchaseRequestRead:
-    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_request(payload)
 
 
@@ -148,7 +164,7 @@ async def update_purchase_request_status(
     service: AdministracionService = Depends(get_service),
 ) -> PurchaseRequestRead:
     existing = await service.get_request(request_id)
-    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_request_status(
         request_id, payload.status, payload.quotes, payload.warehouse_id, payload.location,
         current_user.user_id,
@@ -164,7 +180,7 @@ async def list_supplier_claims(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> list[SupplierClaimRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_compras_access(current_user, filial_id, service.db)
     return await service.list_claims(filial_id)
 
 
@@ -174,7 +190,7 @@ async def create_supplier_claim(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> SupplierClaimRead:
-    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_claim(payload)
 
 
@@ -186,7 +202,7 @@ async def update_supplier_claim(
     service: AdministracionService = Depends(get_service),
 ) -> SupplierClaimRead:
     existing = await service.get_claim(claim_id)
-    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_claim(claim_id, payload)
 
 
@@ -198,7 +214,7 @@ async def resolve_supplier_claim(
     service: AdministracionService = Depends(get_service),
 ) -> SupplierClaimRead:
     existing = await service.get_claim(claim_id)
-    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_compras_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.resolve_claim(claim_id, payload, current_user.user_id)
 
 

@@ -19,11 +19,23 @@ class ServiceOrderType(str, enum.Enum):
     # see ServiceOrderService.convert_warranty_claim_to_order. Never picked
     # by hand.
     RETRABAJO = "retrabajo"
+    # These three ARE picked by hand, at manual ODS creation — each requires
+    # linking an existing, authorized WarrantyClaim of the matching type for
+    # the same vehicle (ServiceOrder.warranty_claim_id). A separate path from
+    # RETRABAJO's automatic conversion: this lets an advisor open the ODS
+    # directly from intake and reference the claim, instead of going through
+    # "Convertir a ODS" from the Reclamos screen.
+    GARANTIA_FABRICA = "garantia_fabrica"
+    COMEBACK = "comeback"
+    CAMPANA = "campana"
 
 
 class TaskStatus(str, enum.Enum):
     PENDIENTE = "pendiente"
+    EN_ESPERA_DE_REPUESTOS = "en_espera_de_repuestos"
+    EN_PROGRESO = "en_progreso"
     COMPLETADA = "completada"
+    CANCELADA = "cancelada"
 
 
 class TransferStatus(str, enum.Enum):

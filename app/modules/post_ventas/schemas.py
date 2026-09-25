@@ -3,7 +3,15 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.modules.post_ventas.enums import TemparioCategory, VehicleWarrantySource, WorkshopWarrantyCoverage
+from app.modules.post_ventas.enums import (
+    TemparioCategory,
+    VehicleWarrantySource,
+    WarrantyPolicyAppliesTo,
+    WarrantyPolicyCoveredBy,
+    WarrantyPolicyScope,
+    WarrantyPolicyStatus,
+    WorkshopWarrantyCoverage,
+)
 
 
 class LaborSettingsUpdate(BaseModel):
@@ -244,10 +252,86 @@ class WorkshopWarrantyRead(BaseModel):
     tempario_name_snapshot: str
     technician_user_id: uuid.UUID | None
     starts_at: date
-    duration_days: int
-    duration_km: int
-    expires_at: date
+    duration_days: int | None
+    duration_km: int | None
+    expires_at: date | None
     expiration_mileage: int | None
+    warranty_policy_id: uuid.UUID | None
+    warranty_policy_name_snapshot: str | None
+    covered_by_snapshot: WarrantyPolicyCoveredBy | None
     status: str
-    days_remaining: int
+    days_remaining: int | None
     created_at: datetime
+
+
+class WarrantyPolicyCreate(BaseModel):
+    filial_id: uuid.UUID
+    name: str = Field(min_length=2, max_length=150)
+    applies_to: WarrantyPolicyAppliesTo
+    covered_by: WarrantyPolicyCoveredBy
+    scope: WarrantyPolicyScope
+    no_expiration: bool = False
+    duration_days: int | None = Field(default=None, ge=0)
+    duration_km: int | None = Field(default=None, ge=0)
+    status: WarrantyPolicyStatus = WarrantyPolicyStatus.ACTIVA
+    tempario_ids: list[uuid.UUID] = Field(default_factory=list)
+    part_ids: list[uuid.UUID] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_vigencia(self):
+        if self.no_expiration:
+            if self.duration_days is not None or self.duration_km is not None:
+                raise ValueError(
+                    "Una política sin vencimiento no debe tener días ni kilómetros de vigencia."
+                )
+        elif self.duration_days is None and self.duration_km is None:
+            raise ValueError(
+                "Define los días y/o kilómetros de vigencia, o marca la política como sin vencimiento."
+            )
+        return self
+
+
+class WarrantyPolicyUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=150)
+    applies_to: WarrantyPolicyAppliesTo | None = None
+    covered_by: WarrantyPolicyCoveredBy | None = None
+    scope: WarrantyPolicyScope | None = None
+    no_expiration: bool | None = None
+    duration_days: int | None = Field(default=None, ge=0)
+    duration_km: int | None = Field(default=None, ge=0)
+    clear_duration_days: bool = False
+    clear_duration_km: bool = False
+    status: WarrantyPolicyStatus | None = None
+    tempario_ids: list[uuid.UUID] | None = None
+    part_ids: list[uuid.UUID] | None = None
+
+
+class WarrantyPolicyTemparioRead(BaseModel):
+    id: uuid.UUID
+    tempario_id: uuid.UUID
+    tempario_code: str
+    tempario_name: str
+
+
+class WarrantyPolicyPartRead(BaseModel):
+    id: uuid.UUID
+    part_id: uuid.UUID
+    part_code: str
+    part_name: str
+
+
+class WarrantyPolicyRead(BaseModel):
+    id: uuid.UUID
+    filial_id: uuid.UUID
+    name: str
+    applies_to: WarrantyPolicyAppliesTo
+    covered_by: WarrantyPolicyCoveredBy
+    scope: WarrantyPolicyScope
+    no_expiration: bool
+    duration_days: int | None
+    duration_km: int | None
+    status: WarrantyPolicyStatus
+    temparios: list[WarrantyPolicyTemparioRead]
+    parts: list[WarrantyPolicyPartRead]
+    created_at: datetime
+    updated_at: datetime

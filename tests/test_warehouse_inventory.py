@@ -17,6 +17,7 @@ from test_part_sales_fifo import AsyncAdapter
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
 from app.modules.parts.models import Part
+from app.modules.warehouse.exceptions import NoStockAtWarehouseError
 from app.modules.warehouse.models import PartLot, Warehouse
 from app.modules.warehouse.service import AlmacenService
 
@@ -104,3 +105,71 @@ async def test_inventory_can_be_filtered_by_part_for_the_transfer_modal_hint(env
 
     assert {r.part_id for r in rows} == {part.id}
     assert sum(r.quantity for r in rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_editing_the_location_updates_every_in_stock_lot(env):
+    """Not just the newest lot — otherwise the edit would silently
+    "revert" once that lot sold out and an older, untouched lot became the
+    one left with stock."""
+    service, session, filial_id, warehouse, part = env
+
+    row = await service.set_inventory_location(filial_id, part.id, warehouse.id, "Estante A3")
+    assert row.location == "Estante A3"
+
+    lots = session.query(PartLot).filter(PartLot.part_id == part.id).all()
+    assert all(lot.location == "Estante A3" for lot in lots)
+
+
+@pytest.mark.asyncio
+async def test_location_edit_survives_the_newest_lot_selling_out(env):
+    service, session, filial_id, warehouse, part = env
+    await service.set_inventory_location(filial_id, part.id, warehouse.id, "Estante A3")
+
+    newest_lot = (
+        session.query(PartLot)
+        .filter(PartLot.part_id == part.id)
+        .order_by(PartLot.received_at.desc())
+        .first()
+    )
+    newest_lot.quantity_remaining = 0
+    session.commit()
+
+    rows = await service.get_inventory(filial_id, part_id=part.id)
+    assert rows[0].location == "Estante A3"
+
+
+@pytest.mark.asyncio
+async def test_a_later_stock_in_with_its_own_location_still_wins(env):
+    service, session, filial_id, warehouse, part = env
+    await service.set_inventory_location(filial_id, part.id, warehouse.id, "Estante A3")
+
+    session.add(
+        PartLot(
+            filial_id=filial_id, warehouse_id=warehouse.id, part_id=part.id,
+            quantity_received=1, quantity_remaining=1, unit_cost=15, location="Estante B1",
+            received_at=datetime(2026, 1, 5, tzinfo=UTC),
+        )
+    )
+    session.commit()
+
+    rows = await service.get_inventory(filial_id, part_id=part.id)
+    assert rows[0].location == "Estante B1"
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_location_sets_it_to_none(env):
+    service, _session, filial_id, warehouse, part = env
+    await service.set_inventory_location(filial_id, part.id, warehouse.id, "Estante A3")
+
+    row = await service.set_inventory_location(filial_id, part.id, warehouse.id, "")
+    assert row.location is None
+
+
+@pytest.mark.asyncio
+async def test_editing_the_location_of_a_part_with_no_stock_here_raises(env):
+    service, _session, filial_id, warehouse, part = env
+    other_warehouse_id = uuid.uuid4()
+
+    with pytest.raises(NoStockAtWarehouseError):
+        await service.set_inventory_location(filial_id, part.id, other_warehouse_id, "Estante A3")

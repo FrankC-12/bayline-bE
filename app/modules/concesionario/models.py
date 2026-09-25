@@ -35,6 +35,7 @@ class DealershipVehicle(Base):
     )
     brand: Mapped[str] = mapped_column(String(60), nullable=False)
     model: Mapped[str] = mapped_column(String(60), nullable=False)
+    version: Mapped[str | None] = mapped_column(String(60), nullable=True)
     year: Mapped[int] = mapped_column(Integer, nullable=False)
     color: Mapped[str | None] = mapped_column(String(40), nullable=True)
     fuel_type: Mapped[FuelType | None] = mapped_column(
@@ -50,10 +51,21 @@ class DealershipVehicle(Base):
     price_financed: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     cost_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     # Whether cost_price is an actual acquisition cost or a stand-in guess —
-    # there's no purchase-record subsystem behind vehicle cost yet, so this
-    # is the cheapest honest signal for "trust this margin or not" on the
-    # Rentabilidad screen's vehicle departments.
+    # true from reception (see ComprasService.add_reception) until the
+    # supplier invoice linked to the OC is registered and fixes the real
+    # cost, or a stand-in guess for a unit added by hand with no OC behind it.
     cost_is_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Traceability back to Compras — all three null for a unit added by hand
+    # (AddVehicleModal), all three set for one born from a reception.
+    purchase_order_line_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vehicle_purchase_order_lines.id", ondelete="SET NULL"), nullable=True
+    )
+    reception_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vehicle_purchase_order_receptions.id", ondelete="SET NULL"), nullable=True
+    )
+    purchase_order_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vehicle_purchase_order_invoices.id", ondelete="SET NULL"), nullable=True
+    )
     price_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     iva_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=16)
     igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=3)

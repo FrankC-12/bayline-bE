@@ -9,7 +9,7 @@ vehicle arrives, via InspectionService.update_inspection."""
 
 import os
 import uuid
-from datetime import date
+from datetime import datetime
 
 os.environ["DEBUG"] = "false"
 
@@ -54,7 +54,7 @@ def _payload(filial_id, vehicle_id, advisor_id, **overrides):
         "vehicle_id": vehicle_id,
         "customer_reason": "Ruido en frenos delanteros",
         "advisor_user_id": advisor_id,
-        "promised_at": date(2026, 9, 10),
+        "promised_at": datetime(2026, 9, 10, 9, 0),
     }
     fields.update(overrides)
     return ServiceOrderCreate(**fields)
@@ -72,7 +72,7 @@ def test_empty_customer_reason_is_rejected():
             vehicle_id=uuid.uuid4(),
             customer_reason="",
             advisor_user_id=uuid.uuid4(),
-            promised_at=date(2026, 9, 10),
+            promised_at=datetime(2026, 9, 10, 9, 0),
         )
 
 
@@ -98,12 +98,12 @@ async def test_create_order_inherits_mileage_from_inspection_and_links_it(env):
     assert order.intake_mileage == 15000
     assert order.customer_reason == "Ruido en frenos delanteros"
     assert order.advisor_user_id == advisor_id
-    assert order.promised_at == date(2026, 9, 10)
+    assert order.promised_at == datetime(2026, 9, 10, 9, 0)
     assert inspection.service_order_id == order.id
 
     read = ServiceOrderRead.model_validate(order)
     assert read.intake_mileage == 15000
-    assert read.promised_at == date(2026, 9, 10)
+    assert read.promised_at == datetime(2026, 9, 10, 9, 0)
 
 
 @pytest.mark.asyncio

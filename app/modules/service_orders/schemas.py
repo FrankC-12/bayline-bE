@@ -57,8 +57,14 @@ class ServiceOrderCreate(BaseModel):
     # from the order detail screen, once it arrives.
     inspection_id: uuid.UUID | None = None
     customer_reason: str | None = Field(default=None, min_length=1, max_length=2000)
+    # Required exactly when order_type is garantia_fabrica/comeback/campana —
+    # must be an AUTORIZADO WarrantyClaim for this same vehicle_id, of the
+    # matching claim_type (see ServiceOrderService.create_order).
+    warranty_claim_id: uuid.UUID | None = None
     advisor_user_id: uuid.UUID
-    promised_at: date
+    # "Fecha de inicio de ODS" — a date + 30-minute time slot, captured the
+    # same way as scheduled_at's "Hora" select.
+    promised_at: datetime
     notes: str | None = None
     # Used by "Agendar Orden de Servicio" in the Calendario view — optional
     # so a normal walk-in ODS (created from the kanban) can omit them.
@@ -81,6 +87,13 @@ class ServiceOrderUpdate(BaseModel):
     clear_technician: bool = False
     clear_advisor: bool = False
     clear_bay: bool = False
+    # One policy for labor, one for parts, applied to the whole ODS — "None"
+    # here means "leave unchanged", same convention as the other FKs above;
+    # use the matching clear_* flag to explicitly unset one.
+    labor_warranty_policy_id: uuid.UUID | None = None
+    parts_warranty_policy_id: uuid.UUID | None = None
+    clear_labor_warranty_policy: bool = False
+    clear_parts_warranty_policy: bool = False
     # Only meaningful when transitioning status to "completado" while a task
     # is still pendiente or an ODT hasn't been marked pedido — the server
     # decides whether that's actually the case, this just carries the
@@ -111,6 +124,9 @@ class ServiceOrderRead(BaseModel):
     vehicle_id: uuid.UUID
     status: ServiceOrderStatus
     order_type: ServiceOrderType
+    warranty_claim_id: uuid.UUID | None
+    labor_warranty_policy_id: uuid.UUID | None
+    parts_warranty_policy_id: uuid.UUID | None
     technician_user_id: uuid.UUID | None
     advisor_user_id: uuid.UUID | None
     bay_id: uuid.UUID | None
@@ -118,10 +134,11 @@ class ServiceOrderRead(BaseModel):
     scheduled_at: datetime | None
     intake_mileage: int | None
     customer_reason: str | None
-    promised_at: date | None
+    promised_at: datetime | None
     created_at: datetime
     updated_at: datetime
     closed_at: datetime | None
+    completed_at: datetime | None
     total_amount: float | None
     invoiced_at: datetime | None
     cancel_reason: str | None
@@ -359,7 +376,7 @@ class WarrantyClaimConvertInput(BaseModel):
     # the original order (if any) or the claim's own reported_mileage when
     # omitted (see convert_warranty_claim_to_order).
     intake_mileage: int | None = Field(default=None, ge=0)
-    promised_at: date | None = None
+    promised_at: datetime | None = None
 
 
 class WarrantyClaimRead(BaseModel):

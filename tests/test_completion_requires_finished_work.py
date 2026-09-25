@@ -95,6 +95,46 @@ async def test_completing_with_a_pending_task_is_rejected(env):
 
 
 @pytest.mark.asyncio
+async def test_completing_with_a_task_en_espera_de_repuestos_is_rejected(env):
+    service, order, tempario, user = env
+    task = await service.add_task(order.id, tempario.id)
+    await service.update_task_status(task.id, TaskStatus.EN_ESPERA_DE_REPUESTOS)
+
+    with pytest.raises(BadRequestError) as excinfo:
+        await service.update_order(order.id, ServiceOrderUpdate(status=ServiceOrderStatus.COMPLETADO), user)
+
+    assert "Cambio de pastillas" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_completing_with_a_task_en_progreso_is_rejected(env):
+    service, order, tempario, user = env
+    task = await service.add_task(order.id, tempario.id)
+    await service.update_task_status(task.id, TaskStatus.EN_PROGRESO)
+
+    with pytest.raises(BadRequestError) as excinfo:
+        await service.update_order(order.id, ServiceOrderUpdate(status=ServiceOrderStatus.COMPLETADO), user)
+
+    assert "Cambio de pastillas" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_task_does_not_block_completion(env):
+    """A cancelada task was deliberately dropped, not left unfinished — it
+    must not require confirmation the way an actually-pending one does."""
+    service, order, tempario, user = env
+    task = await service.add_task(order.id, tempario.id)
+    await service.update_task_status(task.id, TaskStatus.CANCELADA)
+    transfer = (await service.list_transfers(order.id))[0]
+    await service.mark_transfer_ordered(transfer.id)
+
+    completed = await service.update_order(order.id, ServiceOrderUpdate(status=ServiceOrderStatus.COMPLETADO), user)
+
+    assert completed.status == ServiceOrderStatus.COMPLETADO
+    assert completed.completed_with_pending_items is False
+
+
+@pytest.mark.asyncio
 async def test_completing_with_an_undispatched_odt_but_finished_tasks_is_rejected(env):
     service, order, tempario, user = env
     task = await service.add_task(order.id, tempario.id)
@@ -138,6 +178,22 @@ async def test_completing_with_everything_finished_needs_no_confirmation(env):
     assert completed.completed_with_pending_items is False
     assert completed.completed_override_by_user_id is None
     assert completed.completed_override_at is None
+
+
+@pytest.mark.asyncio
+async def test_becoming_completado_records_when_so_the_elapsed_counter_can_stop(env):
+    """The frontend's elapsed-time counter freezes at completed_at instead
+    of ticking forever once the order is completada/facturada/cancelada."""
+    service, order, tempario, user = env
+    task = await service.add_task(order.id, tempario.id)
+    await service.update_task_status(task.id, TaskStatus.COMPLETADA)
+    transfer = (await service.list_transfers(order.id))[0]
+    await service.mark_transfer_ordered(transfer.id)
+    assert order.completed_at is None
+
+    completed = await service.update_order(order.id, ServiceOrderUpdate(status=ServiceOrderStatus.COMPLETADO), user)
+
+    assert completed.completed_at is not None
 
 
 @pytest.mark.asyncio

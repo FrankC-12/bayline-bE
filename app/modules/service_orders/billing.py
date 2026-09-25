@@ -18,7 +18,7 @@ from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
 from app.modules.post_ventas.enums import WorkshopWarrantyCoverage
-from app.modules.post_ventas.models import LaborSettings, WorkshopWarranty
+from app.modules.post_ventas.models import LaborSettings, WarrantyPolicy, WorkshopWarranty
 from app.modules.service_orders.billing_schemas import (
     BillingInput,
     BillingQuote,
@@ -378,10 +378,40 @@ class BillingService:
                     select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
                 )
                 settings = settings_result.scalar_one_or_none()
-                labor_days = settings.workshop_warranty_days if settings else 90
-                labor_km = settings.workshop_warranty_km if settings else 5000
-                parts_days = settings.workshop_parts_warranty_days if settings else 90
-                parts_km = settings.workshop_parts_warranty_km if settings else 5000
+                fallback_labor_days = settings.workshop_warranty_days if settings else 90
+                fallback_labor_km = settings.workshop_warranty_km if settings else 5000
+                fallback_parts_days = settings.workshop_parts_warranty_days if settings else 90
+                fallback_parts_km = settings.workshop_parts_warranty_km if settings else 5000
+
+                # A WarrantyPolicy selected on the ODS (see ServiceOrder.
+                # labor_warranty_policy_id/parts_warranty_policy_id) takes
+                # precedence over the filial-wide LaborSettings fallback —
+                # orders that never picked one keep today's behavior exactly.
+                labor_policy = parts_policy = None
+                if order.labor_warranty_policy_id is not None:
+                    labor_policy = (
+                        await self.db.execute(
+                            select(WarrantyPolicy).where(WarrantyPolicy.id == order.labor_warranty_policy_id)
+                        )
+                    ).scalar_one_or_none()
+                if order.parts_warranty_policy_id is not None:
+                    parts_policy = (
+                        await self.db.execute(
+                            select(WarrantyPolicy).where(WarrantyPolicy.id == order.parts_warranty_policy_id)
+                        )
+                    ).scalar_one_or_none()
+
+                if labor_policy is not None:
+                    labor_days = None if labor_policy.no_expiration else labor_policy.duration_days
+                    labor_km = None if labor_policy.no_expiration else labor_policy.duration_km
+                else:
+                    labor_days, labor_km = fallback_labor_days, fallback_labor_km
+
+                if parts_policy is not None:
+                    parts_days = None if parts_policy.no_expiration else parts_policy.duration_days
+                    parts_km = None if parts_policy.no_expiration else parts_policy.duration_km
+                else:
+                    parts_days, parts_km = fallback_parts_days, fallback_parts_km
 
                 tasks = list(
                     (
@@ -401,7 +431,7 @@ class BillingService:
 
                 starts_at = now.date()
 
-                def _workshop_warranty(task, coverage, days, km):
+                def _workshop_warranty(task, coverage, days, km, policy):
                     return WorkshopWarranty(
                         filial_id=order.filial_id,
                         vin=vehicle.vin,
@@ -414,19 +444,28 @@ class BillingService:
                         starts_at=starts_at,
                         duration_days=days,
                         duration_km=km,
-                        expires_at=starts_at + timedelta(days=days),
+                        expires_at=starts_at + timedelta(days=days) if days is not None else None,
                         expiration_mileage=(
-                            order.intake_mileage + km if order.intake_mileage is not None else None
+                            order.intake_mileage + km
+                            if order.intake_mileage is not None and km is not None
+                            else None
                         ),
+                        warranty_policy_id=policy.id if policy is not None else None,
+                        warranty_policy_name_snapshot=policy.name if policy is not None else None,
+                        covered_by_snapshot=policy.covered_by if policy is not None else None,
                     )
 
                 for task in tasks:
                     self.db.add(
-                        _workshop_warranty(task, WorkshopWarrantyCoverage.MANO_DE_OBRA, labor_days, labor_km)
+                        _workshop_warranty(
+                            task, WorkshopWarrantyCoverage.MANO_DE_OBRA, labor_days, labor_km, labor_policy
+                        )
                     )
                     if task.id in task_ids_with_parts:
                         self.db.add(
-                            _workshop_warranty(task, WorkshopWarrantyCoverage.REPUESTO, parts_days, parts_km)
+                            _workshop_warranty(
+                                task, WorkshopWarrantyCoverage.REPUESTO, parts_days, parts_km, parts_policy
+                            )
                         )
 
             await self.db.commit()
