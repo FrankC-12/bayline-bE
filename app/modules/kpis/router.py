@@ -7,7 +7,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
-from app.modules.kpis.schemas import KpiReport, ManualMovementsRate, MaintenanceDueReport, ReworkReport
+from app.modules.kpis.schemas import (
+    KpiReport,
+    ManualMovementsRate,
+    MaintenanceDueReport,
+    ReworkReport,
+    UpsellConversionRate,
+)
 from app.modules.kpis.service import KpiService
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
@@ -94,3 +100,15 @@ async def get_manual_movements_rate(
 ) -> ManualMovementsRate:
     await _ensure_access(current_user, filial_id, service.db)
     return await service.get_manual_movements_rate(filial_id, date_from, date_to)
+
+
+@router.get("/kpis/conversion-upsells", response_model=UpsellConversionRate)
+async def get_upsell_conversion_rate(
+    filial_id: uuid.UUID = Query(...),
+    date_from: date = Query(...),
+    date_to: date = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: KpiService = Depends(get_service),
+) -> UpsellConversionRate:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.get_upsell_conversion_rate(filial_id, date_from, date_to)

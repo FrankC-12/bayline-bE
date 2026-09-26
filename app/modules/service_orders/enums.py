@@ -67,6 +67,19 @@ class UpsellApprovalChannel(str, enum.Enum):
     PRESENCIAL = "presencial"
 
 
+class UpsellSeverity(str, enum.Enum):
+    URGENTE = "urgente"
+    PRONTO = "pronto"
+    MONITOREAR = "monitorear"
+
+
+class UpsellDiscardReason(str, enum.Enum):
+    YA_REPARADO_OTRO_TALLER = "ya_reparado_otro_taller"
+    CLIENTE_NO_LO_QUIERE = "cliente_no_lo_quiere"
+    YA_NO_APLICA = "ya_no_aplica"
+    OTRO = "otro"
+
+
 class ReworkFailureCategory(str, enum.Enum):
     MANO_DE_OBRA = "mano_de_obra"
     REPUESTO_DEFECTUOSO = "repuesto_defectuoso"

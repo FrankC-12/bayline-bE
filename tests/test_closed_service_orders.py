@@ -1,5 +1,6 @@
 """Terminal orders reject writes and invoices never reprice on read."""
 
+import json
 import uuid
 from decimal import Decimal
 from types import SimpleNamespace
@@ -87,7 +88,9 @@ async def test_every_order_mutation_is_rejected_by_http(order_inventory, monkeyp
         (
             "POST",
             order_url + "/upsells",
-            {"title": "Nuevo", "description": "Extra", "parts": [{"part_id": str(part_id), "quantity": 1}]},
+            # Multipart form (see create_upsell) — sentinel body, handled
+            # specially in the request loop below.
+            "UPSELL_FORM",
         ),
         ("PATCH", f"/api/v1/upsells/{upsell.id}", {"status": "aprobado", "approval_channel": "presencial"}),
         ("PATCH", f"/api/v1/inspections/{inspection.id}", {"notes": "Cambio"}),
@@ -96,7 +99,16 @@ async def test_every_order_mutation_is_rejected_by_http(order_inventory, monkeyp
     ]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         for method, url, body in requests:
-            response = await client.request(method, url, json=body)
+            if body == "UPSELL_FORM":
+                response = await client.request(
+                    method, url,
+                    data={
+                        "title": "Nuevo", "description": "Extra", "severity": "monitorear",
+                        "parts_json": json.dumps([{"part_id": str(part_id), "quantity": 1}]),
+                    },
+                )
+            else:
+                response = await client.request(method, url, json=body)
             assert response.status_code == 409, (method, url, response.text)
             assert "service_order_read_only" in response.text
         assert (await client.get(order_url)).status_code == 200

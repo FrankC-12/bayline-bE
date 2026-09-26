@@ -76,3 +76,12 @@ class ManualMovementsRate(BaseModel):
     total_count: int
     manual_count: int
     rate: float
+
+
+class UpsellConversionRate(BaseModel):
+    # Of the upsells postponed within the period (postponed_at in range),
+    # how many eventually got added to an ODS (status == aprobado) —
+    # regardless of when that happened.
+    postponed_count: int
+    converted_count: int
+    rate: float

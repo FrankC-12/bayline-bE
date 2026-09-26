@@ -16,14 +16,16 @@ from app.modules.kpis.schemas import (
     ReworkReport,
     ReworkServiceRow,
     ReworkTechnicianRow,
+    UpsellConversionRate,
 )
 from app.modules.parts.models import Part
 from app.modules.post_ventas.models import Tempario
-from app.modules.service_orders.enums import WarrantyClaimType
+from app.modules.service_orders.enums import UpsellStatus, WarrantyClaimType
 from app.modules.service_orders.models import (
     ServiceOrder,
     ServiceOrderInvoice,
     ServiceOrderTransfer,
+    Upsell,
     WarrantyClaim,
 )
 
@@ -316,3 +318,40 @@ class KpiService:
 
         rate = manual_count / total_count if total_count else 0.0
         return ManualMovementsRate(total_count=total_count, manual_count=manual_count, rate=rate)
+
+    async def get_upsell_conversion_rate(
+        self, filial_id: uuid.UUID, date_from: date, date_to: date
+    ) -> UpsellConversionRate:
+        """Of the upsells a technician postponed in this period, how many
+        eventually became a real ODS task (status == aprobado, via
+        decide_upsell's target_service_order_id path or the same-visit one)
+        — the "did postponing actually lead somewhere" rate. `was_postponed`/
+        `postponed_at` are set once and never overwritten by a later
+        decision, so this is independent of the upsell's CURRENT status."""
+        start, end = _bounds(date_from, date_to)
+        base_filters = (
+            ServiceOrder.filial_id == filial_id,
+            Upsell.was_postponed.is_(True),
+            Upsell.postponed_at >= start,
+            Upsell.postponed_at <= end,
+        )
+        postponed_count = (
+            await self.db.execute(
+                select(func.count())
+                .select_from(Upsell)
+                .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
+                .where(*base_filters)
+            )
+        ).scalar_one()
+        converted_count = (
+            await self.db.execute(
+                select(func.count())
+                .select_from(Upsell)
+                .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
+                .where(*base_filters, Upsell.status == UpsellStatus.APROBADO)
+            )
+        ).scalar_one()
+        rate = converted_count / postponed_count if postponed_count else 0.0
+        return UpsellConversionRate(
+            postponed_count=postponed_count, converted_count=converted_count, rate=rate
+        )

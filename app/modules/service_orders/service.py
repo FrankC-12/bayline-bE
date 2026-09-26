@@ -67,6 +67,7 @@ from app.modules.service_orders.schemas import (
     BayCreate,
     BayUpdate,
     OrderSummary,
+    PendingUpsellRead,
     ServiceOrderCreate,
     ServiceOrderUpdate,
     TaskRead,
@@ -1187,13 +1188,23 @@ class ServiceOrderService:
             )
             for p in upsell.parts
         ]
+        # Frozen at creation (quoted_price_snapshot) for every row created
+        # since that field existed — only a legacy row (created before this
+        # column) falls back to the old live-recomputed preview.
+        amount = (
+            float(upsell.quoted_price_snapshot)
+            if upsell.quoted_price_snapshot is not None
+            else labor_cost + sum(p.line_total for p in parts)
+        )
         return UpsellRead(
             id=upsell.id,
             service_order_id=upsell.service_order_id,
             title=upsell.title,
             description=upsell.description,
             detected_by_user_id=upsell.detected_by_user_id,
-            evidence_count=upsell.evidence_count,
+            severity=upsell.severity,
+            detected_mileage=upsell.detected_mileage,
+            photo_urls=upsell.photo_urls,
             status=upsell.status,
             tasks=[
                 UpsellTaskRead(
@@ -1206,9 +1217,12 @@ class ServiceOrderService:
                 for t in upsell.tasks
             ],
             parts=parts,
-            amount=labor_cost + sum(p.line_total for p in parts),
+            amount=amount,
             approved_by_user_id=upsell.approved_by_user_id,
             approval_channel=upsell.approval_channel,
+            applied_to_service_order_id=upsell.applied_to_service_order_id,
+            discard_reason=upsell.discard_reason,
+            discard_note=upsell.discard_note,
             created_at=upsell.created_at,
             resolved_at=upsell.resolved_at,
         )
@@ -1232,14 +1246,53 @@ class ServiceOrderService:
         hourly_rate = await self._hourly_rate(order.filial_id)
         return self._upsell_to_read(upsell, hourly_rate, order.discount_label)
 
-    async def create_upsell(self, service_order_id: uuid.UUID, payload: UpsellCreate) -> UpsellRead:
+    async def list_pending_upsells_for_vehicle(
+        self, vehicle_id: uuid.UUID, exclude_service_order_id: uuid.UUID | None = None
+    ) -> list[PendingUpsellRead]:
+        """Pending/postponed recommendations for this vehicle from OTHER
+        visits — the persistent "recomendaciones pendientes" block an
+        advisor sees on a new ODS. Excludes the current order since its own
+        (same-visit, still-open) upsells already have their own UI."""
+        query = (
+            select(Upsell, ServiceOrder.discount_label, ServiceOrder.sequence_number, ServiceOrder.filial_id)
+            .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
+            .where(
+                ServiceOrder.vehicle_id == vehicle_id,
+                Upsell.status.in_([UpsellStatus.PENDIENTE, UpsellStatus.POSPUESTO]),
+            )
+            .order_by(Upsell.created_at.desc())
+        )
+        if exclude_service_order_id is not None:
+            query = query.where(Upsell.service_order_id != exclude_service_order_id)
+        rows = (await self.db.execute(query)).all()
+        if not rows:
+            return []
+        hourly_rate = await self._hourly_rate(rows[0][3])
+        return [
+            PendingUpsellRead(
+                **self._upsell_to_read(upsell, hourly_rate, discount_label).model_dump(),
+                origin_service_order_code=f"ODS-{sequence_number}",
+            )
+            for upsell, discount_label, sequence_number, _filial_id in rows
+        ]
+
+    async def create_upsell(
+        self, service_order_id: uuid.UUID, payload: UpsellCreate, photo_urls: list[str]
+    ) -> UpsellRead:
         order = await require_editable_order(self.db, service_order_id)
+        hourly_rate = await self._hourly_rate(order.filial_id)
+        multiplier = float(PARTS_MULTIPLIERS[order.discount_label])
+        labor_cost = 0.0
+        parts_cost = 0.0
+
         upsell = Upsell(
             service_order_id=service_order_id,
             title=payload.title,
             description=payload.description,
-            evidence_count=payload.evidence_count,
+            severity=payload.severity,
             detected_by_user_id=payload.detected_by_user_id,
+            detected_mileage=order.intake_mileage,
+            photo_urls=photo_urls,
         )
         self.db.add(upsell)
         await self.db.flush()
@@ -1248,6 +1301,7 @@ class ServiceOrderService:
             tempario = await self.db.get(Tempario, task_input.tempario_id)
             if tempario is None or tempario.filial_id != order.filial_id:
                 raise TaskNotFoundError(str(task_input.tempario_id))
+            labor_cost += float(tempario.estimated_hours) * hourly_rate
             self.db.add(
                 UpsellTask(
                     upsell_id=upsell.id,
@@ -1269,6 +1323,7 @@ class ServiceOrderService:
                 order.filial_id, part.id, part_input.quantity
             )
             unit_cost = total_cost / part_input.quantity if part_input.quantity else Decimal(0)
+            parts_cost += float(unit_cost) * part_input.quantity * multiplier
             self.db.add(
                 UpsellPart(
                     upsell_id=upsell.id,
@@ -1279,6 +1334,10 @@ class ServiceOrderService:
                 )
             )
 
+        # Frozen the instant it's detected — never recalculated afterward,
+        # even if the hourly rate, FIFO cost, or discount tier later change.
+        upsell.quoted_price_snapshot = Decimal(str(round(labor_cost + parts_cost, 2)))
+
         await self.db.commit()
         await self.db.refresh(upsell)
         return await self.get_upsell(upsell.id)
@@ -1287,7 +1346,10 @@ class ServiceOrderService:
         self, upsell_id: uuid.UUID, payload: UpsellDecisionInput, decided_by_user_id: uuid.UUID | None
     ) -> UpsellRead:
         upsell = await self._get_upsell_model(upsell_id)
-        await require_editable_order(self.db, upsell.service_order_id)
+        if upsell.status not in (UpsellStatus.PENDIENTE, UpsellStatus.POSPUESTO):
+            raise BadRequestError(
+                "Esta recomendación ya fue decidida.", error_code="upsell_already_decided"
+            )
         status = UpsellStatus(payload.status)
 
         if status == UpsellStatus.APROBADO:
@@ -1295,15 +1357,35 @@ class ServiceOrderService:
             # it adds the same tasks/parts fresh, exactly as if an advisor
             # had added them by hand right now, so they price off today's
             # tempario/labor rate/FIFO cost, not whatever they were when
-            # the upsell was first proposed.
+            # the upsell was first proposed. target_service_order_id lets
+            # this be a DIFFERENT, currently-open order than the one the
+            # upsell was created under — that original order is very
+            # likely already closed by the time a postponed recommendation
+            # resurfaces at a later visit, so only the TARGET order needs
+            # to still be editable.
+            target_order_id = payload.target_service_order_id or upsell.service_order_id
+            target_order = await require_editable_order(self.db, target_order_id)
+            origin_order = await self.get_order(upsell.service_order_id)
+            if target_order.vehicle_id != origin_order.vehicle_id:
+                raise BadRequestError(
+                    "La ODS destino debe ser del mismo vehículo que la recomendación.",
+                    error_code="upsell_vehicle_mismatch",
+                )
             for task in upsell.tasks:
-                await self.add_task(upsell.service_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE)
+                await self.add_task(target_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE)
             for part in upsell.parts:
                 await self.add_transfer_line(
-                    upsell.service_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE
+                    target_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE
                 )
             upsell.approved_by_user_id = decided_by_user_id
             upsell.approval_channel = payload.approval_channel
+            upsell.applied_to_service_order_id = target_order_id
+        elif status == UpsellStatus.RECHAZADO:
+            upsell.discard_reason = payload.discard_reason
+            upsell.discard_note = payload.discard_note
+        elif status == UpsellStatus.POSPUESTO and not upsell.was_postponed:
+            upsell.was_postponed = True
+            upsell.postponed_at = datetime.now(UTC)
 
         upsell.status = status
         upsell.resolved_at = datetime.now(UTC)

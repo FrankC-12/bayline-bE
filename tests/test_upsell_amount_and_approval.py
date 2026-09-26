@@ -20,7 +20,7 @@ from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
 from app.modules.post_ventas.enums import TemparioCategory
 from app.modules.post_ventas.models import LaborSettings, Tempario, TemparioPart
-from app.modules.service_orders.enums import UpsellStatus
+from app.modules.service_orders.enums import UpsellDiscardReason, UpsellSeverity, UpsellStatus
 from app.modules.service_orders.models import ServiceOrder
 from app.modules.service_orders.schemas import (
     UpsellCreate,
@@ -95,9 +95,11 @@ async def test_upsell_amount_reflects_its_tasks_and_parts(env):
         order.id,
         UpsellCreate(
             title="Frenos desgastados", description="Se notó desgaste en las pastillas.",
+            severity=UpsellSeverity.MONITOREAR,
             tasks=[UpsellTaskInput(tempario_id=tempario.id)],
             parts=[UpsellPartInput(part_id=part.id, quantity=2)],
         ),
+        [],
     )
     # labor: 2h * $25 = 50; parts: 2 * $20 * 1.30 (default margin) = 52
     assert upsell.amount == 102.0
@@ -127,8 +129,10 @@ async def test_upsell_part_cost_is_weighted_across_multiple_fifo_lots(env):
         order.id,
         UpsellCreate(
             title="Cambio mayor", description="Requiere más piezas de las estimadas.",
+            severity=UpsellSeverity.MONITOREAR,
             parts=[UpsellPartInput(part_id=part.id, quantity=8)],
         ),
+        [],
     )
 
     # 5 units @ $20 (older lot, all it has) + 3 units @ $50 (newer lot) = $250
@@ -144,8 +148,10 @@ async def test_approving_an_upsell_adds_its_lines_and_recalculates_the_order_tot
         order.id,
         UpsellCreate(
             title="Frenos desgastados", description="Se notó desgaste en las pastillas.",
+            severity=UpsellSeverity.MONITOREAR,
             tasks=[UpsellTaskInput(tempario_id=tempario.id)],
         ),
+        [],
     )
     before = await service.get_order_summary(order.id)
     assert before.total == 0
@@ -174,9 +180,18 @@ async def test_approving_an_upsell_adds_its_lines_and_recalculates_the_order_tot
 async def test_rejecting_an_upsell_does_not_touch_the_order(env):
     service, _session, order, tempario, _part = env
     upsell = await service.create_upsell(
-        order.id, UpsellCreate(title="Extra", description="Trabajo adicional", tasks=[UpsellTaskInput(tempario_id=tempario.id)])
+        order.id,
+        UpsellCreate(
+            title="Extra", description="Trabajo adicional", severity=UpsellSeverity.MONITOREAR,
+            tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+        ),
+        [],
     )
-    decided = await service.decide_upsell(upsell.id, UpsellDecisionInput(status="rechazado"), uuid.uuid4())
+    decided = await service.decide_upsell(
+        upsell.id,
+        UpsellDecisionInput(status="rechazado", discard_reason=UpsellDiscardReason.YA_NO_APLICA),
+        uuid.uuid4(),
+    )
     assert decided.status == UpsellStatus.RECHAZADO
     assert decided.approved_by_user_id is None
     assert await service.list_tasks(order.id) == []
@@ -186,13 +201,27 @@ async def test_rejecting_an_upsell_does_not_touch_the_order(env):
 async def test_list_upsells_includes_both_approved_and_rejected(env):
     service, _session, order, tempario, _part = env
     approved = await service.create_upsell(
-        order.id, UpsellCreate(title="Upsell A", description="Aprobado", tasks=[UpsellTaskInput(tempario_id=tempario.id)])
+        order.id,
+        UpsellCreate(
+            title="Upsell A", description="Aprobado", severity=UpsellSeverity.MONITOREAR,
+            tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+        ),
+        [],
     )
     rejected = await service.create_upsell(
-        order.id, UpsellCreate(title="Upsell B", description="Rechazado", tasks=[UpsellTaskInput(tempario_id=tempario.id)])
+        order.id,
+        UpsellCreate(
+            title="Upsell B", description="Rechazado", severity=UpsellSeverity.MONITOREAR,
+            tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+        ),
+        [],
     )
     await service.decide_upsell(approved.id, UpsellDecisionInput(status="aprobado", approval_channel="whatsapp"), uuid.uuid4())
-    await service.decide_upsell(rejected.id, UpsellDecisionInput(status="rechazado"), uuid.uuid4())
+    await service.decide_upsell(
+        rejected.id,
+        UpsellDecisionInput(status="rechazado", discard_reason=UpsellDiscardReason.YA_NO_APLICA),
+        uuid.uuid4(),
+    )
 
     upsells = await service.list_upsells(order.filial_id)
     statuses = {u.id: u.status for u in upsells}

@@ -381,11 +381,17 @@ async def get_account_movements(
 # Income / Expense
 
 
-# Manual movements (Ingresos/Egresos) — gated by their own module, separate
-# from the rest of Finanzas: someone with general "administracion" access
-# does not automatically get this; it's granted per-user via the existing
-# permission-override screen.
+# Manual income movements (ingreso manual) — gated by its own module,
+# separate from the rest of Finanzas: someone with general "administracion"
+# access does not automatically get this; it's granted per-user via the
+# existing permission-override screen. Egreso/reversar used to live here
+# too — split into their own fine-grained modules below (see
+# _ensure_egreso_access / _ensure_reversar_access) since Finanzas actions
+# are sensitive enough to grant independently.
 MANUAL_MOVEMENTS_MODULE_ID = "movimientos-manuales"
+EGRESO_MODULE_ID = "finanzas-egreso"
+REVERSAR_MODULE_ID = "finanzas-reversar"
+RENTABILIDAD_MODULE_ID = "finanzas-rentabilidad"
 
 
 async def _ensure_manual_movement_access(
@@ -395,6 +401,33 @@ async def _ensure_manual_movement_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MANUAL_MOVEMENTS_MODULE_ID, level)
+
+
+async def _ensure_egreso_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, EGRESO_MODULE_ID, level)
+
+
+async def _ensure_reversar_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, REVERSAR_MODULE_ID, level)
+
+
+async def _ensure_rentabilidad_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, RENTABILIDAD_MODULE_ID, level)
 
 
 @router.get("/income-entries", response_model=list[IncomeEntryRead])
@@ -445,7 +478,7 @@ async def reverse_income_entry(
     existing = await service.db.get(IncomeEntry, entry_id)
     if existing is None:
         raise EntryNotFoundError(str(entry_id))
-    await _ensure_manual_movement_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_reversar_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.reverse_income(entry_id, current_user.user_id)
 
 
@@ -456,7 +489,7 @@ async def list_expense_entries(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> list[ExpenseEntryRead]:
-    await _ensure_manual_movement_access(current_user, filial_id, service.db)
+    await _ensure_egreso_access(current_user, filial_id, service.db)
     return await service.list_expenses(filial_id, search)
 
 
@@ -486,7 +519,7 @@ async def create_expense_entry(
         counterparty_supplier_id=counterparty_supplier_id, counterparty_name=counterparty_name,
         reference=reference,
     )
-    await _ensure_manual_movement_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_egreso_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_expense(payload, attachment, current_user.user_id)
 
 
@@ -499,7 +532,7 @@ async def reverse_expense_entry(
     existing = await service.db.get(ExpenseEntry, entry_id)
     if existing is None:
         raise EntryNotFoundError(str(entry_id))
-    await _ensure_manual_movement_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_reversar_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.reverse_expense(entry_id, current_user.user_id)
 
 
@@ -524,5 +557,5 @@ async def get_profitability(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> ProfitabilityReport:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_rentabilidad_access(current_user, filial_id, service.db)
     return await service.get_profitability(filial_id, date_from, date_to)

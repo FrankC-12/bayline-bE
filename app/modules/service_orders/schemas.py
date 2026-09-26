@@ -14,6 +14,8 @@ from app.modules.service_orders.enums import (
     TaskStatus,
     TransferStatus,
     UpsellApprovalChannel,
+    UpsellDiscardReason,
+    UpsellSeverity,
     UpsellStatus,
     WarrantyClaimStatus,
     WarrantyClaimType,
@@ -269,7 +271,7 @@ class UpsellPartInput(BaseModel):
 class UpsellCreate(BaseModel):
     title: str = Field(min_length=2, max_length=150)
     description: str = Field(min_length=2)
-    evidence_count: int = Field(default=0, ge=0)
+    severity: UpsellSeverity
     detected_by_user_id: uuid.UUID | None = None
     tasks: list[UpsellTaskInput] = Field(default_factory=list)
     parts: list[UpsellPartInput] = Field(default_factory=list)
@@ -286,11 +288,30 @@ class UpsellDecisionInput(BaseModel):
     # Only meaningful (and required) for status="aprobado" — how the client
     # actually agreed to pay for the additional work.
     approval_channel: UpsellApprovalChannel | None = None
+    # Only meaningful for status="aprobado" — which ODS to add the tasks/
+    # parts to. Omit to keep today's behavior (the upsell's own order, same
+    # visit); set explicitly when applying a pending/postponed recommendation
+    # from a past visit to the ODS open right now (a different order, likely
+    # of a vehicle that's since had its original order closed).
+    target_service_order_id: uuid.UUID | None = None
+    # Only meaningful (and required) for status="rechazado" — "Descartar"
+    # requires a reason; "otro" additionally requires a note.
+    discard_reason: UpsellDiscardReason | None = None
+    discard_note: str | None = None
 
     @model_validator(mode="after")
     def _requires_channel_when_approved(self) -> "UpsellDecisionInput":
         if self.status == "aprobado" and self.approval_channel is None:
             raise ValueError("Indica por qué medio el cliente aprobó el trabajo adicional.")
+        return self
+
+    @model_validator(mode="after")
+    def _requires_reason_when_discarded(self) -> "UpsellDecisionInput":
+        if self.status == "rechazado":
+            if self.discard_reason is None:
+                raise ValueError("Indica el motivo por el que se descarta esta recomendación.")
+            if self.discard_reason == UpsellDiscardReason.OTRO and not self.discard_note:
+                raise ValueError("Describe el motivo en la nota cuando el motivo es 'Otro'.")
         return self
 
 
@@ -317,19 +338,32 @@ class UpsellRead(BaseModel):
     title: str
     description: str
     detected_by_user_id: uuid.UUID | None
-    evidence_count: int
+    severity: UpsellSeverity
+    detected_mileage: int | None
+    photo_urls: list[str]
     status: UpsellStatus
     tasks: list[UpsellTaskRead]
     parts: list[UpsellPartRead]
-    # A preview: labor at the filial's current hourly rate + parts at the
-    # cost they had when proposed, marked up by the order's own discount
-    # tier — the same formula that will actually price them on approval,
-    # give or take whatever moved (rate, stock cost) since this was built.
+    # Frozen at creation time (see Upsell.quoted_price_snapshot) — the
+    # historical "precio cotizado", never recalculated on read. Rows
+    # created before this field existed fall back to the old live preview
+    # formula (current hourly rate + current discount tier).
     amount: float
     approved_by_user_id: uuid.UUID | None
     approval_channel: UpsellApprovalChannel | None
+    applied_to_service_order_id: uuid.UUID | None
+    discard_reason: UpsellDiscardReason | None
+    discard_note: str | None
     created_at: datetime
     resolved_at: datetime | None
+
+
+class PendingUpsellRead(UpsellRead):
+    """An UpsellRead plus which ODS it originated from — used only by the
+    "recomendaciones pendientes de este vehículo" block, since that list
+    spans multiple orders and needs to say where each one came from."""
+
+    origin_service_order_code: str
 
 
 class WarrantyClaimCreate(BaseModel):

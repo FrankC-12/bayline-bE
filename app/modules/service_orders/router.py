@@ -1,13 +1,15 @@
 import datetime as dt
+import json
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
+from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.storage import save_upload_attachment
+from app.core.storage import save_upload_attachment, save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import AccessLevel
@@ -18,13 +20,20 @@ from app.modules.service_orders.billing_schemas import (
     InvoiceCreate,
     ReceivableRead,
 )
-from app.modules.service_orders.enums import ReworkFailureCategory, ServiceOrderStatus, WarrantyClaimStatus, WarrantyClaimType
+from app.modules.service_orders.enums import (
+    ReworkFailureCategory,
+    ServiceOrderStatus,
+    UpsellSeverity,
+    WarrantyClaimStatus,
+    WarrantyClaimType,
+)
 from app.modules.service_orders.exceptions import TaskAndTechnicianRequiredError
 from app.modules.service_orders.schemas import (
     BayCreate,
     BayRead,
     BayUpdate,
     OrderSummary,
+    PendingUpsellRead,
     ServiceOrderCancelInput,
     ServiceOrderCloseInput,
     ServiceOrderCreate,
@@ -40,7 +49,9 @@ from app.modules.service_orders.schemas import (
     TransferRead,
     UpsellCreate,
     UpsellDecisionInput,
+    UpsellPartInput,
     UpsellRead,
+    UpsellTaskInput,
     WarrantyClaimAuthorizationInput,
     WarrantyClaimContext,
     WarrantyClaimConvertInput,
@@ -69,6 +80,21 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
+
+
+# Collecting a receivable is a sensitive Finanzas action — gated by its own
+# fine-grained module, separate from general "asesor-servicios" access
+# (which still covers just seeing what's owed, via list_receivables below).
+COBRAR_MODULE_ID = "finanzas-cobrar"
+
+
+async def _ensure_cobrar_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, COBRAR_MODULE_ID, level)
 
 
 @router.get("/service-orders", response_model=list[ServiceOrderRead])
@@ -400,13 +426,42 @@ async def list_upsells(
 )
 async def create_upsell(
     order_id: uuid.UUID,
-    payload: UpsellCreate,
+    title: str = Form(...),
+    description: str = Form(...),
+    severity: UpsellSeverity = Form(...),
+    detected_by_user_id: uuid.UUID | None = Form(default=None),
+    # JSON-encoded lists — Form doesn't support nested list-of-object
+    # fields, so these arrive as strings and get validated below.
+    tasks_json: str = Form(default="[]"),
+    parts_json: str = Form(default="[]"),
+    photos: list[UploadFile] = File(default=[]),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> UpsellRead:
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_upsell(order_id, payload)
+
+    settings = get_settings()
+    photo_urls = [
+        await save_upload_image(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="upsells",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        for photo in photos
+    ]
+
+    payload = UpsellCreate(
+        title=title,
+        description=description,
+        severity=severity,
+        detected_by_user_id=detected_by_user_id,
+        tasks=TypeAdapter(list[UpsellTaskInput]).validate_python(json.loads(tasks_json)),
+        parts=TypeAdapter(list[UpsellPartInput]).validate_python(json.loads(parts_json)),
+    )
+    return await service.create_upsell(order_id, payload, photo_urls)
 
 
 @router.patch("/upsells/{upsell_id}", response_model=UpsellRead)
@@ -420,6 +475,20 @@ async def decide_upsell(
     order = await service.get_order(existing.service_order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
     return await service.decide_upsell(upsell_id, payload, current_user.user_id)
+
+
+@router.get("/upsells/pending-by-vehicle", response_model=list[PendingUpsellRead])
+async def list_pending_upsells_for_vehicle(
+    vehicle_id: uuid.UUID = Query(...),
+    exclude_order_id: uuid.UUID | None = Query(default=None),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> list[PendingUpsellRead]:
+    """Recomendaciones pendientes/pospuestas de este vehículo, de OTRAS
+    visitas — el bloque fijo que un asesor ve al abrir la ODS de este VIN."""
+    filial_id = await service.get_vehicle_filial_id(vehicle_id)
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_pending_upsells_for_vehicle(vehicle_id, exclude_order_id)
 
 
 @router.get("/service-orders/{order_id}/billing")
@@ -546,7 +615,7 @@ async def collect_receivable(
     billing = BillingService(service.db)
     invoice = await billing.get_invoice_by_id(invoice_id)
     order = await service.get_order(invoice.service_order_id)
-    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_cobrar_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
     return await billing.collect_invoice(invoice_id, payload, current_user.user_id)
 
 

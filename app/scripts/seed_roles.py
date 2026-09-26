@@ -10,6 +10,7 @@ ALL_MODULES = [
     "asesor-servicios", "tecnico-servicio", "administracion", "usuarios-accesos",
     "post-ventas", "kpis", "clientes-vehiculos", "repuestos", "almacen",
     "concesionario", "ventas", "ajustes", "movimientos-manuales", "compras",
+    "finanzas-cobrar", "finanzas-egreso", "finanzas-reversar", "finanzas-rentabilidad",
 ]
 
 ROLES_SEED = [

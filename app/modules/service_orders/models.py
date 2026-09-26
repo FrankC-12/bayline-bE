@@ -26,6 +26,8 @@ from app.modules.service_orders.enums import (
     TaskStatus,
     TransferStatus,
     UpsellApprovalChannel,
+    UpsellDiscardReason,
+    UpsellSeverity,
     UpsellStatus,
     WarrantyClaimStatus,
     WarrantyClaimType,
@@ -328,7 +330,21 @@ class Upsell(Base):
     detected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    severity: Mapped[UpsellSeverity] = mapped_column(
+        Enum(UpsellSeverity, name="upsell_severity"),
+        nullable=False,
+        default=UpsellSeverity.MONITOREAR,
+        server_default=UpsellSeverity.MONITOREAR.value,
+    )
+    # The vehicle's mileage at the moment this was detected — copied from
+    # the order's intake_mileage at creation, not a manual technician
+    # input (a workshop doesn't re-measure mid-visit).
+    detected_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Frozen at creation from the tempario/labor rate/FIFO cost in effect
+    # that moment — the historical "precio cotizado", never recalculated on
+    # read. Null only for rows created before this field existed.
+    quoted_price_snapshot: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    photo_urls: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[UpsellStatus] = mapped_column(
         Enum(UpsellStatus, name="upsell_status"), nullable=False, default=UpsellStatus.PENDIENTE
     )
@@ -342,6 +358,25 @@ class Upsell(Base):
     approval_channel: Mapped[UpsellApprovalChannel | None] = mapped_column(
         Enum(UpsellApprovalChannel, name="upsell_approval_channel"), nullable=True
     )
+    # Which ODS the recommendation actually landed on — usually the same as
+    # service_order_id (approved the same visit it was detected), but can
+    # be a LATER order when a pending/postponed recommendation from a past
+    # visit gets added at reingreso (see decide_upsell's target_service_order_id).
+    applied_to_service_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("service_orders.id", ondelete="SET NULL"), nullable=True
+    )
+    # Only set together, and only when status becomes RECHAZADO ("Descartar").
+    discard_reason: Mapped[UpsellDiscardReason | None] = mapped_column(
+        Enum(UpsellDiscardReason, name="upsell_discard_reason"), nullable=True
+    )
+    discard_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set once, the FIRST time this upsell is postponed — never cleared or
+    # overwritten by a later decision (unlike `status`, which moves on to
+    # APROBADO/RECHAZADO and would otherwise erase the fact it was ever
+    # postponed). This is what the "tasa de conversión de upsells
+    # pospuestos" KPI groups by, independent of where it ends up.
+    was_postponed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    postponed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     tasks: Mapped[list["UpsellTask"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
     parts: Mapped[list["UpsellPart"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
