@@ -188,6 +188,33 @@ async def test_amount_under_threshold_without_attachment_saves(env):
 
 
 @pytest.mark.asyncio
+async def test_threshold_compares_the_usd_equivalent_not_the_raw_bs_amount(env):
+    """Bs 50.000 at a rate of 1000 is ~$50 (under the $100 threshold) — must
+    NOT require an attachment just because 50000 as a raw number is >= 100."""
+    service, session, filial_id, _usd_account, bs_account, _ = env
+    session.add(ExchangeRate(currency="USD", rate_ves=1000, value_date=date.today()))
+    session.commit()
+
+    payload = _income_payload(filial_id, bs_account.id, amount=50000, currency=AccountCurrency.BS)
+    entry = await service.create_income(payload, None, uuid.uuid4())
+    assert entry.attachment_url is None
+    assert entry.amount_usd == pytest.approx(50.0)
+
+
+@pytest.mark.asyncio
+async def test_threshold_requires_attachment_once_the_usd_equivalent_crosses_it(env):
+    """Bs 150.000 at a rate of 1000 is $150 — over the threshold, same as a
+    raw $150 USD movement would be."""
+    service, session, filial_id, _usd_account, bs_account, _ = env
+    session.add(ExchangeRate(currency="USD", rate_ves=1000, value_date=date.today()))
+    session.commit()
+
+    payload = _expense_payload(filial_id, bs_account.id, amount=150000, currency=AccountCurrency.BS)
+    with pytest.raises(AttachmentRequiredError):
+        await service.create_expense(payload, None, uuid.uuid4())
+
+
+@pytest.mark.asyncio
 async def test_amount_over_threshold_with_attachment_saves(env, tmp_path, monkeypatch):
     import app.core.config as config_module
 
@@ -231,8 +258,9 @@ async def test_reverse_income_creates_negative_row_and_nets_balance(env):
     payload = _income_payload(filial_id, usd_account.id, amount=80)
     original = await service.create_income(payload, None, uuid.uuid4())
 
-    reversal = await service.reverse_income(original.id, uuid.uuid4())
+    reversal = await service.reverse_income(original.id, uuid.uuid4(), "Registrado por error")
     assert reversal.reverses_entry_id == original.id
+    assert reversal.reversal_reason == "Registrado por error"
     assert float(reversal.amount) == -80
     assert reversal.entry_date == date.today()
 
@@ -241,7 +269,7 @@ async def test_reverse_income_creates_negative_row_and_nets_balance(env):
     assert balance == 0
 
     with pytest.raises(EntryAlreadyReversedError):
-        await service.reverse_income(original.id, uuid.uuid4())
+        await service.reverse_income(original.id, uuid.uuid4(), "Otro motivo")
 
 
 @pytest.mark.asyncio
@@ -250,12 +278,42 @@ async def test_reverse_expense_creates_negative_row(env):
     payload = _expense_payload(filial_id, usd_account.id, amount=30)
     original = await service.create_expense(payload, None, uuid.uuid4())
 
-    reversal = await service.reverse_expense(original.id, uuid.uuid4())
+    reversal = await service.reverse_expense(original.id, uuid.uuid4(), "Registrado por error")
     assert reversal.reverses_entry_id == original.id
+    assert reversal.reversal_reason == "Registrado por error"
     assert float(reversal.amount) == -30
 
     with pytest.raises(EntryAlreadyReversedError):
-        await service.reverse_expense(original.id, uuid.uuid4())
+        await service.reverse_expense(original.id, uuid.uuid4(), "Otro motivo")
+
+
+def test_reverse_entry_input_requires_a_reason():
+    from app.modules.administracion.schemas import ReverseEntryInput
+
+    with pytest.raises(ValidationError):
+        ReverseEntryInput(reason="")
+    with pytest.raises(ValidationError):
+        ReverseEntryInput(reason="ok")  # too short (min_length=3)
+    ReverseEntryInput(reason="Monto digitado incorrectamente")
+
+
+@pytest.mark.asyncio
+async def test_account_movements_expose_author_and_reversal_reason(env):
+    service, _session, filial_id, usd_account, _, _ = env
+    author = uuid.uuid4()
+    payload = _expense_payload(filial_id, usd_account.id, amount=30)
+    original = await service.create_expense(payload, None, author)
+    reversal_author = uuid.uuid4()
+    await service.reverse_expense(original.id, reversal_author, "Categoría equivocada")
+
+    movements = await service.get_account_movements(usd_account.id)
+    by_id = {m["id"]: m for m in movements}
+
+    assert by_id[original.id]["registered_by_user_id"] == author
+    assert by_id[original.id]["reversal_reason"] is None
+    reversal_row = next(m for m in movements if m["reverses_entry_id"] == original.id)
+    assert reversal_row["registered_by_user_id"] == reversal_author
+    assert reversal_row["reversal_reason"] == "Categoría equivocada"
 
 
 # --- Regression: automatic-path entry creation is untouched ---

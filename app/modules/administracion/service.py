@@ -10,6 +10,7 @@ from app.modules.administracion.enums import (
     AccountCurrency,
     ClaimResolution,
     ClaimStatus,
+    CounterpartyType,
     ExpenseCategory,
     IncomeConcept,
     IncomeSource,
@@ -34,8 +35,13 @@ from app.modules.administracion.exceptions import (
     FutureEntryDateError,
     InvalidPurchaseStatusTransitionError,
     PurchaseRequestNotFoundError,
+    PurchaseRequestNotPayableError,
+    PurchaseRequestRequiresSupplierCounterpartyError,
+    PurchaseRequestSupplierMismatchError,
     QuoteRequiredError,
+    SameAccountTransferError,
     SupplierNotFoundError,
+    TransferExchangeRateRequiredError,
     WarehouseRequiredError,
     WarrantySubmissionAlreadyExistsError,
     WarrantySubmissionEmptyError,
@@ -60,6 +66,7 @@ from app.modules.administracion.schemas import (
     FinanceDashboard,
     IncomeEntryCreate,
     MonthTrend,
+    PayableRead,
     ProfitabilityAdjustmentRow,
     ProfitabilityDepartmentRow,
     ProfitabilityLineItem,
@@ -74,6 +81,8 @@ from app.modules.administracion.schemas import (
     SupplierDetailRead,
     SupplierRead,
     SupplierUpdate,
+    TransferCreate,
+    TransferRead,
     WarrantySubmissionClaimRead,
     WarrantySubmissionCreate,
     WarrantySubmissionPayInput,
@@ -139,6 +148,9 @@ def _request_to_read(request: PurchaseRequest) -> PurchaseRequestRead:
             for line in request.lines
         ],
         total_quoted=total,
+        conciliated_at=request.conciliated_at,
+        paid_at=request.paid_at,
+        payment_expense_entry_id=request.payment_expense_entry_id,
         created_at=request.created_at,
         updated_at=request.updated_at,
     )
@@ -314,10 +326,63 @@ class AdministracionService:
                     )
                 request.warehouse_id = warehouse_id
 
+            if new_status == PurchaseRequestStatus.CONCILIADA:
+                request.conciliated_at = datetime.now(timezone.utc)
+
             request.status = new_status
 
         await self.db.commit()
         return await self.get_request(request_id)
+
+    async def list_payables(self, filial_id: uuid.UUID) -> list[PayableRead]:
+        """Cuentas por Pagar — computed the same way as list_receivables:
+        no persisted "payable" row, just every CONCILIADA PurchaseRequest
+        that hasn't had a payment linked yet (paid_at IS NULL). Registering
+        a payment (create_expense with purchase_request_ids) sets paid_at,
+        which is what makes the row disappear from here."""
+        result = await self.db.execute(
+            select(PurchaseRequest)
+            .options(selectinload(PurchaseRequest.lines))
+            .where(
+                PurchaseRequest.filial_id == filial_id,
+                PurchaseRequest.status == PurchaseRequestStatus.CONCILIADA,
+                PurchaseRequest.paid_at.is_(None),
+            )
+            .order_by(PurchaseRequest.conciliated_at)
+        )
+        requests = list(result.scalars().all())
+        if not requests:
+            return []
+
+        supplier_ids = {r.supplier_id for r in requests}
+        suppliers_result = await self.db.execute(select(Supplier).where(Supplier.id.in_(supplier_ids)))
+        supplier_names = {s.id: s.business_name for s in suppliers_result.scalars().all()}
+
+        today = venezuela_today()
+        payables = []
+        for request in requests:
+            total = sum(
+                line.quantity * float(line.unit_cost) for line in request.lines if line.unit_cost is not None
+            )
+            # Falls back to updated_at for a request conciliada before this
+            # column existed (never backfilled — there's no way to know the
+            # real historical date).
+            anchor = request.conciliated_at or request.updated_at
+            days_outstanding = (today - anchor.date()).days
+            payables.append(
+                PayableRead(
+                    purchase_request_id=request.id,
+                    code=request.code,
+                    filial_id=request.filial_id,
+                    supplier_id=request.supplier_id,
+                    supplier_name=supplier_names.get(request.supplier_id, "—"),
+                    total_amount=total,
+                    conciliated_at=anchor,
+                    days_outstanding=days_outstanding,
+                    aging_bucket=aging_bucket(days_outstanding),
+                )
+            )
+        return payables
 
     # Supplier claims
 
@@ -730,8 +795,11 @@ class AdministracionService:
                 "reference": e.reference,
                 "attachment_url": e.attachment_url,
                 "reverses_entry_id": e.reverses_entry_id,
+                "reversal_reason": e.reversal_reason,
+                "exchange_rate": float(e.exchange_rate) if e.exchange_rate is not None else None,
                 "source_type": e.source_type,
                 "source_id": e.source_id,
+                "registered_by_user_id": e.registered_by_user_id,
                 "created_at": e.created_at,
             }
             for e in income_result.scalars().all()
@@ -752,8 +820,11 @@ class AdministracionService:
                 "reference": e.reference,
                 "attachment_url": e.attachment_url,
                 "reverses_entry_id": e.reverses_entry_id,
+                "reversal_reason": e.reversal_reason,
+                "exchange_rate": float(e.exchange_rate) if e.exchange_rate is not None else None,
                 "source_type": e.source_type,
                 "source_id": e.source_id,
+                "registered_by_user_id": e.registered_by_user_id,
                 "created_at": e.created_at,
             }
             for e in expense_result.scalars().all()
@@ -832,7 +903,12 @@ class AdministracionService:
 
     async def list_income(self, filial_id: uuid.UUID, search: str | None = None) -> list[IncomeEntry]:
         result = await self.db.execute(
-            select(IncomeEntry).where(IncomeEntry.filial_id == filial_id).order_by(IncomeEntry.entry_date.desc())
+            select(IncomeEntry)
+            .where(
+                IncomeEntry.filial_id == filial_id,
+                IncomeEntry.source_type.is_distinct_from(MovementSourceType.ACCOUNT_TRANSFER),
+            )
+            .order_by(IncomeEntry.entry_date.desc())
         )
         entries = list(result.scalars().all())
         if search:
@@ -917,7 +993,7 @@ class AdministracionService:
         await self.db.refresh(entry)
         return entry
 
-    async def reverse_income(self, entry_id: uuid.UUID, user_id: uuid.UUID | None) -> IncomeEntry:
+    async def reverse_income(self, entry_id: uuid.UUID, user_id: uuid.UUID | None, reason: str) -> IncomeEntry:
         original = await self.db.get(IncomeEntry, entry_id)
         if original is None:
             raise EntryNotFoundError(str(entry_id))
@@ -945,6 +1021,7 @@ class AdministracionService:
             amount_usd=-original.amount_usd if original.amount_usd is not None else None,
             amount_bs=-original.amount_bs if original.amount_bs is not None else None,
             reverses_entry_id=original.id,
+            reversal_reason=reason,
             registered_by_user_id=user_id,
         )
         self.db.add(reversal)
@@ -954,7 +1031,12 @@ class AdministracionService:
 
     async def list_expenses(self, filial_id: uuid.UUID, search: str | None = None) -> list[ExpenseEntry]:
         result = await self.db.execute(
-            select(ExpenseEntry).where(ExpenseEntry.filial_id == filial_id).order_by(ExpenseEntry.entry_date.desc())
+            select(ExpenseEntry)
+            .where(
+                ExpenseEntry.filial_id == filial_id,
+                ExpenseEntry.source_type.is_distinct_from(MovementSourceType.ACCOUNT_TRANSFER),
+            )
+            .order_by(ExpenseEntry.entry_date.desc())
         )
         entries = list(result.scalars().all())
         if search:
@@ -971,12 +1053,27 @@ class AdministracionService:
     ) -> ExpenseEntry:
         self._assert_open_period(payload.entry_date)
         await self.get_account(payload.account_id)
+
+        purchase_requests: list[PurchaseRequest] = []
+        if payload.purchase_request_ids:
+            if payload.counterparty_type != CounterpartyType.PROVEEDOR or payload.counterparty_supplier_id is None:
+                raise PurchaseRequestRequiresSupplierCounterpartyError()
+            for request_id in payload.purchase_request_ids:
+                request = await self.db.get(PurchaseRequest, request_id)
+                if request is None:
+                    raise PurchaseRequestNotFoundError(str(request_id))
+                if request.supplier_id != payload.counterparty_supplier_id:
+                    raise PurchaseRequestSupplierMismatchError(request.code)
+                if request.status != PurchaseRequestStatus.CONCILIADA or request.paid_at is not None:
+                    raise PurchaseRequestNotPayableError(request.code)
+                purchase_requests.append(request)
+
         exchange_rate, amount_usd, amount_bs = await self._freeze_rate(
             payload.currency, payload.entry_date, payload.amount
         )
         attachment_url = await self._require_attachment_if_needed(payload.filial_id, amount_usd, attachment)
         entry = ExpenseEntry(
-            **payload.model_dump(),
+            **payload.model_dump(exclude={"purchase_request_ids"}),
             exchange_rate=exchange_rate,
             amount_usd=amount_usd,
             amount_bs=amount_bs,
@@ -984,11 +1081,19 @@ class AdministracionService:
             registered_by_user_id=responsible_user_id,
         )
         self.db.add(entry)
+        await self.db.flush()
+
+        for request in purchase_requests:
+            request.paid_at = datetime.now(timezone.utc)
+            request.payment_account_id = payload.account_id
+            request.payment_expense_entry_id = entry.id
+            request.paid_by_user_id = responsible_user_id
+
         await self.db.commit()
         await self.db.refresh(entry)
         return entry
 
-    async def reverse_expense(self, entry_id: uuid.UUID, user_id: uuid.UUID | None) -> ExpenseEntry:
+    async def reverse_expense(self, entry_id: uuid.UUID, user_id: uuid.UUID | None, reason: str) -> ExpenseEntry:
         original = await self.db.get(ExpenseEntry, entry_id)
         if original is None:
             raise EntryNotFoundError(str(entry_id))
@@ -1016,12 +1121,96 @@ class AdministracionService:
             amount_usd=-original.amount_usd if original.amount_usd is not None else None,
             amount_bs=-original.amount_bs if original.amount_bs is not None else None,
             reverses_entry_id=original.id,
+            reversal_reason=reason,
             registered_by_user_id=user_id,
         )
         self.db.add(reversal)
         await self.db.commit()
         await self.db.refresh(reversal)
         return reversal
+
+    async def create_transfer(
+        self, payload: TransferCreate, responsible_user_id: uuid.UUID | None
+    ) -> TransferRead:
+        """Moves money between two of the filial's own accounts as a linked
+        ExpenseEntry/IncomeEntry pair, tagged source_type=ACCOUNT_TRANSFER so
+        the dashboard and profitability can exclude it — it's neither real
+        income nor a real expense, just the same money in a different place."""
+        self._assert_open_period(payload.entry_date)
+        if payload.from_account_id == payload.to_account_id:
+            raise SameAccountTransferError()
+
+        from_account = await self.get_account(payload.from_account_id)
+        to_account = await self.get_account(payload.to_account_id)
+
+        if from_account.currency == to_account.currency:
+            to_amount = payload.amount
+            from_rate, from_amount_usd, from_amount_bs = await self._freeze_rate(
+                from_account.currency, payload.entry_date, payload.amount
+            )
+            to_rate, to_amount_usd, to_amount_bs = from_rate, from_amount_usd, from_amount_bs
+        else:
+            if payload.exchange_rate is None:
+                raise TransferExchangeRateRequiredError()
+            rate = payload.exchange_rate
+            if from_account.currency == AccountCurrency.USD:
+                to_amount = payload.amount * rate
+                from_amount_usd, from_amount_bs = payload.amount, to_amount
+            else:
+                to_amount = payload.amount / rate
+                from_amount_usd, from_amount_bs = to_amount, payload.amount
+            to_amount_usd, to_amount_bs = from_amount_usd, from_amount_bs
+            from_rate = to_rate = rate
+
+        expense = ExpenseEntry(
+            filial_id=payload.filial_id,
+            entry_date=payload.entry_date,
+            category=ExpenseCategory.TRANSFERENCIA_CUENTAS,
+            beneficiary=to_account.name,
+            description=payload.description or f"Transferencia a {to_account.name}",
+            amount=payload.amount,
+            currency=from_account.currency,
+            account_id=from_account.id,
+            reference=payload.reference,
+            exchange_rate=from_rate,
+            amount_usd=from_amount_usd,
+            amount_bs=from_amount_bs,
+            source_type=MovementSourceType.ACCOUNT_TRANSFER,
+            registered_by_user_id=responsible_user_id,
+        )
+        income = IncomeEntry(
+            filial_id=payload.filial_id,
+            entry_date=payload.entry_date,
+            source=IncomeSource.MANUAL,
+            description=payload.description or f"Transferencia desde {from_account.name}",
+            amount=to_amount,
+            currency=to_account.currency,
+            account_id=to_account.id,
+            reference=payload.reference,
+            exchange_rate=to_rate,
+            amount_usd=to_amount_usd,
+            amount_bs=to_amount_bs,
+            source_type=MovementSourceType.ACCOUNT_TRANSFER,
+            registered_by_user_id=responsible_user_id,
+        )
+        self.db.add(expense)
+        self.db.add(income)
+        await self.db.flush()
+        expense.source_id = income.id
+        income.source_id = expense.id
+        await self.db.commit()
+        await self.db.refresh(expense)
+        await self.db.refresh(income)
+
+        return TransferRead(
+            from_entry_id=expense.id,
+            to_entry_id=income.id,
+            from_amount=float(expense.amount),
+            to_amount=float(income.amount),
+            from_currency=from_account.currency,
+            to_currency=to_account.currency,
+            exchange_rate=from_rate,
+        )
 
     # Reports
 
@@ -1035,9 +1224,19 @@ class AdministracionService:
         bcv_rate = float(settings.bcv_rate) if settings.bcv_rate else 0.0
         today = venezuela_today()
 
-        income_result = await self.db.execute(select(IncomeEntry).where(IncomeEntry.filial_id == filial_id))
+        income_result = await self.db.execute(
+            select(IncomeEntry).where(
+                IncomeEntry.filial_id == filial_id,
+                IncomeEntry.source_type.is_distinct_from(MovementSourceType.ACCOUNT_TRANSFER),
+            )
+        )
         incomes = list(income_result.scalars().all())
-        expense_result = await self.db.execute(select(ExpenseEntry).where(ExpenseEntry.filial_id == filial_id))
+        expense_result = await self.db.execute(
+            select(ExpenseEntry).where(
+                ExpenseEntry.filial_id == filial_id,
+                ExpenseEntry.source_type.is_distinct_from(MovementSourceType.ACCOUNT_TRANSFER),
+            )
+        )
         expenses = list(expense_result.scalars().all())
 
         def month_key(d: date) -> tuple[int, int]:
@@ -1451,7 +1650,12 @@ class AdministracionService:
         operating_expenses = sum(
             self._entry_usd_amount(e, bcv_rate)
             for e in expenses
-            if e.category not in (ExpenseCategory.COMPRAS_PROVEEDORES, ExpenseCategory.NOMINA_COMISIONES)
+            if e.category
+            not in (
+                ExpenseCategory.COMPRAS_PROVEEDORES,
+                ExpenseCategory.NOMINA_COMISIONES,
+                ExpenseCategory.TRANSFERENCIA_CUENTAS,
+            )
         )
         commissions_paid = sum(
             self._entry_usd_amount(e, bcv_rate) for e in expenses if e.category == ExpenseCategory.NOMINA_COMISIONES

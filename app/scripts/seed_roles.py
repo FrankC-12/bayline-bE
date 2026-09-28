@@ -11,6 +11,7 @@ ALL_MODULES = [
     "post-ventas", "kpis", "clientes-vehiculos", "repuestos", "almacen",
     "concesionario", "ventas", "ajustes", "movimientos-manuales", "compras",
     "finanzas-cobrar", "finanzas-egreso", "finanzas-reversar", "finanzas-rentabilidad",
+    "finanzas-transferir",
 ]
 
 ROLES_SEED = [

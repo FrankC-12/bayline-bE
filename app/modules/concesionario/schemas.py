@@ -9,6 +9,7 @@ from app.modules.concesionario.enums import (
     SaleType,
     TransmissionType,
     VehicleCondition,
+    VehicleLocation,
     VehicleStatus,
 )
 
@@ -17,6 +18,7 @@ class VehicleCreate(BaseModel):
     filial_id: uuid.UUID
     status: VehicleStatus = VehicleStatus.EN_TRANSITO
     condition: VehicleCondition
+    location: VehicleLocation
     brand: str = Field(min_length=1, max_length=60)
     model: str = Field(min_length=1, max_length=60)
     year: int = Field(ge=1980, le=2100)
@@ -75,6 +77,7 @@ class VehicleReservationInput(BaseModel):
 class VehicleUpdate(BaseModel):
     status: VehicleStatus | None = None
     condition: VehicleCondition | None = None
+    location: VehicleLocation | None = None
     brand: str | None = Field(default=None, min_length=1, max_length=60)
     model: str | None = Field(default=None, min_length=1, max_length=60)
     year: int | None = Field(default=None, ge=1980, le=2100)
@@ -103,6 +106,7 @@ class VehicleRead(BaseModel):
     filial_id: uuid.UUID
     status: VehicleStatus
     condition: VehicleCondition
+    location: VehicleLocation | None
     brand: str
     model: str
     year: int

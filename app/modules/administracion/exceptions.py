@@ -47,6 +47,30 @@ class WarehouseRequiredError(BadRequestError):
         )
 
 
+class PurchaseRequestNotPayableError(BadRequestError):
+    def __init__(self, code: str) -> None:
+        super().__init__(
+            f"La orden de compra '{code}' no está conciliada o ya fue pagada.",
+            error_code="purchase_request_not_payable",
+        )
+
+
+class PurchaseRequestSupplierMismatchError(BadRequestError):
+    def __init__(self, code: str) -> None:
+        super().__init__(
+            f"La orden de compra '{code}' no es del proveedor seleccionado.",
+            error_code="purchase_request_supplier_mismatch",
+        )
+
+
+class PurchaseRequestRequiresSupplierCounterpartyError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Para vincular órdenes de compra, la contraparte del egreso debe ser un proveedor.",
+            error_code="purchase_request_requires_supplier_counterparty",
+        )
+
+
 class ClaimNotRejectedError(BadRequestError):
     def __init__(self) -> None:
         super().__init__(
@@ -184,4 +208,20 @@ class EntryAlreadyReversedError(BadRequestError):
         super().__init__(
             "Este movimiento ya fue reversado.",
             error_code="entry_already_reversed",
+        )
+
+
+class SameAccountTransferError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "La cuenta de origen y destino no pueden ser la misma.",
+            error_code="same_account_transfer",
+        )
+
+
+class TransferExchangeRateRequiredError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "La transferencia cambia de moneda — se requiere la tasa aplicada.",
+            error_code="transfer_exchange_rate_required",
         )

@@ -75,6 +75,10 @@ class ExpenseCategory(str, enum.Enum):
     IMPUESTOS_TASAS = "impuestos_tasas"
     GARANTIA_RECHAZADA = "garantia_rechazada"
     OTRO = "otro"
+    # Only ever set by create_transfer, never chosen from the "Registrar
+    # Egreso" form — excluded from operating_expenses via source_type, this
+    # exists purely so the category column has a truthful value.
+    TRANSFERENCIA_CUENTAS = "transferencia_cuentas"
 
 
 class IncomeConcept(str, enum.Enum):
@@ -112,3 +116,7 @@ class MovementSourceType(str, enum.Enum):
     SERVICE_ORDER = "service_order"
     SUPPLIER_CLAIM = "supplier_claim"
     WARRANTY_SUBMISSION = "warranty_submission"
+    # A transfer between two of the filial's own accounts — the pair of rows
+    # it creates points at each other via source_id, not at an external
+    # document, so the account-detail screen has nothing to link out to.
+    ACCOUNT_TRANSFER = "account_transfer"

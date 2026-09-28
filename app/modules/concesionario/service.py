@@ -262,6 +262,7 @@ class ConcesionarioService:
         for field in (
             "status",
             "condition",
+            "location",
             "brand",
             "model",
             "year",

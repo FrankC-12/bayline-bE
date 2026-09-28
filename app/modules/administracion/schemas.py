@@ -159,8 +159,29 @@ class PurchaseRequestRead(BaseModel):
     status: PurchaseRequestStatus
     lines: list[PurchaseRequestLineRead]
     total_quoted: float | None
+    conciliated_at: datetime | None
+    # "Estado de pago a proveedor" — distinct from `status`'s own PAGADA
+    # stage (see PurchaseRequest.paid_at comment); null means still owed.
+    paid_at: datetime | None
+    payment_expense_entry_id: uuid.UUID | None
     created_at: datetime
     updated_at: datetime
+
+
+class PayableRead(BaseModel):
+    """A conciliada, not-yet-paid PurchaseRequest — mirrors ReceivableRead's
+    shape, computed the same way (no persisted "payable" row, see
+    AdministracionService.list_payables)."""
+
+    purchase_request_id: uuid.UUID
+    code: str
+    filial_id: uuid.UUID
+    supplier_id: uuid.UUID
+    supplier_name: str
+    total_amount: float
+    conciliated_at: datetime
+    days_outstanding: int
+    aging_bucket: Literal["0-30", "31-60", "61-90", "90+"]
 
 
 # Supplier claims
@@ -304,6 +325,7 @@ class IncomeEntryRead(BaseModel):
     amount_bs: float | None
     attachment_url: str | None
     reverses_entry_id: uuid.UUID | None
+    reversal_reason: str | None
     source_type: MovementSourceType | None
     source_id: uuid.UUID | None
     registered_by_user_id: uuid.UUID | None
@@ -324,6 +346,10 @@ class ExpenseEntryCreate(BaseModel):
     counterparty_supplier_id: uuid.UUID | None = None
     counterparty_name: str | None = Field(default=None, max_length=150)
     reference: str | None = Field(default=None, max_length=60)
+    # Only meaningful for category="compras_proveedores" + counterparty_type
+    # "proveedor" — the PurchaseRequest(s) (Cuentas por Pagar) this payment
+    # settles. Marks each one fully paid; see AdministracionService.create_expense.
+    purchase_request_ids: list[uuid.UUID] = Field(default_factory=list)
 
     _validate_counterparty = model_validator(mode="after")(_validate_counterparty)
 
@@ -350,10 +376,15 @@ class ExpenseEntryRead(BaseModel):
     amount_bs: float | None
     attachment_url: str | None
     reverses_entry_id: uuid.UUID | None
+    reversal_reason: str | None
     source_type: MovementSourceType | None
     source_id: uuid.UUID | None
     registered_by_user_id: uuid.UUID | None
     created_at: datetime
+
+
+class ReverseEntryInput(BaseModel):
+    reason: str = Field(min_length=3, max_length=300)
 
 
 class AccountMovementRead(BaseModel):
@@ -375,9 +406,37 @@ class AccountMovementRead(BaseModel):
     reference: str | None
     attachment_url: str | None
     reverses_entry_id: uuid.UUID | None
+    reversal_reason: str | None = None
+    # Only meaningful for a transfer that changes currency — the rate the
+    # user applied to convert one account's amount into the other's.
+    exchange_rate: float | None = None
     source_type: MovementSourceType | None
     source_id: uuid.UUID | None
+    registered_by_user_id: uuid.UUID | None = None
     created_at: datetime
+
+
+class TransferCreate(BaseModel):
+    filial_id: uuid.UUID
+    entry_date: date
+    from_account_id: uuid.UUID
+    to_account_id: uuid.UUID
+    amount: float = Field(gt=0)  # in from_account's own currency
+    # Required only when from_account and to_account carry different
+    # currencies — the rate applied to convert one side into the other.
+    exchange_rate: float | None = Field(default=None, gt=0)
+    description: str | None = Field(default=None, max_length=200)
+    reference: str | None = Field(default=None, max_length=60)
+
+
+class TransferRead(BaseModel):
+    from_entry_id: uuid.UUID
+    to_entry_id: uuid.UUID
+    from_amount: float
+    to_amount: float
+    from_currency: AccountCurrency
+    to_currency: AccountCurrency
+    exchange_rate: float | None
 
 
 # Warranty submissions (monthly presentación to the holding)

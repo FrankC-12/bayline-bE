@@ -11,6 +11,7 @@ from app.modules.concesionario.enums import (
     SaleType,
     TransmissionType,
     VehicleCondition,
+    VehicleLocation,
     VehicleStatus,
 )
 
@@ -32,6 +33,12 @@ class DealershipVehicle(Base):
     )
     condition: Mapped[VehicleCondition] = mapped_column(
         Enum(VehicleCondition, name="dealership_vehicle_condition"), nullable=False
+    )
+    # Physical whereabouts within the filial — nullable since existing rows
+    # predate this field; a new vehicle always sets one (VehicleCreate
+    # requires it), so in practice only pre-existing inventory is ever null.
+    location: Mapped[VehicleLocation | None] = mapped_column(
+        Enum(VehicleLocation, name="dealership_vehicle_location"), nullable=True
     )
     brand: Mapped[str] = mapped_column(String(60), nullable=False)
     model: Mapped[str] = mapped_column(String(60), nullable=False)

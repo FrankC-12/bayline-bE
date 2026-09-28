@@ -97,6 +97,26 @@ class PurchaseRequest(Base):
     warehouse_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="SET NULL"), nullable=True
     )
+    # Set once, the moment status first becomes CONCILIADA — the anchor date
+    # for "Cuentas por Pagar" aging, distinct from `updated_at` (which any
+    # later edit would bump). Null for requests conciliated before this
+    # field existed; those fall back to `updated_at` when read.
+    conciliated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set when an ExpenseEntry (egreso, categoría "compras_proveedores") is
+    # linked against this request — see AdministracionService.create_expense.
+    # Distinct from PurchaseRequestStatus.PAGADA, an unrelated mid-workflow
+    # stage (paying the quote so the supplier ships) that exists before
+    # CONCILIADA and has no accounting effect.
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payment_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("accounts.id", ondelete="SET NULL"), nullable=True
+    )
+    payment_expense_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("expense_entries.id", ondelete="SET NULL"), nullable=True
+    )
+    paid_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -269,6 +289,10 @@ class IncomeEntry(Base):
     reverses_entry_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("income_entries.id", ondelete="SET NULL"), nullable=True
     )
+    # Only ever set on the counter-entry created by a reversal (never on the
+    # original row it reverses) — the mandatory reason the user gave when
+    # confirming the reverse.
+    reversal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Polymorphic pointer back at whatever document generated this entry
     # (a VehicleSale, PartSale, ServiceOrder...) — no FK constraint since the
     # target table varies with source_type; lets the account-detail screen
@@ -380,6 +404,8 @@ class ExpenseEntry(Base):
     reverses_entry_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("expense_entries.id", ondelete="SET NULL"), nullable=True
     )
+    # See IncomeEntry.reversal_reason — same "only on the counter-entry" rule.
+    reversal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # See IncomeEntry.source_type/source_id — same polymorphic, no-FK link
     # back at whatever generated this expense (e.g. a resolved SupplierClaim).
     source_type: Mapped[MovementSourceType | None] = mapped_column(

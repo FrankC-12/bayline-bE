@@ -30,4 +30,5 @@ MODULE_CATALOG: list[str] = [
     "finanzas-egreso",
     "finanzas-reversar",
     "finanzas-rentabilidad",
+    "finanzas-transferir",
 ]

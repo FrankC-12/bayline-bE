@@ -14,6 +14,12 @@ class VehicleStatus(str, enum.Enum):
     VENDIDO = "vendido"
 
 
+class VehicleLocation(str, enum.Enum):
+    PATIO = "patio"
+    SHOWROOM = "showroom"
+    SUCURSAL = "sucursal"
+
+
 class FuelType(str, enum.Enum):
     GASOLINA = "gasolina"
     DIESEL = "diesel"

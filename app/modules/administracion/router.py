@@ -1,7 +1,9 @@
+import json
 import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile, status
+from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -18,10 +20,12 @@ from app.modules.administracion.schemas import (
     FinanceDashboard,
     IncomeEntryCreate,
     IncomeEntryRead,
+    PayableRead,
     ProfitabilityReport,
     PurchaseRequestCreate,
     PurchaseRequestRead,
     PurchaseRequestStatusUpdate,
+    ReverseEntryInput,
     SupplierClaimCreate,
     SupplierClaimRead,
     SupplierClaimResolveInput,
@@ -30,6 +34,8 @@ from app.modules.administracion.schemas import (
     SupplierDetailRead,
     SupplierRead,
     SupplierUpdate,
+    TransferCreate,
+    TransferRead,
     WarrantySubmissionCreate,
     WarrantySubmissionPayInput,
     WarrantySubmissionRead,
@@ -169,6 +175,17 @@ async def update_purchase_request_status(
         request_id, payload.status, payload.quotes, payload.warehouse_id, payload.location,
         current_user.user_id,
     )
+
+
+@router.get("/payables", response_model=list[PayableRead])
+async def list_payables(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+) -> list[PayableRead]:
+    """Cuentas por Pagar — órdenes de compra conciliadas y aún no pagadas."""
+    await _ensure_compras_access(current_user, filial_id, service.db)
+    return await service.list_payables(filial_id)
 
 
 # Supplier claims
@@ -378,6 +395,16 @@ async def get_account_movements(
     return await service.get_account_movements(account_id, limit)
 
 
+@router.post("/transfers", response_model=TransferRead, status_code=status.HTTP_201_CREATED)
+async def create_transfer(
+    payload: TransferCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+) -> TransferRead:
+    await _ensure_transferir_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_transfer(payload, current_user.user_id)
+
+
 # Income / Expense
 
 
@@ -392,6 +419,7 @@ MANUAL_MOVEMENTS_MODULE_ID = "movimientos-manuales"
 EGRESO_MODULE_ID = "finanzas-egreso"
 REVERSAR_MODULE_ID = "finanzas-reversar"
 RENTABILIDAD_MODULE_ID = "finanzas-rentabilidad"
+TRANSFERIR_MODULE_ID = "finanzas-transferir"
 
 
 async def _ensure_manual_movement_access(
@@ -428,6 +456,15 @@ async def _ensure_rentabilidad_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, RENTABILIDAD_MODULE_ID, level)
+
+
+async def _ensure_transferir_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, TRANSFERIR_MODULE_ID, level)
 
 
 @router.get("/income-entries", response_model=list[IncomeEntryRead])
@@ -472,6 +509,7 @@ async def create_income_entry(
 @router.post("/income-entries/{entry_id}/reverse", response_model=IncomeEntryRead)
 async def reverse_income_entry(
     entry_id: uuid.UUID,
+    payload: ReverseEntryInput,
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> IncomeEntryRead:
@@ -479,7 +517,7 @@ async def reverse_income_entry(
     if existing is None:
         raise EntryNotFoundError(str(entry_id))
     await _ensure_reversar_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.reverse_income(entry_id, current_user.user_id)
+    return await service.reverse_income(entry_id, current_user.user_id, payload.reason)
 
 
 @router.get("/expense-entries", response_model=list[ExpenseEntryRead])
@@ -508,6 +546,8 @@ async def create_expense_entry(
     counterparty_supplier_id: uuid.UUID | None = Form(None),
     counterparty_name: str | None = Form(None),
     reference: str | None = Form(None),
+    # JSON-encoded list — Form doesn't support a native list-of-UUID field.
+    purchase_request_ids_json: str = Form(default="[]"),
     attachment: UploadFile | None = File(None),
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
@@ -518,6 +558,7 @@ async def create_expense_entry(
         counterparty_type=counterparty_type, counterparty_client_id=counterparty_client_id,
         counterparty_supplier_id=counterparty_supplier_id, counterparty_name=counterparty_name,
         reference=reference,
+        purchase_request_ids=TypeAdapter(list[uuid.UUID]).validate_python(json.loads(purchase_request_ids_json)),
     )
     await _ensure_egreso_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_expense(payload, attachment, current_user.user_id)
@@ -526,6 +567,7 @@ async def create_expense_entry(
 @router.post("/expense-entries/{entry_id}/reverse", response_model=ExpenseEntryRead)
 async def reverse_expense_entry(
     entry_id: uuid.UUID,
+    payload: ReverseEntryInput,
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> ExpenseEntryRead:
@@ -533,7 +575,7 @@ async def reverse_expense_entry(
     if existing is None:
         raise EntryNotFoundError(str(entry_id))
     await _ensure_reversar_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.reverse_expense(entry_id, current_user.user_id)
+    return await service.reverse_expense(entry_id, current_user.user_id, payload.reason)
 
 
 # Reports
