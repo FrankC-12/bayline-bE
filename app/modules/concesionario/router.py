@@ -1,9 +1,12 @@
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.storage import save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.concesionario.schemas import (
@@ -54,6 +57,30 @@ async def create_vehicle(
 ) -> VehicleRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_vehicle(payload)
+
+
+@router.post("/dealership-vehicles/{vehicle_id}/photos", response_model=VehicleRead)
+async def upload_vehicle_photos(
+    vehicle_id: uuid.UUID,
+    photos: list[UploadFile] = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+) -> VehicleRead:
+    existing = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+
+    settings = get_settings()
+    photo_urls = [
+        await save_upload_image(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="dealership-vehicles",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        for photo in photos
+    ]
+    return await service.add_vehicle_photos(vehicle_id, photo_urls)
 
 
 @router.patch("/dealership-vehicles/{vehicle_id}", response_model=VehicleRead)

@@ -2,15 +2,17 @@ import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.modules.inspections.enums import InspectionStatus
 from app.modules.inspections.exceptions import (
     CannotDeleteLinkedInspectionError,
     InspectionAlreadyLinkedError,
+    InspectionDamageNotFoundError,
     InspectionNotesRequiredError,
     InspectionNotFoundError,
 )
-from app.modules.inspections.models import PreliminaryInspection
+from app.modules.inspections.models import InspectionDamage, PreliminaryInspection
 from app.modules.inspections.schemas import InspectionCreate, InspectionUpdate
 from app.modules.service_orders.guards import require_editable_order
 
@@ -22,7 +24,11 @@ class InspectionService:
     async def list_inspections(
         self, filial_id: uuid.UUID, unlinked_only: bool = False
     ) -> list[PreliminaryInspection]:
-        query = select(PreliminaryInspection).where(PreliminaryInspection.filial_id == filial_id)
+        query = (
+            select(PreliminaryInspection)
+            .options(selectinload(PreliminaryInspection.damages))
+            .where(PreliminaryInspection.filial_id == filial_id)
+        )
         if unlinked_only:
             query = query.where(PreliminaryInspection.service_order_id.is_(None))
         query = query.order_by(PreliminaryInspection.created_at.desc())
@@ -30,16 +36,18 @@ class InspectionService:
         return list(result.scalars().all())
 
     async def get_inspection(self, inspection_id: uuid.UUID) -> PreliminaryInspection:
-        inspection = await self.db.get(PreliminaryInspection, inspection_id)
+        inspection = await self.db.get(
+            PreliminaryInspection, inspection_id, options=[selectinload(PreliminaryInspection.damages)]
+        )
         if inspection is None:
             raise InspectionNotFoundError(str(inspection_id))
         return inspection
 
     async def get_for_order(self, service_order_id: uuid.UUID) -> PreliminaryInspection | None:
         result = await self.db.execute(
-            select(PreliminaryInspection).where(
-                PreliminaryInspection.service_order_id == service_order_id
-            )
+            select(PreliminaryInspection)
+            .options(selectinload(PreliminaryInspection.damages))
+            .where(PreliminaryInspection.service_order_id == service_order_id)
         )
         return result.scalar_one_or_none()
 
@@ -55,6 +63,10 @@ class InspectionService:
             mileage=payload.mileage,
             notes=payload.notes,
             status=payload.status,
+            damages=[
+                InspectionDamage(**damage.model_dump(), sort_order=index)
+                for index, damage in enumerate(payload.damages)
+            ],
         )
         self.db.add(inspection)
         await self.db.commit()
@@ -116,3 +128,24 @@ class InspectionService:
             raise CannotDeleteLinkedInspectionError()
         await self.db.delete(inspection)
         await self.db.commit()
+
+    async def set_damage_photo(
+        self, inspection_id: uuid.UUID, damage_id: uuid.UUID, photo_url: str
+    ) -> PreliminaryInspection:
+        inspection = await self.get_inspection(inspection_id)
+        damage = next((d for d in inspection.damages if d.id == damage_id), None)
+        if damage is None:
+            raise InspectionDamageNotFoundError(str(damage_id))
+        damage.photo_url = photo_url
+        await self.db.commit()
+        await self.db.refresh(inspection)
+        return inspection
+
+    async def add_inspection_photos(
+        self, inspection_id: uuid.UUID, photo_urls: list[str]
+    ) -> PreliminaryInspection:
+        inspection = await self.get_inspection(inspection_id)
+        inspection.photo_urls = [*inspection.photo_urls, *photo_urls]
+        await self.db.commit()
+        await self.db.refresh(inspection)
+        return inspection

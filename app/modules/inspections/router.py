@@ -1,9 +1,12 @@
 import uuid
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.storage import save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.inspections.schemas import InspectionCreate, InspectionRead, InspectionUpdate
@@ -83,3 +86,49 @@ async def delete_inspection(
     existing = await service.get_inspection(inspection_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     await service.delete_inspection(inspection_id)
+
+
+@router.post("/{inspection_id}/damages/{damage_id}/photo", response_model=InspectionRead)
+async def upload_damage_photo(
+    inspection_id: uuid.UUID,
+    damage_id: uuid.UUID,
+    photo: UploadFile = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: InspectionService = Depends(get_service),
+) -> InspectionRead:
+    existing = await service.get_inspection(inspection_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+
+    settings = get_settings()
+    photo_url = await save_upload_image(
+        photo,
+        directory=Path(settings.uploads_dir),
+        subdir="inspections",
+        url_prefix=f"{settings.api_v1_prefix}/uploads",
+        max_mb=settings.max_upload_mb,
+    )
+    return await service.set_damage_photo(inspection_id, damage_id, photo_url)
+
+
+@router.post("/{inspection_id}/photos", response_model=InspectionRead)
+async def upload_inspection_photos(
+    inspection_id: uuid.UUID,
+    photos: list[UploadFile] = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: InspectionService = Depends(get_service),
+) -> InspectionRead:
+    existing = await service.get_inspection(inspection_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+
+    settings = get_settings()
+    photo_urls = [
+        await save_upload_image(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="inspections",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        for photo in photos
+    ]
+    return await service.add_inspection_photos(inspection_id, photo_urls)

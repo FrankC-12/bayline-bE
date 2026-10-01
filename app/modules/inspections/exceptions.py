@@ -8,6 +8,13 @@ class InspectionNotFoundError(NotFoundError):
         )
 
 
+class InspectionDamageNotFoundError(NotFoundError):
+    def __init__(self, damage_id: str) -> None:
+        super().__init__(
+            f"Inspection damage '{damage_id}' was not found.", error_code="inspection_damage_not_found"
+        )
+
+
 class InspectionAlreadyLinkedError(BadRequestError):
     def __init__(self) -> None:
         super().__init__(

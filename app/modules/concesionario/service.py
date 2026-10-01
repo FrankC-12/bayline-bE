@@ -85,6 +85,13 @@ class ConcesionarioService:
         await self.db.refresh(vehicle)
         return vehicle
 
+    async def add_vehicle_photos(self, vehicle_id: uuid.UUID, photo_urls: list[str]) -> DealershipVehicle:
+        vehicle = await self.get_vehicle(vehicle_id)
+        vehicle.images = [*vehicle.images, *photo_urls]
+        await self.db.commit()
+        await self.db.refresh(vehicle)
+        return vehicle
+
     async def _require_vehicle_for_update(self, vehicle_id: uuid.UUID) -> DealershipVehicle:
         result = await self.db.execute(
             select(DealershipVehicle)

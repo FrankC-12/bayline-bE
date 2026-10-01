@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     uploads_dir: str = "uploads"
     max_upload_mb: int = 8
 
+    # S3-backed uploads — optional. When s3_bucket_name is unset, every
+    # upload falls back to local disk (uploads_dir) exactly as before, so
+    # dev/test environments never need real AWS credentials.
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_region: str = "us-east-1"
+    s3_bucket_name: str | None = None
+
     @property
     def cookie_secure(self) -> bool:
         return self.app_env in {"production", "staging"}
