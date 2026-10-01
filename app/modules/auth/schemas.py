@@ -10,6 +10,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RefreshRequest(BaseModel):
+    """Only meaningful for a mobile client — the web app's refresh token
+    never leaves the server as anything but an HttpOnly cookie, so this
+    field is how a mobile client (which stored it itself after login)
+    hands it back."""
+
+    refresh_token: str | None = None
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str

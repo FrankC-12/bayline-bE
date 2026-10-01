@@ -65,3 +65,32 @@ async def test_add_photos_to_unknown_vehicle_raises(env):
     service, _filial_id = env
     with pytest.raises(VehicleNotFoundError):
         await service.add_vehicle_photos(uuid.uuid4(), ["https://bucket/a.jpg"])
+
+
+@pytest.mark.asyncio
+async def test_remove_vehicle_photo_drops_only_that_url(env):
+    service, filial_id = env
+    vehicle = await service.create_vehicle(_create_payload(filial_id))
+    await service.add_vehicle_photos(vehicle.id, ["https://bucket/a.jpg", "https://bucket/b.jpg"])
+
+    updated = await service.remove_vehicle_photo(vehicle.id, "https://bucket/a.jpg")
+
+    assert updated.images == ["https://bucket/b.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_removing_a_url_not_in_the_list_is_a_no_op(env):
+    service, filial_id = env
+    vehicle = await service.create_vehicle(_create_payload(filial_id))
+    await service.add_vehicle_photos(vehicle.id, ["https://bucket/a.jpg"])
+
+    updated = await service.remove_vehicle_photo(vehicle.id, "https://bucket/does-not-exist.jpg")
+
+    assert updated.images == ["https://bucket/a.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_remove_photo_from_unknown_vehicle_raises(env):
+    service, _filial_id = env
+    with pytest.raises(VehicleNotFoundError):
+        await service.remove_vehicle_photo(uuid.uuid4(), "https://bucket/a.jpg")

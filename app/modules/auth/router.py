@@ -7,7 +7,7 @@ from app.core.database import get_db
 from app.core.exceptions import DomainError
 from app.modules.auth.cookies import REFRESH_COOKIE, clear_session_cookies, set_session_cookies
 from app.modules.auth.dependencies import get_current_user
-from app.modules.auth.schemas import AccessMapResponse, CurrentUser, LoginRequest
+from app.modules.auth.schemas import AccessMapResponse, CurrentUser, LoginRequest, RefreshRequest, TokenResponse
 from app.modules.auth.service import AuthService
 from app.modules.roles.models import RoleModulePermission
 from app.modules.roles.module_catalog import MODULE_CATALOG
@@ -20,28 +20,39 @@ def get_auth_service(db: AsyncSession = Depends(get_db)) -> AuthService:
     return AuthService(db)
 
 
-@router.post("/login")
+@router.post("/login", response_model=TokenResponse)
 async def login(
     payload: LoginRequest,
     response: Response,
     service: AuthService = Depends(get_auth_service),
-):
+) -> TokenResponse:
+    """Sets the session as HttpOnly cookies for the web app AND returns the
+    tokens in the body — a mobile client has no cookie jar to lean on, so it
+    stores access_token/refresh_token itself and sends the former as
+    `Authorization: Bearer <access_token>` on every subsequent call."""
     tokens = await service.login(payload.email, payload.password)
     set_session_cookies(response, tokens)
-    return {"authenticated": True}
+    return tokens
 
 
 @router.post("/refresh")
-async def refresh(request: Request, service: AuthService = Depends(get_auth_service)):
+async def refresh(
+    request: Request,
+    payload: RefreshRequest = RefreshRequest(),
+    service: AuthService = Depends(get_auth_service),
+):
+    # Cookie first (web) — fall back to a body-supplied refresh_token (mobile,
+    # which never received one as a cookie to begin with).
+    refresh_token = request.cookies.get(REFRESH_COOKIE) or payload.refresh_token or ""
     try:
-        tokens = await service.refresh(request.cookies.get(REFRESH_COOKIE, ""))
+        tokens = await service.refresh(refresh_token)
     except DomainError as exc:
         response = JSONResponse(
             {"message": exc.message, "errorCode": exc.error_code}, status_code=exc.status_code
         )
         clear_session_cookies(response)
         return response
-    response = JSONResponse({"authenticated": True})
+    response = JSONResponse(tokens.model_dump())
     set_session_cookies(response, tokens)
     return response
 

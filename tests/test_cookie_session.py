@@ -73,7 +73,10 @@ def session_app(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_login_me_refresh_logout_without_exposing_tokens(session_app):
+async def test_login_me_refresh_logout_also_exposes_tokens_for_mobile(session_app):
+    """Web keeps using the HttpOnly cookies (unchanged); a mobile client has
+    no cookie jar, so login/refresh now ALSO return the tokens in the body —
+    this is the intentional contract change that makes mobile possible."""
     async with AsyncClient(transport=ASGITransport(app=session_app), base_url=ORIGIN) as client:
         result = await client.post(
             "/api/v1/auth/login",
@@ -81,7 +84,9 @@ async def test_login_me_refresh_logout_without_exposing_tokens(session_app):
             json={"email": "user@example.com", "password": "test"},
         )
         assert result.status_code == 200
-        assert result.json() == {"authenticated": True}
+        body = result.json()
+        assert body["token_type"] == "bearer"
+        assert body["access_token"] and body["refresh_token"]
         headers = result.headers.get_list("set-cookie")
         assert len(headers) == 2
         assert all("HttpOnly" in h and "Secure" in h and "SameSite=lax" in h for h in headers)
@@ -92,13 +97,20 @@ async def test_login_me_refresh_logout_without_exposing_tokens(session_app):
         assert me.status_code == 200
         assert me.json()["email"] == "user@example.com"
         assert "access_token" not in me.json()
+        # A mobile client authenticates the same /me endpoint with its stored
+        # access_token as a Bearer header instead of a cookie.
+        bearer_me = await client.get(
+            "/api/v1/auth/me", headers={"Authorization": f"Bearer {body['access_token']}"}
+        )
+        assert bearer_me.status_code == 200
         # An expired/missing access cookie can be recovered using the HttpOnly refresh cookie.
         for cookie in list(client.cookies.jar):
             if cookie.name == cookies.ACCESS_COOKIE:
                 client.cookies.delete(cookie.name, domain=cookie.domain, path=cookie.path)
         assert (await client.get("/api/v1/auth/me")).status_code == 401
         renewed = await client.post("/api/v1/auth/refresh", headers=HEADERS)
-        assert renewed.status_code == 200 and renewed.json() == {"authenticated": True}
+        assert renewed.status_code == 200
+        assert renewed.json()["access_token"]
         assert (await client.get("/api/v1/auth/me")).status_code == 200
         logged_out = await client.post("/api/v1/auth/logout", headers=HEADERS)
         assert logged_out.status_code == 204
@@ -108,17 +120,11 @@ async def test_login_me_refresh_logout_without_exposing_tokens(session_app):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "headers",
-    [
-        {},
-        {"Origin": ORIGIN},
-        {"Origin": "https://attacker.example", "X-CSRF-Protection": "1"},
-        {"Origin": "null", "X-CSRF-Protection": "1"},
-        {"Origin": "https://sub.app.example.com", "X-CSRF-Protection": "1"},
-    ],
-)
-async def test_csrf_rejected_even_for_login(session_app, headers):
+@pytest.mark.parametrize("headers", [{}, {"Origin": ORIGIN}])
+async def test_missing_csrf_header_is_rejected_for_every_auth_endpoint(session_app, headers):
+    """X-CSRF-Protection is required unconditionally — even login/refresh's
+    Origin exemption (below) never waives this, since a plain HTML form
+    can't set it without JS."""
     async with AsyncClient(transport=ASGITransport(app=session_app), base_url=ORIGIN) as client:
         for endpoint in ["login", "refresh", "logout"]:
             result = await client.post(
@@ -132,15 +138,51 @@ async def test_csrf_rejected_even_for_login(session_app, headers):
 
 
 @pytest.mark.asyncio
-async def test_body_tokens_and_bearer_no_longer_authenticate(session_app):
+@pytest.mark.parametrize(
+    "origin",
+    ["https://attacker.example", "null", "https://sub.app.example.com"],
+)
+async def test_login_and_refresh_waive_the_origin_check_but_logout_does_not(session_app, origin):
+    """A mobile client has no browser-managed Origin header to send, so
+    login/refresh (the two calls a client makes before it has a Bearer token
+    to rely on instead) don't require it. logout isn't exempt — a request
+    there either already has a Bearer token (covered by the Bearer exemption
+    tested elsewhere) or must come from a known web origin."""
+    headers = {"Origin": origin, "X-CSRF-Protection": "1"}
     async with AsyncClient(transport=ASGITransport(app=session_app), base_url=ORIGIN) as client:
-        old_refresh = create_refresh_token(str(uuid.uuid4()))
+        for endpoint in ["login", "refresh"]:
+            result = await client.post(
+                "/api/v1/auth/" + endpoint,
+                headers=headers,
+                json={"email": "user@example.com", "password": "test"},
+            )
+            assert result.status_code == 200
+
+        logout = await client.post("/api/v1/auth/logout", headers=headers)
+        assert logout.status_code == 403
+        assert logout.json()["errorCode"] == "csrf_rejected"
+
+
+@pytest.mark.asyncio
+async def test_refresh_accepts_a_body_token_and_bearer_only_authenticates_access_tokens(session_app):
+    """The mobile contract: a refresh_token in the body (no cookie) renews
+    the session — but a Bearer header only ever authenticates a real access
+    token, never a refresh token (decode_access_token rejects type=refresh),
+    so a client can't bypass auth by reusing its refresh token as a Bearer."""
+    async with AsyncClient(transport=ASGITransport(app=session_app), base_url=ORIGIN) as client:
+        valid_refresh = create_refresh_token(str(uuid.uuid4()))
         result = await client.post(
-            "/api/v1/auth/refresh", headers=HEADERS, json={"refresh_token": old_refresh}
+            "/api/v1/auth/refresh", headers=HEADERS, json={"refresh_token": valid_refresh}
         )
-        assert result.status_code == 401
+        assert result.status_code == 200
+        assert result.json()["access_token"]
+        # That refresh call also set a (valid) access cookie on this client —
+        # clear it so the next call is actually testing the Bearer header
+        # alone, not falling back to the cookie get_current_user prefers.
+        client.cookies.clear()
+
         assert (
-            await client.get("/api/v1/auth/me", headers={"Authorization": "Bearer " + old_refresh})
+            await client.get("/api/v1/auth/me", headers={"Authorization": "Bearer " + valid_refresh})
         ).status_code == 401
 
 

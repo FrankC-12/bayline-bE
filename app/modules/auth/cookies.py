@@ -1,4 +1,6 @@
-"""Session JWTs never leave the server except as HttpOnly cookies."""
+"""Sets the session as HttpOnly cookies for the web app on every login/
+refresh — a mobile client ignores these (no cookie jar) and instead reads
+the same tokens from the JSON response body (see auth/router.py)."""
 
 from fastapi import Response
 

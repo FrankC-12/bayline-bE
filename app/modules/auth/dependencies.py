@@ -11,8 +11,15 @@ from app.modules.roles.enums import RoleScope
 
 
 def get_current_user(request: Request) -> CurrentUser:
-    """Validate the access cookie; Authorization headers are not session credentials."""
+    """Validate the access cookie (web) or an `Authorization: Bearer` token
+    (mobile/native clients, which have no browser cookie jar to rely on) —
+    whichever the request actually sent. See also HttpSecurityMiddleware,
+    which skips its Origin/CSRF check for Bearer-authenticated requests."""
     token = request.cookies.get(ACCESS_COOKIE)
+    if not token:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
     if not token:
         raise InvalidTokenError()
     try:

@@ -11,6 +11,7 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.concesionario.schemas import (
     VehicleCreate,
+    VehiclePhotoRemoveInput,
     VehicleRead,
     VehicleReservationInput,
     VehicleSaleRead,
@@ -81,6 +82,18 @@ async def upload_vehicle_photos(
         for photo in photos
     ]
     return await service.add_vehicle_photos(vehicle_id, photo_urls)
+
+
+@router.delete("/dealership-vehicles/{vehicle_id}/photos", response_model=VehicleRead)
+async def remove_vehicle_photo(
+    vehicle_id: uuid.UUID,
+    payload: VehiclePhotoRemoveInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+) -> VehicleRead:
+    existing = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.remove_vehicle_photo(vehicle_id, payload.photo_url)
 
 
 @router.patch("/dealership-vehicles/{vehicle_id}", response_model=VehicleRead)

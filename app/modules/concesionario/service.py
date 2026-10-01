@@ -92,6 +92,16 @@ class ConcesionarioService:
         await self.db.refresh(vehicle)
         return vehicle
 
+    async def remove_vehicle_photo(self, vehicle_id: uuid.UUID, photo_url: str) -> DealershipVehicle:
+        """Only drops the reference from `images` — the underlying file in
+        S3/disk is left in place (same minimal-footprint choice already made
+        for PartReturn/Inspection photos, which never got a delete either)."""
+        vehicle = await self.get_vehicle(vehicle_id)
+        vehicle.images = [url for url in vehicle.images if url != photo_url]
+        await self.db.commit()
+        await self.db.refresh(vehicle)
+        return vehicle
+
     async def _require_vehicle_for_update(self, vehicle_id: uuid.UUID) -> DealershipVehicle:
         result = await self.db.execute(
             select(DealershipVehicle)

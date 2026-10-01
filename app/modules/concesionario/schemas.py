@@ -64,6 +64,10 @@ class VehicleSaleInput(BaseModel):
         return self
 
 
+class VehiclePhotoRemoveInput(BaseModel):
+    photo_url: str
+
+
 class VehicleReservationInput(BaseModel):
     client_id: uuid.UUID
     # The vendedor the reservation — and the unit — is locked to, distinct
