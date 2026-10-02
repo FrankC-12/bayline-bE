@@ -78,8 +78,11 @@ class InspectionService:
         )
         self.db.add(inspection)
         await self.db.commit()
-        await self.db.refresh(inspection)
-        return inspection
+        # Plain refresh() doesn't reliably reload the `damages` relationship
+        # under the async Postgres driver (unlike get_inspection's explicit
+        # selectinload), which raised MissingGreenlet when FastAPI tried to
+        # serialize it — re-fetch through get_inspection instead.
+        return await self.get_inspection(inspection.id)
 
     async def update_inspection(
         self, inspection_id: uuid.UUID, payload: InspectionUpdate
