@@ -12,6 +12,10 @@ from app.modules.inspections.exceptions import (
     InspectionNotesRequiredError,
     InspectionNotFoundError,
 )
+from app.modules.clients.exceptions import VehicleNotFoundError
+from app.modules.clients.models import Vehicle
+from app.modules.filiales.exceptions import FilialNotFoundError
+from app.modules.filiales.models import Filial
 from app.modules.inspections.models import InspectionDamage, PreliminaryInspection
 from app.modules.inspections.schemas import InspectionCreate, InspectionUpdate
 from app.modules.service_orders.guards import require_editable_order
@@ -56,6 +60,10 @@ class InspectionService:
     ) -> PreliminaryInspection:
         if payload.status == InspectionStatus.COMPLETADA and not (payload.notes and payload.notes.strip()):
             raise InspectionNotesRequiredError()
+        if await self.db.get(Filial, payload.filial_id) is None:
+            raise FilialNotFoundError(str(payload.filial_id))
+        if await self.db.get(Vehicle, payload.vehicle_id) is None:
+            raise VehicleNotFoundError(str(payload.vehicle_id))
         inspection = PreliminaryInspection(
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,

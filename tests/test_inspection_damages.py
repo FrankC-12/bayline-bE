@@ -16,6 +16,8 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.modules.clients.models import Vehicle
+from app.modules.filiales.models import Filial
 from app.modules.inspections.exceptions import InspectionDamageNotFoundError
 from app.modules.inspections.schemas import InspectionCreate, InspectionDamageInput
 from app.modules.inspections.service import InspectionService
@@ -26,12 +28,16 @@ def env():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False, autoflush=False) as session:
-        yield InspectionService(AsyncAdapter(session)), session
+        filial = Filial(holding_id=uuid.uuid4(), name="Taller Central", slug="taller-central")
+        vehicle = Vehicle(client_id=uuid.uuid4(), brand="Toyota", model="Corolla")
+        session.add_all([filial, vehicle])
+        session.flush()
+        yield InspectionService(AsyncAdapter(session)), session, filial.id, vehicle.id
 
 
-def _create_payload(**overrides):
+def _create_payload(filial_id, vehicle_id, **overrides):
     fields = {
-        "filial_id": uuid.uuid4(), "vehicle_id": uuid.uuid4(), "notes": "Chequeo de ingreso",
+        "filial_id": filial_id, "vehicle_id": vehicle_id, "notes": "Chequeo de ingreso",
     }
     fields.update(overrides)
     return InspectionCreate(**fields)
@@ -45,9 +51,10 @@ def _damage(**overrides):
 
 @pytest.mark.asyncio
 async def test_create_inspection_persists_its_damages(env):
-    service, _session = env
+    service, _session, filial_id, vehicle_id = env
     inspection = await service.create_inspection(
         _create_payload(
+            filial_id, vehicle_id,
             damages=[
                 _damage(zone="puerta_trasera_derecha", kind="rayon", severity="leve"),
                 _damage(x=0.28, y=0.21, zone="guardafango_delantero_izquierdo", kind="abolladura", severity="grave", description=None),
@@ -63,16 +70,16 @@ async def test_create_inspection_persists_its_damages(env):
 
 @pytest.mark.asyncio
 async def test_inspection_without_damages_in_payload_saves_empty_list(env):
-    service, _session = env
-    inspection = await service.create_inspection(_create_payload(), uuid.uuid4())
+    service, _session, filial_id, vehicle_id = env
+    inspection = await service.create_inspection(_create_payload(filial_id, vehicle_id), uuid.uuid4())
     assert inspection.damages == []
 
 
 @pytest.mark.asyncio
 async def test_list_inspections_eager_loads_damages(env):
-    service, _session = env
+    service, _session, filial_id, vehicle_id = env
     created = await service.create_inspection(
-        _create_payload(damages=[_damage()]), uuid.uuid4()
+        _create_payload(filial_id, vehicle_id, damages=[_damage()]), uuid.uuid4()
     )
 
     listed = await service.list_inspections(created.filial_id)
@@ -83,9 +90,9 @@ async def test_list_inspections_eager_loads_damages(env):
 
 @pytest.mark.asyncio
 async def test_get_inspection_eager_loads_damages(env):
-    service, _session = env
+    service, _session, filial_id, vehicle_id = env
     created = await service.create_inspection(
-        _create_payload(damages=[_damage()]), uuid.uuid4()
+        _create_payload(filial_id, vehicle_id, damages=[_damage()]), uuid.uuid4()
     )
 
     fetched = await service.get_inspection(created.id)
@@ -94,9 +101,9 @@ async def test_get_inspection_eager_loads_damages(env):
 
 @pytest.mark.asyncio
 async def test_get_for_order_eager_loads_damages(env):
-    service, session = env
+    service, session, filial_id, vehicle_id = env
     created = await service.create_inspection(
-        _create_payload(damages=[_damage()]), uuid.uuid4()
+        _create_payload(filial_id, vehicle_id, damages=[_damage()]), uuid.uuid4()
     )
     order_id = uuid.uuid4()
     created.service_order_id = order_id
@@ -109,9 +116,9 @@ async def test_get_for_order_eager_loads_damages(env):
 
 @pytest.mark.asyncio
 async def test_deleting_an_unlinked_inspection_cascades_its_damages(env):
-    service, session = env
+    service, session, filial_id, vehicle_id = env
     created = await service.create_inspection(
-        _create_payload(damages=[_damage()]), uuid.uuid4()
+        _create_payload(filial_id, vehicle_id, damages=[_damage()]), uuid.uuid4()
     )
     damage_id = created.damages[0].id
 
@@ -124,9 +131,9 @@ async def test_deleting_an_unlinked_inspection_cascades_its_damages(env):
 
 @pytest.mark.asyncio
 async def test_set_damage_photo_persists_the_url(env):
-    service, _session = env
+    service, _session, filial_id, vehicle_id = env
     created = await service.create_inspection(
-        _create_payload(damages=[_damage()]), uuid.uuid4()
+        _create_payload(filial_id, vehicle_id, damages=[_damage()]), uuid.uuid4()
     )
     damage_id = created.damages[0].id
 
@@ -137,8 +144,8 @@ async def test_set_damage_photo_persists_the_url(env):
 
 @pytest.mark.asyncio
 async def test_set_damage_photo_for_unknown_damage_raises(env):
-    service, _session = env
-    created = await service.create_inspection(_create_payload(), uuid.uuid4())
+    service, _session, filial_id, vehicle_id = env
+    created = await service.create_inspection(_create_payload(filial_id, vehicle_id), uuid.uuid4())
 
     with pytest.raises(InspectionDamageNotFoundError):
         await service.set_damage_photo(created.id, uuid.uuid4(), "https://bucket.s3.amazonaws.com/x.jpg")
@@ -146,8 +153,8 @@ async def test_set_damage_photo_for_unknown_damage_raises(env):
 
 @pytest.mark.asyncio
 async def test_add_inspection_photos_appends_rather_than_replaces(env):
-    service, _session = env
-    created = await service.create_inspection(_create_payload(), uuid.uuid4())
+    service, _session, filial_id, vehicle_id = env
+    created = await service.create_inspection(_create_payload(filial_id, vehicle_id), uuid.uuid4())
 
     once = await service.add_inspection_photos(created.id, ["https://bucket/a.jpg"])
     assert once.photo_urls == ["https://bucket/a.jpg"]
@@ -161,9 +168,10 @@ async def test_damages_are_returned_in_submission_order(env):
     """All damages in one inspection share the same created_at (same
     transaction) — sort_order, not created_at, is what the frontend relies
     on to match each returned damage id back to its own pending photo."""
-    service, _session = env
+    service, _session, filial_id, vehicle_id = env
     inspection = await service.create_inspection(
         _create_payload(
+            filial_id, vehicle_id,
             damages=[
                 _damage(zone="capo", kind="rayon"),
                 _damage(zone="maletero", kind="golpe"),
@@ -181,6 +189,6 @@ async def test_damages_are_returned_in_submission_order(env):
 
 @pytest.mark.asyncio
 async def test_inspection_without_photos_defaults_to_empty_list(env):
-    service, _session = env
-    created = await service.create_inspection(_create_payload(), uuid.uuid4())
+    service, _session, filial_id, vehicle_id = env
+    created = await service.create_inspection(_create_payload(filial_id, vehicle_id), uuid.uuid4())
     assert created.photo_urls == []
