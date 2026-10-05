@@ -166,6 +166,7 @@ async def test_ods_http_discount_update_and_summary(order_inventory, monkeypatch
         pass
 
     monkeypatch.setattr(routes, "_ensure_access", allowed)
+    monkeypatch.setattr(routes, "_ensure_order_access", allowed)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         for label, expected in LEVELS:
             response = await client.patch(

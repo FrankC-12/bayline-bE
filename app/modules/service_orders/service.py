@@ -158,12 +158,18 @@ class ServiceOrderService:
         filial_id: uuid.UUID,
         statuses: list[ServiceOrderStatus] | None = None,
         scheduled_date: date | None = None,
+        technician_user_id: uuid.UUID | None = None,
     ) -> list[ServiceOrder]:
+        """`technician_user_id` restricts the list to orders assigned to that
+        técnico — used when the caller doesn't have general asesor-servicios
+        access but may still see their own assigned work (see router._ensure_access)."""
         query = select(ServiceOrder).where(ServiceOrder.filial_id == filial_id)
         if statuses:
             query = query.where(ServiceOrder.status.in_(statuses))
         if scheduled_date is not None:
             query = query.where(func.date(ServiceOrder.scheduled_at) == scheduled_date)
+        if technician_user_id is not None:
+            query = query.where(ServiceOrder.technician_user_id == technician_user_id)
         query = query.order_by(ServiceOrder.created_at.desc())
         result = await self.db.execute(query)
         return list(result.scalars().all())

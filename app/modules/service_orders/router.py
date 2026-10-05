@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.storage import save_upload_attachment, save_upload_image
 from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
@@ -65,6 +66,12 @@ from app.modules.service_orders.service import (
 )
 
 MODULE_ID = "asesor-servicios"
+# The técnico role (see seed_roles.py: "Acceso móvil a tareas asignadas e
+# inspecciones") was seeded with this module instead of asesor-servicios —
+# it grants no general visibility into the filial's orders, only the right
+# to view/work the orders it's personally assigned to as técnico (see
+# _has_access/_ensure_list_access/_ensure_order_access below).
+TECNICO_MODULE_ID = "tecnico-servicio"
 
 router = APIRouter(tags=["Service Orders"])
 
@@ -80,6 +87,48 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
+
+
+async def _has_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    module_id: str,
+    level: AccessLevel = AccessLevel.VER,
+) -> bool:
+    try:
+        await ensure_module_access(db, current_user, filial_id, module_id, level)
+        return True
+    except InsufficientPermissionsError:
+        return False
+
+
+async def _ensure_list_access(
+    current_user: CurrentUser, filial_id: uuid.UUID, db: AsyncSession
+) -> uuid.UUID | None:
+    """Returns None if the caller can see every order in the filial
+    (asesor-servicios VER), or the caller's own user_id if they only have
+    tecnico-servicio access — in which case the list must be filtered to
+    orders assigned to them as técnico. Raises if neither applies."""
+    if await _has_access(current_user, filial_id, db, MODULE_ID):
+        return None
+    if await _has_access(current_user, filial_id, db, TECNICO_MODULE_ID):
+        return current_user.user_id
+    raise InsufficientPermissionsError()
+
+
+async def _ensure_order_access(current_user: CurrentUser, order, db: AsyncSession) -> None:
+    """Same idea as _ensure_list_access but for a single already-fetched
+    order: a técnico without asesor-servicios access can still view it if
+    they're the técnico assigned to it."""
+    if await _has_access(current_user, order.filial_id, db, MODULE_ID):
+        return
+    if (
+        await _has_access(current_user, order.filial_id, db, TECNICO_MODULE_ID)
+        and order.technician_user_id == current_user.user_id
+    ):
+        return
+    raise InsufficientPermissionsError()
 
 
 # Collecting a receivable is a sensitive Finanzas action — gated by its own
@@ -106,8 +155,10 @@ async def list_service_orders(
     service: ServiceOrderService = Depends(get_service),
 ) -> list[ServiceOrderRead]:
     """List service orders. 'active' = kanban statuses, 'history' = closed/cancelled.
-    Pass 'date' to filter by scheduled_at (used by the Calendario view)."""
-    await _ensure_access(current_user, filial_id, service.db)
+    Pass 'date' to filter by scheduled_at (used by the Calendario view). A
+    técnico without general asesor-servicios access only gets the orders
+    assigned to them, instead of the full filial list."""
+    technician_user_id = await _ensure_list_access(current_user, filial_id, service.db)
     statuses: list[ServiceOrderStatus] | None
     if view == "active":
         statuses = ACTIVE_STATUSES
@@ -115,7 +166,7 @@ async def list_service_orders(
         statuses = HISTORY_STATUSES
     else:
         statuses = None
-    return await service.list_orders(filial_id, statuses, date)
+    return await service.list_orders(filial_id, statuses, date, technician_user_id)
 
 
 @router.get("/service-orders/{order_id}", response_model=ServiceOrderRead)
@@ -125,7 +176,7 @@ async def get_service_order(
     service: ServiceOrderService = Depends(get_service),
 ) -> ServiceOrderRead:
     order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db)
+    await _ensure_order_access(current_user, order, service.db)
     return order
 
 
@@ -206,7 +257,7 @@ async def get_order_summary(
     """Tasks, ODTs and the live pricing summary for a service order — everything
     the detail screen needs in one call."""
     order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db)
+    await _ensure_order_access(current_user, order, service.db)
     return await service.get_order_summary(order_id)
 
 
@@ -217,7 +268,7 @@ async def list_tasks(
     service: ServiceOrderService = Depends(get_service),
 ) -> list[TaskRead]:
     order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db)
+    await _ensure_order_access(current_user, order, service.db)
     tasks = await service.list_tasks(order_id)
     return [
         TaskRead(

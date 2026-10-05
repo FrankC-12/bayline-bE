@@ -68,6 +68,8 @@ async def test_every_order_mutation_is_rejected_by_http(order_inventory, monkeyp
         pass
 
     monkeypatch.setattr(routes, "_ensure_access", allowed)
+    monkeypatch.setattr(routes, "_ensure_order_access", allowed)
+    monkeypatch.setattr(routes, "_ensure_list_access", allowed)
     monkeypatch.setattr(inspection_routes, "_ensure_access", allowed)
     order_url = f"/api/v1/service-orders/{order.id}"
     requests = [
