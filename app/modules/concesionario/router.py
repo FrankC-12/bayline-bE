@@ -15,6 +15,7 @@ from app.modules.concesionario.schemas import (
     VehicleRead,
     VehicleReservationInput,
     VehicleSaleRead,
+    VehicleStatusEventRead,
     VehicleUpdate,
 )
 from app.modules.concesionario.service import ConcesionarioService
@@ -50,14 +51,16 @@ async def list_vehicles(
     return await service.list_vehicles(filial_id, search)
 
 
-@router.post("/dealership-vehicles", response_model=VehicleRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/dealership-vehicles", response_model=VehicleRead, status_code=status.HTTP_201_CREATED
+)
 async def create_vehicle(
     payload: VehicleCreate,
     current_user: CurrentUser = Depends(get_current_user),
     service: ConcesionarioService = Depends(get_service),
 ) -> VehicleRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_vehicle(payload)
+    return await service.create_vehicle(payload, current_user)
 
 
 @router.post("/dealership-vehicles/{vehicle_id}/photos", response_model=VehicleRead)
@@ -139,3 +142,78 @@ async def list_vehicle_sales(
 ) -> list[VehicleSaleRead]:
     await _ensure_access(current_user, filial_id, service.db)
     return await service.list_sales(filial_id)
+
+
+@router.get(
+    "/dealership-vehicles/{vehicle_id}/status-history", response_model=list[VehicleStatusEventRead]
+)
+async def vehicle_status_history(
+    vehicle_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    vehicle = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, vehicle.filial_id, service.db)
+    return await service.list_status_history(vehicle_id)
+
+
+@router.get("/vehicle-sales/{sale_id}/document")
+async def vehicle_sale_document(
+    sale_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    sale = await service.get_sale(sale_id)
+    await _ensure_access(current_user, sale.filial_id, service.db)
+    return await service.sale_document(sale)
+
+
+@router.get("/vehicle-sales/{sale_id}/invoice/pdf")
+async def vehicle_sale_invoice_pdf(
+    sale_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    from fastapi.responses import Response
+    from app.core.documents.invoice_pdf import render_invoice_pdf
+    from app.modules.filiales.models import Filial
+
+    sale = await service.get_sale(sale_id)
+    await _ensure_access(current_user, sale.filial_id, service.db)
+    vehicle = await service.get_vehicle(sale.vehicle_id)
+    filial = await service.db.get(Filial, sale.filial_id)
+    mileage = (
+        f"{sale.mileage_at_sale:,} km" if sale.mileage_at_sale is not None else "No registrado"
+    )
+    data = {
+        "issuer": filial.name,
+        "code": "FAC-" + sale.code,
+        "issued_at": sale.created_at.isoformat(),
+        "currency": "Bs." if vehicle.price_currency == "VES" else "USD",
+        "client": sale.client_name,
+        "client_document": sale.client_document or "",
+        "vehicle": f"{vehicle.brand} {vehicle.model} · {vehicle.year}\nVIN: {vehicle.vin or '—'} · Placa: {vehicle.plate or 'Sin placa'}\nKilometraje al vender: {mileage}",
+        "lines": [
+            {
+                "description": f"{vehicle.brand} {vehicle.model} · {sale.sale_type.value}",
+                "quantity": 1,
+                "total": float(sale.final_price) - float(sale.igtf_amount),
+            }
+        ],
+        "totals": [
+            (
+                "Precio de venta antes de IGTF",
+                float(sale.final_price) - float(sale.igtf_amount),
+            ),
+            ("IGTF", sale.igtf_amount),
+            ("Total", sale.final_price),
+        ],
+        "payments": ["Modalidad: " + sale.sale_type.value],
+        "pending": 0 if sale.sale_type.value == "contado" else sale.final_price,
+        "notes": ["Precio y kilometraje registrados al vender."],
+    }
+    return Response(
+        render_invoice_pdf(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="factura-{sale.id}.pdf"'},
+    )

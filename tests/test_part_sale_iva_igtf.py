@@ -101,5 +101,5 @@ async def test_create_sale_freezes_the_tax_breakdown(env):
     assert float(sale.iva_percentage) == 16.0
     assert float(sale.iva_amount) == 7200.00
     assert float(sale.igtf_percentage) == 3.0
-    assert float(sale.igtf_amount) == 1566.00
-    assert sale.total_with_taxes == pytest.approx(53766.00)
+    assert float(sale.igtf_amount) == 0  # Accrued only when USD is collected.
+    assert sale.total_with_taxes == pytest.approx(52200.00)

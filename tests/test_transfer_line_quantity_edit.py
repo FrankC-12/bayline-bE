@@ -13,7 +13,7 @@ os.environ["DEBUG"] = "false"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -49,7 +49,10 @@ def env():
         session.add(vehicle)
         session.commit()
 
-        order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+        order = ServiceOrder(
+            filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+            order_type_id=make_order_type(session, filial_id),
+        )
         session.add(order)
         session.commit()
 
@@ -87,7 +90,10 @@ async def test_reducing_quantity_frees_up_the_reserved_units_for_another_line(en
     await service.set_transfer_line_quantity(line.id, 2)
 
     # The 4 units given back are now free for a second, unrelated line to claim.
-    order2 = ServiceOrder(filial_id=order.filial_id, sequence_number=2, vehicle_id=order.vehicle_id)
+    order2 = ServiceOrder(
+        filial_id=order.filial_id, sequence_number=2, vehicle_id=order.vehicle_id,
+        order_type_id=order.order_type_id,
+    )
     session.add(order2)
     session.commit()
     second_transfer = await service.add_transfer_line(order2.id, part.id, 4)

@@ -1,5 +1,7 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -236,9 +238,43 @@ class PartSaleRead(BaseModel):
     igtf_percentage: float
     igtf_amount: float
     total_with_taxes: float
+    # Derived from every IncomeEntry ever posted against this sale (see
+    # PartsService._collected_amounts) — not a stored column, so always
+    # current regardless of how many partial payments were collected.
+    amount_collected: float
+    pending_amount: float
     lines: list[PartSaleLineRead]
     created_at: datetime
     updated_at: datetime
+
+
+class PartSalePaymentQuoteInput(BaseModel):
+    payment_method: Literal["usd", "bs", "mixed"]
+    usd_base: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
+
+
+class PartSalePaymentQuote(BaseModel):
+    pending_before: float
+    payment_method: Literal["usd", "bs", "mixed"]
+    bcv_rate: float | None
+    bcv_date: date | None
+    due_usd: float
+    due_bs: float
+    igtf_amount: float
+    total_usd: float
+
+
+class PartSalePaymentCreate(PartSalePaymentQuoteInput):
+    # No quote_hash/request_id round-trip like ODS's InvoiceCreate — simpler
+    # on purpose (see plan notes): collect_sale_payment always re-reads
+    # pending_amount fresh under a row lock on the sale, so it never trusts
+    # a stale client-side quote, and a genuine concurrent double-collection
+    # is blocked by that same lock rather than an idempotency key.
+    paid_usd: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    paid_bs: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    usd_account_id: uuid.UUID | None = None
+    bs_account_id: uuid.UUID | None = None
+    payment_reference: str = Field(default="", max_length=60)
 
 
 class PartReturnCreate(BaseModel):

@@ -10,7 +10,13 @@ from app.core.exceptions import BadRequestError
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.parts.models import Part
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
-from app.modules.post_ventas.enums import CATEGORY_PREFIXES, TemparioCategory, VehicleWarrantySource
+from app.modules.post_ventas.enums import (
+    CATEGORY_PREFIXES,
+    TemparioCategory,
+    VehicleWarrantySource,
+    WarrantyPolicyAppliesTo,
+    WarrantyPolicyStatus,
+)
 from app.modules.post_ventas.exceptions import (
     MaintenancePlanNotFoundError,
     TemparioCodeAlreadyExistsError,
@@ -53,6 +59,7 @@ from app.modules.post_ventas.schemas import (
     WorkshopWarrantyRead,
 )
 
+
 def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) -> TemparioRead:
     # Same formula a real ODS uses (price_parts_cost/PARTS_MULTIPLIERS in
     # app.modules.parts.pricing): margin applied once, on the true parts
@@ -79,6 +86,8 @@ def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) ->
         compatible_vehicles=[CompatibleVehicle(**v) for v in t.compatible_vehicles],
         tools=list(t.tools),
         requires_parts=t.requires_parts,
+        labor_warranty_policy_id=t.labor_warranty_policy_id,
+        parts_warranty_policy_id=t.parts_warranty_policy_id,
         parts=[
             TemparioPartRead(
                 id=p.id,
@@ -171,7 +180,7 @@ class PostVentasService:
 
     # Labor settings
 
-    async def get_labor_settings(self, filial_id: uuid.UUID) -> LaborSettings:
+    async def get_labor_settings(self, filial_id: uuid.UUID, *, commit: bool = True) -> LaborSettings:
         result = await self.db.execute(select(LaborSettings).where(LaborSettings.filial_id == filial_id))
         settings = result.scalar_one_or_none()
         changed = False
@@ -195,7 +204,10 @@ class PostVentasService:
             changed = True
 
         if changed:
-            await self.db.commit()
+            if commit:
+                await self.db.commit()
+            else:
+                await self.db.flush()
             await self.db.refresh(settings)
         return settings
 
@@ -257,7 +269,26 @@ class PostVentasService:
         settings = await self.get_labor_settings(t.filial_id)
         return _tempario_to_read(t, float(settings.hourly_rate), float(settings.iva_percentage))
 
+    async def _validate_tempario_warranties(self, payload, filial_id, existing=None):
+        for field, coverage in (
+            ("labor_warranty_policy_id", WarrantyPolicyAppliesTo.MANO_DE_OBRA),
+            ("parts_warranty_policy_id", WarrantyPolicyAppliesTo.REPUESTOS),
+        ):
+            if field not in payload.model_fields_set:
+                continue
+            policy_id = getattr(payload, field)
+            if policy_id is None or (existing is not None and policy_id == getattr(existing, field)):
+                continue
+            policy = await self.db.get(WarrantyPolicy, policy_id)
+            if policy is None or policy.filial_id != filial_id:
+                raise BadRequestError("La garantía debe pertenecer a esta filial.")
+            if policy.status != WarrantyPolicyStatus.ACTIVA:
+                raise BadRequestError("Selecciona una garantía activa.")
+            if policy.applies_to not in (coverage, WarrantyPolicyAppliesTo.AMBAS):
+                raise BadRequestError("La garantía no corresponde a esta cobertura.")
+
     async def create_tempario(self, payload: TemparioCreate) -> TemparioRead:
+        await self._validate_tempario_warranties(payload, payload.filial_id)
         sequence_number = payload.sequence_number or await self._next_sequence(
             payload.filial_id, payload.category
         )
@@ -274,6 +305,8 @@ class PostVentasService:
             compatible_vehicles=[v.model_dump() for v in payload.compatible_vehicles],
             tools=payload.tools,
             requires_parts=payload.requires_parts,
+            labor_warranty_policy_id=payload.labor_warranty_policy_id,
+            parts_warranty_policy_id=payload.parts_warranty_policy_id,
         )
         self.db.add(t)
         await self.db.flush()
@@ -294,6 +327,10 @@ class PostVentasService:
 
     async def update_tempario(self, tempario_id: uuid.UUID, payload: TemparioUpdate) -> TemparioRead:
         t = await self._get_tempario_model(tempario_id)
+        await self._validate_tempario_warranties(payload, t.filial_id, t)
+        for field in ("labor_warranty_policy_id", "parts_warranty_policy_id"):
+            if field in payload.model_fields_set:
+                setattr(t, field, getattr(payload, field))
 
         if payload.name is not None:
             t.name = payload.name
@@ -618,13 +655,14 @@ class PostVentasService:
         model: str | None,
         sale_date: date,
         dealership_vehicle_id: uuid.UUID,
+        *, commit: bool = True,
     ) -> VehicleWarranty:
         """Called from ConcesionarioService when a DealershipVehicle sale
         closes. A fresh sale means the factory-warranty clock restarts from
         today, whether or not this VIN already had one on file (e.g. a
         used-car resale) — so this upserts rather than skipping or erroring."""
         vin = vin.strip().upper()
-        settings = await self.get_labor_settings(filial_id)
+        settings = await self.get_labor_settings(filial_id, commit=commit)
         default_months = settings.vehicle_warranty_default_months
 
         result = await self.db.execute(
@@ -645,7 +683,10 @@ class PostVentasService:
         warranty.dealership_vehicle_id = dealership_vehicle_id
         warranty.note = None
 
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         await self.db.refresh(warranty)
         return warranty
 

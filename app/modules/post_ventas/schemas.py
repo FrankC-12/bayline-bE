@@ -76,6 +76,8 @@ class TemparioPartRead(BaseModel):
 
 
 class TemparioCreate(BaseModel):
+    labor_warranty_policy_id: uuid.UUID | None = None
+    parts_warranty_policy_id: uuid.UUID | None = None
     filial_id: uuid.UUID
     category: TemparioCategory
     sequence_number: int | None = Field(default=None, ge=1)
@@ -90,6 +92,8 @@ class TemparioCreate(BaseModel):
 
 
 class TemparioUpdate(BaseModel):
+    labor_warranty_policy_id: uuid.UUID | None = None
+    parts_warranty_policy_id: uuid.UUID | None = None
     name: str | None = Field(default=None, min_length=2, max_length=150)
     estimated_hours: float | None = Field(default=None, ge=0)
     year_from: int | None = None
@@ -101,6 +105,8 @@ class TemparioUpdate(BaseModel):
 
 
 class TemparioRead(BaseModel):
+    labor_warranty_policy_id: uuid.UUID | None = None
+    parts_warranty_policy_id: uuid.UUID | None = None
     id: uuid.UUID
     filial_id: uuid.UUID
     code: str

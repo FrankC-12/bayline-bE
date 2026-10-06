@@ -22,6 +22,7 @@ class VehicleCreate(BaseModel):
     brand: str = Field(min_length=1, max_length=60)
     model: str = Field(min_length=1, max_length=60)
     year: int = Field(ge=1980, le=2100)
+    mileage: int | None = Field(default=None, ge=0, le=2147483647, strict=True)
     color: str | None = Field(default=None, max_length=40)
     fuel_type: FuelType | None = None
     transmission: TransmissionType | None = None
@@ -38,8 +39,15 @@ class VehicleCreate(BaseModel):
     luxury_tax_percentage: float = Field(default=0, ge=0, le=100)
     financing_provider: str | None = Field(default="troyano", max_length=50)
 
+    @model_validator(mode="after")
+    def _require_used_mileage(self):
+        if self.condition == VehicleCondition.USADO and self.mileage is None:
+            raise ValueError("El kilometraje es obligatorio para un vehículo usado.")
+        return self
+
 
 class VehicleSaleInput(BaseModel):
+    client_id: uuid.UUID | None = None
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None
     advisor_user_id: uuid.UUID | None = None
@@ -60,7 +68,9 @@ class VehicleSaleInput(BaseModel):
     @model_validator(mode="after")
     def _check_payment_method_for_contado(self) -> "VehicleSaleInput":
         if self.sale_type == SaleType.CONTADO and self.payment_method is None:
-            raise ValueError("Indica cómo se cobra (divisas, bolívares o mixto) para una venta de contado.")
+            raise ValueError(
+                "Indica cómo se cobra (divisas, bolívares o mixto) para una venta de contado."
+            )
         return self
 
 
@@ -74,17 +84,20 @@ class VehicleReservationInput(BaseModel):
     # from whoever is submitting the request (e.g. an admin reserving on a
     # vendedor's behalf).
     advisor_user_id: uuid.UUID
-    deposit_amount: float = Field(gt=0)
+    deposit_amount: float = Field(gt=0, allow_inf_nan=False)
     expires_at: date
+    reason: str = Field(default="Reserva de cliente", min_length=3, max_length=500)
 
 
 class VehicleUpdate(BaseModel):
+    status_reason: str | None = Field(default=None, max_length=500)
     status: VehicleStatus | None = None
     condition: VehicleCondition | None = None
     location: VehicleLocation | None = None
     brand: str | None = Field(default=None, min_length=1, max_length=60)
     model: str | None = Field(default=None, min_length=1, max_length=60)
     year: int | None = Field(default=None, ge=1980, le=2100)
+    mileage: int | None = Field(default=None, ge=0, le=2147483647, strict=True)
     color: str | None = Field(default=None, max_length=40)
     fuel_type: FuelType | None = None
     transmission: TransmissionType | None = None
@@ -114,6 +127,7 @@ class VehicleRead(BaseModel):
     brand: str
     model: str
     year: int
+    mileage: int | None
     color: str | None
     fuel_type: FuelType | None
     transmission: TransmissionType | None
@@ -150,6 +164,7 @@ class VehicleSaleRead(BaseModel):
     id: uuid.UUID
     code: str
     vehicle_id: uuid.UUID
+    mileage_at_sale: int | None
     client_name: str
     client_document: str | None
     advisor_user_id: uuid.UUID | None
@@ -163,4 +178,18 @@ class VehicleSaleRead(BaseModel):
     below_cost_override_note: str | None
     authorized_by_user_id: uuid.UUID | None
     authorized_at: datetime | None
+    created_at: datetime
+
+
+class VehicleStatusEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    vehicle_id: uuid.UUID
+    previous_status: VehicleStatus | None
+    new_status: VehicleStatus
+    user_id: uuid.UUID
+    user_name: str
+    reason: str
+    reservation_snapshot: dict | None
     created_at: datetime

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -67,7 +67,10 @@ async def _seed_filial_a(session, service, filial):
     )
     session.commit()
 
-    order = ServiceOrder(filial_id=filial.id, sequence_number=1, vehicle_id=uuid.uuid4(), status=ServiceOrderStatus.EN_PROGRESO)
+    order = ServiceOrder(
+        filial_id=filial.id, sequence_number=1, vehicle_id=uuid.uuid4(), status=ServiceOrderStatus.EN_PROGRESO,
+        order_type_id=make_order_type(session, filial.id),
+    )
     session.add(order)
     session.commit()
     part = Part(category_id=uuid.uuid4(), filial_id=filial.id, code="P-1", name="Filtro", price=10, stock_quantity=5)

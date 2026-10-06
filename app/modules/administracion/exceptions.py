@@ -119,6 +119,20 @@ class ClaimCurrencyMismatchError(BadRequestError):
         )
 
 
+class AccountCurrencyMismatchError(BadRequestError):
+    """A manual ingreso/egreso's currency must match its target account's —
+    otherwise the amount silently never reaches that account's own balance
+    (_account_balance sums entries filtered by currency == account.currency),
+    even though it's correctly converted and counted everywhere else
+    (the movement list, the dashboard's monthly aggregate)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "La cuenta elegida no maneja esta moneda — selecciona una cuenta en la misma moneda del movimiento.",
+            error_code="account_currency_mismatch",
+        )
+
+
 class WarrantySubmissionNotFoundError(NotFoundError):
     def __init__(self, submission_id: str) -> None:
         super().__init__(

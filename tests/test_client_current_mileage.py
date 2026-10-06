@@ -11,7 +11,7 @@ os.environ["DEBUG"] = "false"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -104,7 +104,8 @@ async def test_current_mileage_picks_the_most_recent_visit(env):
 async def test_current_mileage_links_to_its_service_order(env):
     service, session, filial_id, client, vehicle = env
     order = ServiceOrder(
-        id=uuid.uuid4(), filial_id=filial_id, sequence_number=2041, vehicle_id=vehicle.id
+        id=uuid.uuid4(), filial_id=filial_id, sequence_number=2041, vehicle_id=vehicle.id,
+        order_type_id=make_order_type(session, filial_id),
     )
     session.add(order)
     session.add(_inspection(vehicle.id, 20_000, datetime(2026, 6, 1, tzinfo=UTC), order.id))
@@ -121,7 +122,8 @@ async def test_current_mileage_links_to_its_service_order(env):
 async def test_no_fallback_to_an_older_order_linked_inspection(env):
     service, session, filial_id, client, vehicle = env
     order = ServiceOrder(
-        id=uuid.uuid4(), filial_id=filial_id, sequence_number=2041, vehicle_id=vehicle.id
+        id=uuid.uuid4(), filial_id=filial_id, sequence_number=2041, vehicle_id=vehicle.id,
+        order_type_id=make_order_type(session, filial_id),
     )
     session.add(order)
     session.add(_inspection(vehicle.id, 10_000, datetime(2026, 1, 1, tzinfo=UTC), order.id))

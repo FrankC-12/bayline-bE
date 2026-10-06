@@ -8,9 +8,9 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, seed_order_types
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -23,7 +23,6 @@ from app.modules.service_orders.enums import (
     ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
-    ServiceOrderType,
     WarrantyClaimStatus,
     WarrantyClaimType,
 )
@@ -35,7 +34,7 @@ from app.modules.service_orders.exceptions import (
     WarrantyClaimNotAuthorizedError,
     WarrantyOverrideNoteRequiredError,
 )
-from app.modules.service_orders.models import ServiceOrder
+from app.modules.service_orders.models import ServiceOrder, ServiceOrderTypeCatalog
 from app.modules.service_orders.schemas import (
     WarrantyClaimAuthorizationInput,
     WarrantyClaimConvertInput,
@@ -64,7 +63,14 @@ def env():
 
 
 async def _create_comeback_claim(service, session, filial_id, vehicle):
-    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+    await seed_order_types(session, filial_id)
+    session.flush()
+    regular = session.execute(
+        select(ServiceOrderTypeCatalog).where(
+            ServiceOrderTypeCatalog.filial_id == filial_id, ServiceOrderTypeCatalog.code == "regular"
+        )
+    ).scalar_one()
+    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id, order_type_id=regular.id)
     session.add(order)
     session.commit()
     from app.modules.service_orders.models import ServiceOrderInvoice
@@ -176,7 +182,7 @@ async def test_converting_a_comeback_opens_retrabajo_order_with_taller_payer(env
 
     assert converted.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
     new_order = session.get(ServiceOrder, converted.resulting_service_order_id)
-    assert new_order.order_type == ServiceOrderType.RETRABAJO
+    assert new_order.order_type.code == "retrabajo"
     assert new_order.vehicle_id == vehicle.id
 
 
@@ -237,6 +243,8 @@ async def test_authorizing_fabrica_with_vigente_warranty_needs_no_override(env):
 @pytest.mark.asyncio
 async def test_converting_fabrica_claim_with_no_prior_order_uses_reported_mileage(env):
     service, session, filial_id, vehicle = env
+    await seed_order_types(session, filial_id)
+    session.flush()
     session.add(VehicleWarranty(
         filial_id=filial_id, vin=vehicle.vin, brand="Toyota", starts_at=date(2020, 1, 1),
         expires_at=date.today() + timedelta(days=100), source=VehicleWarrantySource.MANUAL,
@@ -254,6 +262,6 @@ async def test_converting_fabrica_claim_with_no_prior_order_uses_reported_mileag
     converted = await service.convert_warranty_claim_to_order(claim.id, WarrantyClaimConvertInput(), None)
 
     new_order = session.get(ServiceOrder, converted.resulting_service_order_id)
-    assert new_order.order_type == ServiceOrderType.RETRABAJO
+    assert new_order.order_type.code == "retrabajo"
     assert new_order.intake_mileage == 12345
     assert new_order.vehicle_id == vehicle.id

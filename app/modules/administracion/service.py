@@ -19,6 +19,7 @@ from app.modules.administracion.enums import (
     WarrantySubmissionStatus,
 )
 from app.modules.administracion.exceptions import (
+    AccountCurrencyMismatchError,
     AccountNotFoundError,
     AttachmentRequiredError,
     ClaimAccountRequiredError,
@@ -846,6 +847,7 @@ class AdministracionService:
         origin_reference: str,
         source_type: MovementSourceType | None = None,
         source_id: uuid.UUID | None = None,
+        *, commit: bool = True,
     ) -> IncomeEntry | None:
         """Called by other modules (Servicios, Repuestos, Concesionario) when they
         close something billable. Posts to the filial's first active USD account.
@@ -881,7 +883,10 @@ class AdministracionService:
             source_id=source_id,
         )
         self.db.add(entry)
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         return entry
 
     async def create_account(self, payload: AccountCreate) -> Account:
@@ -974,7 +979,9 @@ class AdministracionService:
 
     async def create_income(self, payload: IncomeEntryCreate, attachment, responsible_user_id: uuid.UUID | None) -> IncomeEntry:
         self._assert_open_period(payload.entry_date)
-        await self.get_account(payload.account_id)
+        account = await self.get_account(payload.account_id)
+        if account.currency != payload.currency:
+            raise AccountCurrencyMismatchError()
         exchange_rate, amount_usd, amount_bs = await self._freeze_rate(
             payload.currency, payload.entry_date, payload.amount
         )
@@ -1052,7 +1059,9 @@ class AdministracionService:
         self, payload: ExpenseEntryCreate, attachment, responsible_user_id: uuid.UUID | None
     ) -> ExpenseEntry:
         self._assert_open_period(payload.entry_date)
-        await self.get_account(payload.account_id)
+        account = await self.get_account(payload.account_id)
+        if account.currency != payload.currency:
+            raise AccountCurrencyMismatchError()
 
         purchase_requests: list[PurchaseRequest] = []
         if payload.purchase_request_ids:
@@ -1553,15 +1562,7 @@ class AdministracionService:
         return income_diff - expense_diff
 
     async def list_receivables(self, filial_id: uuid.UUID) -> list["ReceivableRead"]:
-        """Cuentas por Cobrar — every document sold but not yet collected.
-        ODS invoices already track this precisely (billing.py's own
-        collect_invoice flow); a parts counter sale has no such flow at
-        all — this system only ever books its income when it reaches
-        COMPLETADO (PartsService.update_sale_status), so any non-cancelled
-        sale that hasn't gotten there yet is, by the system's own definition
-        of "collected," still outstanding. That's also what makes
-        CxC + ingresos reconcile exactly against Rentabilidad's net_sales
-        for repuestos, which counts every non-cancelled sale as revenue."""
+        """Outstanding invoices and non-cancelled parts sales, including partial payments."""
         from app.modules.service_orders.billing import BillingService
         from app.modules.service_orders.billing_schemas import ReceivableRead
 
@@ -1572,14 +1573,22 @@ class AdministracionService:
             .options(selectinload(PartSale.lines))
             .where(
                 PartSale.filial_id == filial_id,
-                PartSale.status.not_in([PartSaleStatus.COMPLETADO, PartSaleStatus.CANCELADO]),
+                PartSale.status != PartSaleStatus.CANCELADO,
             )
         )
         today = venezuela_today()
+        from app.modules.parts.service import PartsService
+
+        sales = list(result.scalars().all())
+        collected = await PartsService(self.db)._collected_amounts([sale.id for sale in sales])
         part_sale_receivables = []
-        for sale in result.scalars().all():
+        for sale in sales:
             days_outstanding = (today - sale.created_at.date()).days
-            total = sale.total
+            total = sale.total_with_taxes
+            paid = collected.get(sale.id, 0.0)
+            pending = max(0.0, round(total - paid, 2))
+            if pending <= 0:
+                continue
             part_sale_receivables.append(
                 ReceivableRead(
                     document_type="part_sale",
@@ -1592,7 +1601,7 @@ class AdministracionService:
                     islr_retention_amount=0.0,
                     net_expected=total,
                     amount_paid_at_issuance=0.0,
-                    pending_amount=total,
+                    pending_amount=pending,
                     issued_at=sale.created_at,
                     days_outstanding=days_outstanding,
                     aging_bucket=aging_bucket(days_outstanding),

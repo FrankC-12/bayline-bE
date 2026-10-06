@@ -12,6 +12,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import UUID
@@ -22,7 +23,6 @@ from app.modules.service_orders.enums import (
     ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
-    ServiceOrderType,
     TaskStatus,
     TransferStatus,
     UpsellApprovalChannel,
@@ -51,6 +51,40 @@ class Bay(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ServiceOrderTypeCatalog(Base):
+    """A filial-scoped, admin-manageable "tipo de ODS" — replaces the old
+    fixed ServiceOrderType enum. Six system rows are seeded for every filial
+    (see service.py's seed_default_order_types): regular, mpt (reserved,
+    unused), retrabajo (auto-assigned only, see convert_warranty_claim_to_order),
+    and garantia_fabrica/comeback/campana (manually picked, each requiring a
+    matching authorized WarrantyClaim via `claim_type`). `code`/`claim_type`/
+    `is_selectable` are only ever set on these system rows — never exposed in
+    the admin create/update schema, so an admin-created type always behaves
+    like a plain "regular" type. Never hard-deleted (service_orders.order_type_id
+    is ondelete=RESTRICT) — `is_active` just hides it from the manual picker."""
+
+    __tablename__ = "service_order_types"
+    __table_args__ = (UniqueConstraint("filial_id", "code", name="uq_service_order_types_filial_code"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filial_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    code: Mapped[str] = mapped_column(String(60), nullable=False)
+    name: Mapped[str] = mapped_column(String(150), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_system: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    claim_type: Mapped[WarrantyClaimType | None] = mapped_column(
+        Enum(WarrantyClaimType, name="warranty_claim_type"), nullable=True
+    )
+    is_selectable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ServiceOrder(Base):
     """A work order (ODS) tracking a vehicle through the workshop."""
 
@@ -75,11 +109,19 @@ class ServiceOrder(Base):
         nullable=False,
         default=ServiceOrderStatus.PENDIENTE,
     )
-    order_type: Mapped[ServiceOrderType] = mapped_column(
-        Enum(ServiceOrderType, name="service_order_type"),
+    order_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("service_order_types.id", ondelete="RESTRICT"),
         nullable=False,
-        default=ServiceOrderType.REGULAR,
+        index=True,
     )
+    # Eager by default (not selectinload-at-callsite) since ServiceOrder is
+    # loaded from dozens of places across this module via plain db.get()/
+    # select() — a lazy relationship would need every one of them updated to
+    # eager-load it, and missing even one would raise MissingGreenlet the
+    # moment a response tries to serialize .order_type (this exact bug
+    # already bit InspectionDamage once in this codebase).
+    order_type: Mapped["ServiceOrderTypeCatalog"] = relationship(lazy="joined")
     technician_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -180,6 +222,7 @@ class ServiceOrderTask(Base):
     code_snapshot: Mapped[str] = mapped_column(String(20), nullable=False)
     name_snapshot: Mapped[str] = mapped_column(String(150), nullable=False)
     hours_snapshot: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)
+    warranty_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[TaskStatus] = mapped_column(
         Enum(TaskStatus, name="task_status"), nullable=False, default=TaskStatus.PENDIENTE
     )
@@ -188,6 +231,13 @@ class ServiceOrderTask(Base):
         nullable=False,
         default=ServiceOrderPayer.CLIENTE,
     )
+    # Manual cronómetro, independent of `status` — a técnico starts/pauses it
+    # explicitly rather than it following status transitions. `timer_started_at`
+    # is the start of the currently-running segment (None while paused);
+    # `timer_accumulated_seconds` is the sum of every previously-closed
+    # segment. Live elapsed = accumulated + (now - timer_started_at) if running.
+    timer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    timer_accumulated_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

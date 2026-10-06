@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -68,7 +68,8 @@ def env():
             ]
         )
         order = ServiceOrder(
-            id=uuid.uuid4(), filial_id=filial.id, vehicle_id=uuid.uuid4(), sequence_number=2001
+            id=uuid.uuid4(), filial_id=filial.id, vehicle_id=uuid.uuid4(), sequence_number=2001,
+            order_type_id=make_order_type(session, filial.id),
         )
         session.add(order)
         session.commit()

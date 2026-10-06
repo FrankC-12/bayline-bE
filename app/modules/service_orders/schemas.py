@@ -10,7 +10,6 @@ from app.modules.service_orders.enums import (
     ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
-    ServiceOrderType,
     TaskStatus,
     TransferStatus,
     UpsellApprovalChannel,
@@ -40,11 +39,39 @@ class BayRead(BaseModel):
     is_active: bool
 
 
+class ServiceOrderTypeRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    filial_id: uuid.UUID
+    code: str
+    name: str
+    description: str | None
+    is_system: bool
+    claim_type: WarrantyClaimType | None
+    is_selectable: bool
+    is_active: bool
+
+
+class ServiceOrderTypeCreate(BaseModel):
+    filial_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=150)
+    description: str | None = Field(default=None, max_length=2000)
+
+
+class ServiceOrderTypeUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=150)
+    description: str | None = None
+    is_active: bool | None = None
+
+
 class ServiceOrderCreate(BaseModel):
     discount_label: DiscountLabel = DEFAULT_DISCOUNT
     filial_id: uuid.UUID
     vehicle_id: uuid.UUID
-    order_type: ServiceOrderType = ServiceOrderType.REGULAR
+    # None resolves to this filial's "regular" system type — see
+    # ServiceOrderService.create_order.
+    order_type_id: uuid.UUID | None = None
     # Reception data. customer_reason is inherited from the linked
     # PreliminaryInspection's notes whenever it has any — same as
     # intake_mileage, never re-entered by hand in that case (see
@@ -59,8 +86,9 @@ class ServiceOrderCreate(BaseModel):
     # from the order detail screen, once it arrives.
     inspection_id: uuid.UUID | None = None
     customer_reason: str | None = Field(default=None, min_length=1, max_length=2000)
-    # Required exactly when order_type is garantia_fabrica/comeback/campana —
-    # must be an AUTORIZADO WarrantyClaim for this same vehicle_id, of the
+    # Required exactly when the chosen order_type_id's catalog row has a
+    # claim_type set (garantia_fabrica/comeback/campana, by default) — must
+    # be an AUTORIZADO WarrantyClaim for this same vehicle_id, of that
     # matching claim_type (see ServiceOrderService.create_order).
     warranty_claim_id: uuid.UUID | None = None
     advisor_user_id: uuid.UUID
@@ -78,7 +106,7 @@ class ServiceOrderCreate(BaseModel):
 class ServiceOrderUpdate(BaseModel):
     discount_label: DiscountLabel | None = None
     status: ServiceOrderStatus | None = None
-    order_type: ServiceOrderType | None = None
+    order_type_id: uuid.UUID | None = None
     technician_user_id: uuid.UUID | None = None
     advisor_user_id: uuid.UUID | None = None
     bay_id: uuid.UUID | None = None
@@ -96,11 +124,6 @@ class ServiceOrderUpdate(BaseModel):
     parts_warranty_policy_id: uuid.UUID | None = None
     clear_labor_warranty_policy: bool = False
     clear_parts_warranty_policy: bool = False
-    # Only meaningful when transitioning status to "completado" while a task
-    # is still pendiente or an ODT hasn't been marked pedido — the server
-    # decides whether that's actually the case, this just carries the
-    # explicit confirmation to go ahead anyway.
-    confirm_incomplete_completion: bool = False
 
 
 class ServiceOrderCancelInput(BaseModel):
@@ -125,7 +148,7 @@ class ServiceOrderRead(BaseModel):
     code: str
     vehicle_id: uuid.UUID
     status: ServiceOrderStatus
-    order_type: ServiceOrderType
+    order_type: ServiceOrderTypeRead
     warranty_claim_id: uuid.UUID | None
     labor_warranty_policy_id: uuid.UUID | None
     parts_warranty_policy_id: uuid.UUID | None
@@ -189,6 +212,8 @@ class TaskRead(BaseModel):
     status: TaskStatus
     payer: ServiceOrderPayer
     created_at: datetime
+    timer_started_at: datetime | None
+    timer_accumulated_seconds: int
 
 
 class TransferLineInput(BaseModel):

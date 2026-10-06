@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 from app.core.database import Base
 from app.core.exceptions import BadRequestError
@@ -68,6 +68,7 @@ def workshop():
             sequence_number=1,
             status=ServiceOrderStatus.COMPLETADO,
             invoiced_at=datetime.now(UTC),
+            order_type_id=make_order_type(session, filial_id),
         )
         session.add(order)
         session.commit()

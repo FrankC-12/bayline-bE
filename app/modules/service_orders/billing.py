@@ -17,7 +17,7 @@ from app.modules.clients.models import Client, Vehicle
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
-from app.modules.post_ventas.enums import WorkshopWarrantyCoverage
+from app.modules.post_ventas.enums import WorkshopWarrantyCoverage, WarrantyPolicyCoveredBy
 from app.modules.post_ventas.models import LaborSettings, WarrantyPolicy, WorkshopWarranty
 from app.modules.service_orders.billing_schemas import (
     BillingInput,
@@ -32,7 +32,6 @@ from app.modules.service_orders.enums import ServiceOrderStatus
 from app.modules.service_orders.exceptions import (
     InvoiceAlreadyCollectedError,
     InvoiceNotFoundError,
-    ReceivableCurrencyMismatchError,
 )
 from app.modules.service_orders.guards import require_editable_order
 from app.modules.service_orders.models import (
@@ -294,6 +293,23 @@ class BillingService:
                 if part_ids
                 else []
             )
+            # Freeze any tempario guarantee in the invoice as well as the task.
+            document["warranties"] = []
+            warranty_tasks = (await self.db.execute(select(ServiceOrderTask).where(
+                ServiceOrderTask.service_order_id == order.id
+            ))).scalars().all()
+            for coverage in ("labor", "parts"):
+                policy_id = getattr(order, f"{coverage}_warranty_policy_id")
+                selected = await self.db.get(WarrantyPolicy, policy_id) if policy_id else None
+                for task in warranty_tasks:
+                    terms = (task.warranty_snapshot or {}).get(coverage)
+                    if selected:
+                        terms = {"name": selected.name,
+                                 "duration_days": None if selected.no_expiration else selected.duration_days,
+                                 "duration_km": None if selected.no_expiration else selected.duration_km}
+                    if terms:
+                        document["warranties"].append({"task": task.code_snapshot,
+                            "coverage": coverage, **terms})
             document.update(
                 id=str(invoice_id),
                 code=code,
@@ -432,6 +448,10 @@ class BillingService:
                 starts_at = now.date()
 
                 def _workshop_warranty(task, coverage, days, km, policy):
+                    key = "labor" if coverage == WorkshopWarrantyCoverage.MANO_DE_OBRA else "parts"
+                    snapshot = (task.warranty_snapshot or {}).get(key) if policy is None else None
+                    if snapshot:
+                        days, km = snapshot["duration_days"], snapshot["duration_km"]
                     return WorkshopWarranty(
                         filial_id=order.filial_id,
                         vin=vehicle.vin,
@@ -450,9 +470,9 @@ class BillingService:
                             if order.intake_mileage is not None and km is not None
                             else None
                         ),
-                        warranty_policy_id=policy.id if policy is not None else None,
-                        warranty_policy_name_snapshot=policy.name if policy is not None else None,
-                        covered_by_snapshot=policy.covered_by if policy is not None else None,
+                        warranty_policy_id=policy.id if policy is not None else (uuid.UUID(snapshot["id"]) if snapshot else None),
+                        warranty_policy_name_snapshot=policy.name if policy is not None else (snapshot["name"] if snapshot else None),
+                        covered_by_snapshot=policy.covered_by if policy is not None else (WarrantyPolicyCoveredBy(snapshot["covered_by"]) if snapshot else None),
                     )
 
                 for task in tasks:
@@ -490,6 +510,11 @@ class BillingService:
             - float(invoice.islr_retention_amount or 0)
         )
 
+    def _pending_amount(self, invoice: ServiceOrderInvoice) -> float:
+        return max(0.0, round(self._net_expected(invoice) - float(invoice.amount_paid_at_issuance)
+                              - float(invoice.net_collected_amount or 0)
+                              - float(invoice.withholding_amount or 0), 2))
+
     def _receivable_to_read(self, invoice: ServiceOrderInvoice, order: ServiceOrder, client: Client) -> ReceivableRead:
         net_expected = self._net_expected(invoice)
         days_outstanding = (venezuela_today() - invoice.issued_at.date()).days
@@ -507,7 +532,7 @@ class BillingService:
             islr_retention_amount=float(invoice.islr_retention_amount or 0),
             net_expected=net_expected,
             amount_paid_at_issuance=float(invoice.amount_paid_at_issuance),
-            pending_amount=net_expected - float(invoice.amount_paid_at_issuance),
+            pending_amount=self._pending_amount(invoice),
             issued_at=invoice.issued_at,
             days_outstanding=days_outstanding,
             aging_bucket=aging_bucket(days_outstanding),
@@ -532,23 +557,42 @@ class BillingService:
     async def collect_invoice(
         self, invoice_id: uuid.UUID, payload: CollectInvoicePaymentInput, collected_by_user_id: uuid.UUID | None
     ) -> ReceivableRead:
-        invoice = await self.get_invoice_by_id(invoice_id)
+        invoice = (await self.db.execute(
+            select(ServiceOrderInvoice).where(ServiceOrderInvoice.id == invoice_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if invoice is None:
+            raise InvoiceNotFoundError(str(invoice_id))
         if invoice.collected_at is not None:
             raise InvoiceAlreadyCollectedError()
 
         account = await self.db.get(Account, payload.account_id)
-        if account is None or account.currency != AccountCurrency.USD:
-            raise ReceivableCurrencyMismatchError()
-
         order = await self.db.get(ServiceOrder, invoice.service_order_id)
+        if (account is None or not account.is_active or account.filial_id != order.filial_id
+                or account.currency not in (AccountCurrency.USD, AccountCurrency.BS)):
+            raise BadRequestError("Selecciona una cuenta activa en USD o Bs. de la filial.")
+        rate_row = (await self.db.execute(select(ExchangeRate).where(
+            ExchangeRate.currency == "USD", ExchangeRate.value_date == billing_day()
+        ))).scalar_one_or_none()
+        rate = Decimal(str(rate_row.rate_ves)) if rate_row else None
+        if account.currency == AccountCurrency.BS and (rate is None or rate <= 0):
+            raise BadRequestError("No hay tasa BCV del día para cobrar en Bs.", error_code="bcv_rate_required")
+        amount_usd = money(payload.net_collected_amount if account.currency == AccountCurrency.USD
+                           else payload.net_collected_amount / rate)
+        settled = amount_usd + payload.withholding_amount
+        if settled <= 0 or settled > money(self._pending_amount(invoice)):
+            raise BadRequestError("El cobro y las retenciones deben ser mayores a cero y no superar el saldo pendiente.")
         income = IncomeEntry(
             filial_id=order.filial_id,
             entry_date=billing_day(),
-            source=IncomeSource.MANUAL,
+            source=IncomeSource.AUTOMATICO,
             origin_reference=invoice.code,
             description=f"Cobro de cuenta por cobrar — {invoice.code}",
             amount=float(payload.net_collected_amount),
-            currency=AccountCurrency.USD,
+            currency=account.currency,
+            exchange_rate=float(rate) if rate else None,
+            amount_usd=float(amount_usd),
+            amount_bs=float(money(payload.net_collected_amount * rate)) if account.currency == AccountCurrency.USD and rate else float(payload.net_collected_amount) if account.currency == AccountCurrency.BS else None,
             account_id=account.id,
             registered_by_user_id=collected_by_user_id,
             source_type=MovementSourceType.SERVICE_ORDER,
@@ -557,12 +601,12 @@ class BillingService:
         self.db.add(income)
         await self.db.flush()
 
-        invoice.withholding_amount = float(payload.withholding_amount)
-        invoice.net_collected_amount = float(payload.net_collected_amount)
+        invoice.withholding_amount = money(invoice.withholding_amount or 0) + payload.withholding_amount
+        invoice.net_collected_amount = money(invoice.net_collected_amount or 0) + amount_usd
         invoice.collection_account_id = account.id
         invoice.collection_income_entry_id = income.id
         invoice.collected_by_user_id = collected_by_user_id
-        invoice.collected_at = datetime.now(UTC)
+        invoice.collected_at = datetime.now(UTC) if self._pending_amount(invoice) <= 0 else None
 
         await self.db.commit()
         await self.db.refresh(invoice)
@@ -587,9 +631,9 @@ class BillingService:
             invoices = result.scalars().all()
             total_invoiced = sum(float(i.total_usd) for i in invoices)
             total_pending = sum(
-                self._net_expected(i) - float(i.amount_paid_at_issuance) for i in invoices if i.collected_at is None
+                self._pending_amount(i) for i in invoices if i.collected_at is None
             )
-            total_collected = sum(float(i.net_collected_amount or 0) for i in invoices if i.collected_at is not None)
+            total_collected = sum(float(i.amount_paid_at_issuance) + float(i.net_collected_amount or 0) for i in invoices)
             total_withheld = sum(
                 float(i.iva_retention_amount or 0) + float(i.islr_retention_amount or 0) + float(i.withholding_amount or 0)
                 for i in invoices

@@ -13,6 +13,22 @@ class BayNotFoundError(NotFoundError):
         super().__init__(f"Bay '{bay_id}' was not found.", error_code="bay_not_found")
 
 
+class ServiceOrderTypeNotFoundError(NotFoundError):
+    def __init__(self, order_type_id: str) -> None:
+        super().__init__(
+            f"Service order type '{order_type_id}' was not found.",
+            error_code="service_order_type_not_found",
+        )
+
+
+class ServiceOrderTypeInvalidError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "El tipo de orden seleccionado no pertenece a esta filial o está inactivo.",
+            error_code="service_order_type_invalid",
+        )
+
+
 class InvalidStatusTransitionError(BadRequestError):
     def __init__(self, current: str, target: str) -> None:
         super().__init__(
@@ -24,6 +40,22 @@ class InvalidStatusTransitionError(BadRequestError):
 class TaskNotFoundError(NotFoundError):
     def __init__(self, task_id: str) -> None:
         super().__init__(f"Task '{task_id}' was not found.", error_code="task_not_found")
+
+
+class TaskTimerAlreadyRunningError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "El cronómetro de esta tarea ya está corriendo.",
+            error_code="task_timer_already_running",
+        )
+
+
+class TaskTimerNotRunningError(BadRequestError):
+    def __init__(self) -> None:
+        super().__init__(
+            "El cronómetro de esta tarea no está corriendo.",
+            error_code="task_timer_not_running",
+        )
 
 
 class TransferNotFoundError(NotFoundError):

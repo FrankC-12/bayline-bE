@@ -27,6 +27,9 @@ from app.modules.parts.schemas import (
     PartReturnCreate,
     PartReturnRead,
     PartSaleCreate,
+    PartSalePaymentCreate,
+    PartSalePaymentQuote,
+    PartSalePaymentQuoteInput,
     PartSaleQuoteInput,
     PartSaleQuoteRead,
     PartSaleRead,
@@ -53,6 +56,15 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
+
+
+COBRAR_MODULE_ID = "finanzas-cobrar"
+
+
+async def _ensure_sale_payment_access(
+    current_user: CurrentUser, filial_id: uuid.UUID, db: AsyncSession
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, COBRAR_MODULE_ID, AccessLevel.EDITAR)
 
 
 async def _holding_id_for_filial(db: AsyncSession, filial_id: uuid.UUID) -> uuid.UUID:
@@ -318,6 +330,47 @@ async def update_part_sale(
     )
 
 
+@router.get("/part-sales/{sale_id}/billing")
+async def get_part_sale_billing(
+    sale_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+):
+    sale = await service.get_sale(sale_id)
+    await _ensure_sale_payment_access(current_user, sale.filial_id, service.db)
+    context = await service.get_sale_billing_context(sale_id)
+    return {
+        "pending_amount": context["sale"].pending_amount,
+        "bcv_rate": context["bcv_rate"],
+        "bcv_date": context["bcv_date"],
+        "accounts": context["accounts"],
+    }
+
+
+@router.post("/part-sales/{sale_id}/billing/quote", response_model=PartSalePaymentQuote)
+async def quote_part_sale_payment(
+    sale_id: uuid.UUID,
+    payload: PartSalePaymentQuoteInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartSalePaymentQuote:
+    sale = await service.get_sale(sale_id)
+    await _ensure_sale_payment_access(current_user, sale.filial_id, service.db)
+    return await service.quote_sale_payment(sale_id, payload)
+
+
+@router.post("/part-sales/{sale_id}/payments", response_model=PartSaleRead)
+async def collect_part_sale_payment(
+    sale_id: uuid.UUID,
+    payload: PartSalePaymentCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartSaleRead:
+    sale = await service.get_sale(sale_id)
+    await _ensure_sale_payment_access(current_user, sale.filial_id, service.db)
+    return await service.collect_sale_payment(sale_id, payload, current_user.user_id)
+
+
 @router.get("/part-returns", response_model=list[PartReturnRead])
 async def list_part_returns(
     filial_id: uuid.UUID = Query(...),
@@ -370,3 +423,84 @@ async def create_part_return(
         photo_urls=photo_urls,
     )
     return await service.create_return(payload, current_user.user_id)
+
+
+@router.get("/part-sales/{sale_id}/invoice/pdf")
+async def part_sale_invoice_pdf(
+    sale_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+):
+    from fastapi.responses import Response
+    from app.core.documents.invoice_pdf import render_invoice_pdf
+    from app.core.exceptions import BadRequestError
+
+    sale = await service.get_sale(sale_id)
+    await _ensure_access(current_user, sale.filial_id, service.db)
+    if sale.status.value != "completado":
+        raise BadRequestError("Confirma la entrega de mostrador antes de descargar la factura.")
+    filial = await service.db.get(Filial, sale.filial_id)
+    from app.modules.parts.models import Part
+
+    descriptions = {}
+    for line in sale.lines:
+        part = await service.db.get(Part, line.part_id)
+        descriptions[line.part_id] = f"{part.code} · {part.name}" if part else "Repuesto"
+    from sqlalchemy import select
+    from app.modules.administracion.models import Account, IncomeEntry
+    from app.modules.administracion.enums import MovementSourceType
+
+    payments = []
+    entries = (
+        (
+            await service.db.execute(
+                select(IncomeEntry)
+                .where(
+                    IncomeEntry.source_type == MovementSourceType.PART_SALE,
+                    IncomeEntry.source_id == sale.id,
+                )
+                .order_by(IncomeEntry.entry_date, IncomeEntry.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for entry in entries:
+        account = await service.db.get(Account, entry.account_id) if entry.account_id else None
+        currency = entry.currency.value.upper()
+        payments.append(
+            f"{account.name if account else 'Cuenta registrada'} · {currency} {float(entry.amount):,.2f}"
+        )
+        if entry.exchange_rate:
+            payments.append(f"Tasa de cobro: Bs. {float(entry.exchange_rate):,.8f} por USD")
+    data = {
+        "issuer": filial.name,
+        "code": "FAC-" + sale.code,
+        "issued_at": sale.created_at.isoformat(),
+        "client": sale.client_name,
+        "client_document": sale.client_document or "",
+        "reference": "Venta " + sale.code,
+        "lines": [
+            {
+                "description": descriptions[line.part_id],
+                "quantity": line.quantity,
+                "unit_price": line.unit_price,
+                "total": line.line_total,
+            }
+            for line in sale.lines
+        ],
+        "totals": [
+            ("Subtotal", sale.total),
+            (f"IVA ({sale.iva_percentage}%)", sale.iva_amount),
+            (f"IGTF ({sale.igtf_percentage}%)", sale.igtf_amount),
+            ("Total", sale.total_with_taxes),
+        ],
+        "payments": payments + [f"Cobrado: USD {sale.amount_collected:,.2f}"],
+        "pending": sale.pending_amount,
+        "notes": ["Saldo y cobros a la fecha de descarga."],
+    }
+    return Response(
+        render_invoice_pdf(data),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="factura-{sale.id}.pdf"'},
+    )

@@ -9,7 +9,7 @@ from datetime import UTC, date, datetime
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 from app.core.database import Base
 from app.modules.clients.enums import ClientType, DocumentType
@@ -36,7 +36,10 @@ def env():
         vehicle = Vehicle(client_id=client.id, brand="Toyota", model="Corolla", plate="ABC123")
         session.add(vehicle)
         session.commit()
-        order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+        order = ServiceOrder(
+            filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+            order_type_id=make_order_type(session, filial_id),
+        )
         session.add(order)
         session.commit()
 
@@ -99,7 +102,10 @@ async def test_rate_scoped_to_filial(env):
     other_vehicle = Vehicle(client_id=other_client.id, brand="Ford", model="Fiesta", plate="XYZ999")
     session.add(other_vehicle)
     session.commit()
-    other_order = ServiceOrder(filial_id=other_filial_id, sequence_number=1, vehicle_id=other_vehicle.id)
+    other_order = ServiceOrder(
+        filial_id=other_filial_id, sequence_number=1, vehicle_id=other_vehicle.id,
+        order_type_id=make_order_type(session, other_filial_id),
+    )
     session.add(other_order)
     session.commit()
 

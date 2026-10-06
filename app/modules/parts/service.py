@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -45,6 +45,9 @@ from app.modules.parts.schemas import (
     PartReturnCreate,
     PartSaleCreate,
     PartSaleLineDispatch,
+    PartSalePaymentCreate,
+    PartSalePaymentQuote,
+    PartSalePaymentQuoteInput,
     PartUpdate,
 )
 from app.modules.post_ventas.models import LaborSettings
@@ -164,9 +167,13 @@ class PartsService:
                 category_id=part.category_id,
                 category_name=categories.get(part.category_id, ""),
                 vehicle_brand_id=part.vehicle_brand_id,
-                vehicle_brand_name=brands.get(part.vehicle_brand_id) if part.vehicle_brand_id else None,
+                vehicle_brand_name=brands.get(part.vehicle_brand_id)
+                if part.vehicle_brand_id
+                else None,
                 vehicle_model_id=part.vehicle_model_id,
-                vehicle_model_name=models.get(part.vehicle_model_id) if part.vehicle_model_id else None,
+                vehicle_model_name=models.get(part.vehicle_model_id)
+                if part.vehicle_model_id
+                else None,
                 year_from=part.year_from,
                 year_to=part.year_to,
                 measure_id=part.measure_id,
@@ -249,7 +256,9 @@ class PartsService:
             .correlate(Part)
             .scalar_subquery()
         )
-        query = select(Part, stock_total, latest_cost, latest_location).where(Part.filial_id == filial_id)
+        query = select(Part, stock_total, latest_cost, latest_location).where(
+            Part.filial_id == filial_id
+        )
         if not include_inactive:
             query = query.where(Part.is_active.is_(True))
         if search:
@@ -352,7 +361,9 @@ class PartsService:
             if payload.year_to is not None:
                 part.year_to = payload.year_to
 
-        await self._validate_vehicle_fit(part.vehicle_brand_id, part.vehicle_model_id, part.year_from, part.year_to)
+        await self._validate_vehicle_fit(
+            part.vehicle_brand_id, part.vehicle_model_id, part.year_from, part.year_to
+        )
 
         for field in ("code", "name", "unit", "min_stock"):
             value = getattr(payload, field)
@@ -424,7 +435,11 @@ class PartsService:
     async def list_categories(
         self, holding_id: uuid.UUID, include_inactive: bool = False
     ) -> list[PartCategory]:
-        query = select(PartCategory).where(PartCategory.holding_id == holding_id).order_by(PartCategory.name)
+        query = (
+            select(PartCategory)
+            .where(PartCategory.holding_id == holding_id)
+            .order_by(PartCategory.name)
+        )
         if not include_inactive:
             query = query.where(PartCategory.is_active.is_(True))
         result = await self.db.execute(query)
@@ -432,7 +447,9 @@ class PartsService:
 
     async def _get_category(self, category_id: uuid.UUID, holding_id: uuid.UUID) -> PartCategory:
         result = await self.db.execute(
-            select(PartCategory).where(PartCategory.id == category_id, PartCategory.holding_id == holding_id)
+            select(PartCategory).where(
+                PartCategory.id == category_id, PartCategory.holding_id == holding_id
+            )
         )
         category = result.scalar_one_or_none()
         if category is None:
@@ -442,7 +459,8 @@ class PartsService:
     async def get_or_create_category(self, holding_id: uuid.UUID, name: str) -> PartCategory:
         result = await self.db.execute(
             select(PartCategory).where(
-                PartCategory.holding_id == holding_id, func.lower(PartCategory.name) == name.strip().lower()
+                PartCategory.holding_id == holding_id,
+                func.lower(PartCategory.name) == name.strip().lower(),
             )
         )
         category = result.scalar_one_or_none()
@@ -453,7 +471,9 @@ class PartsService:
         await self.db.flush()
         return category
 
-    async def create_category(self, holding_id: uuid.UUID, payload: PartCategoryCreate) -> PartCategory:
+    async def create_category(
+        self, holding_id: uuid.UUID, payload: PartCategoryCreate
+    ) -> PartCategory:
         await self._ensure_category_name_is_available(holding_id, payload.name)
         category = PartCategory(holding_id=holding_id, name=payload.name.strip())
         self.db.add(category)
@@ -484,7 +504,8 @@ class PartsService:
     async def _ensure_category_name_is_available(self, holding_id: uuid.UUID, name: str) -> None:
         result = await self.db.execute(
             select(PartCategory).where(
-                PartCategory.holding_id == holding_id, func.lower(PartCategory.name) == name.strip().lower()
+                PartCategory.holding_id == holding_id,
+                func.lower(PartCategory.name) == name.strip().lower(),
             )
         )
         if result.scalar_one_or_none() is not None:
@@ -495,7 +516,11 @@ class PartsService:
     async def list_measures(
         self, holding_id: uuid.UUID, include_inactive: bool = False
     ) -> list[PartMeasure]:
-        query = select(PartMeasure).where(PartMeasure.holding_id == holding_id).order_by(PartMeasure.name)
+        query = (
+            select(PartMeasure)
+            .where(PartMeasure.holding_id == holding_id)
+            .order_by(PartMeasure.name)
+        )
         if not include_inactive:
             query = query.where(PartMeasure.is_active.is_(True))
         result = await self.db.execute(query)
@@ -503,14 +528,18 @@ class PartsService:
 
     async def _get_measure(self, measure_id: uuid.UUID, holding_id: uuid.UUID) -> PartMeasure:
         result = await self.db.execute(
-            select(PartMeasure).where(PartMeasure.id == measure_id, PartMeasure.holding_id == holding_id)
+            select(PartMeasure).where(
+                PartMeasure.id == measure_id, PartMeasure.holding_id == holding_id
+            )
         )
         measure = result.scalar_one_or_none()
         if measure is None:
             raise PartMeasureNotFoundError(str(measure_id))
         return measure
 
-    async def create_measure(self, holding_id: uuid.UUID, payload: PartMeasureCreate) -> PartMeasure:
+    async def create_measure(
+        self, holding_id: uuid.UUID, payload: PartMeasureCreate
+    ) -> PartMeasure:
         await self._ensure_measure_name_is_available(holding_id, payload.name)
         measure = PartMeasure(holding_id=holding_id, name=payload.name.strip())
         self.db.add(measure)
@@ -541,13 +570,57 @@ class PartsService:
     async def _ensure_measure_name_is_available(self, holding_id: uuid.UUID, name: str) -> None:
         result = await self.db.execute(
             select(PartMeasure).where(
-                PartMeasure.holding_id == holding_id, func.lower(PartMeasure.name) == name.strip().lower()
+                PartMeasure.holding_id == holding_id,
+                func.lower(PartMeasure.name) == name.strip().lower(),
             )
         )
         if result.scalar_one_or_none() is not None:
             raise PartMeasureNameAlreadyExistsError(name)
 
     # Sales
+
+    async def _collected_amounts(self, sale_ids: list[uuid.UUID]) -> dict[uuid.UUID, float]:
+        """Sum of every IncomeEntry ever posted against each sale (the
+        payment ledger — see collect_sale_payment) — batched by id so a
+        sales list doesn't do one query per row."""
+        if not sale_ids:
+            return {}
+        from app.modules.administracion.enums import AccountCurrency, MovementSourceType
+        from app.modules.administracion.models import IncomeEntry
+
+        result = await self.db.execute(
+            select(
+                IncomeEntry.source_id,
+                func.coalesce(
+                    func.sum(
+                        func.coalesce(
+                            IncomeEntry.amount_usd,
+                            case(
+                                (IncomeEntry.currency == AccountCurrency.USD, IncomeEntry.amount),
+                                else_=IncomeEntry.amount
+                                / func.nullif(IncomeEntry.exchange_rate, 0),
+                            ),
+                        )
+                    ),
+                    0,
+                ),
+            )
+            .where(
+                IncomeEntry.source_type == MovementSourceType.PART_SALE,
+                IncomeEntry.source_id.in_(sale_ids),
+            )
+            .group_by(IncomeEntry.source_id)
+        )
+        return {row[0]: float(row[1]) for row in result.all()}
+
+    def _attach_payment_status(
+        self, sale: PartSale, collected_amounts: dict[uuid.UUID, float]
+    ) -> None:
+        # Transient attributes, not mapped columns — same convention as
+        # task.stock_warnings elsewhere in this codebase. Pydantic's
+        # from_attributes picks them up like any other attribute.
+        sale.amount_collected = collected_amounts.get(sale.id, 0.0)
+        sale.pending_amount = max(0.0, round(sale.total_with_taxes - sale.amount_collected, 2))
 
     async def list_sales(self, filial_id: uuid.UUID, search: str | None = None) -> list[PartSale]:
         query = (
@@ -561,6 +634,9 @@ class PartsService:
         if search:
             term = search.lower()
             sales = [s for s in sales if term in s.client_name.lower() or term in s.code.lower()]
+        collected_amounts = await self._collected_amounts([s.id for s in sales])
+        for s in sales:
+            self._attach_payment_status(s, collected_amounts)
         return sales
 
     async def get_sale(self, sale_id: uuid.UUID) -> PartSale:
@@ -569,17 +645,13 @@ class PartsService:
         sale = result.scalar_one_or_none()
         if sale is None:
             raise PartSaleNotFoundError(str(sale_id))
+        self._attach_payment_status(sale, await self._collected_amounts([sale.id]))
         return sale
 
     async def _tax_breakdown(
         self, filial_id: uuid.UUID, subtotal: Decimal
     ) -> tuple[float, Decimal, float, Decimal]:
-        """IVA on the subtotal, IGTF on (subtotal + IVA) — never on the
-        subtotal alone. Same formula already used for service orders and
-        vehicle sales; a counter sale is assumed paid in foreign currency in
-        full, the same simplifying assumption a vehicle's own list-price
-        preview already makes (no partial/Bs payment tracking exists for a
-        counter sale, unlike an ODS invoice or a vehicle checkout)."""
+        """Preview IVA and full-USD IGTF; actual IGTF accrues on collection."""
         result = await self.db.execute(
             select(LaborSettings.iva_percentage, LaborSettings.igtf_percentage).where(
                 LaborSettings.filial_id == filial_id
@@ -589,7 +661,9 @@ class PartsService:
         iva_percentage = float(row[0]) if row else 16.0
         igtf_percentage = float(row[1]) if row else 3.0
         cent = Decimal("0.01")
-        iva_amount = (subtotal * Decimal(str(iva_percentage)) / 100).quantize(cent, rounding=ROUND_HALF_UP)
+        iva_amount = (subtotal * Decimal(str(iva_percentage)) / 100).quantize(
+            cent, rounding=ROUND_HALF_UP
+        )
         igtf_amount = ((subtotal + iva_amount) * Decimal(str(igtf_percentage)) / 100).quantize(
             cent, rounding=ROUND_HALF_UP
         )
@@ -679,7 +753,7 @@ class PartsService:
                 iva_percentage=iva_percentage,
                 iva_amount=iva_amount,
                 igtf_percentage=igtf_percentage,
-                igtf_amount=igtf_amount,
+                igtf_amount=0,
             )
             self.db.add(sale)
             await self.db.flush()
@@ -749,7 +823,9 @@ class PartsService:
         allocation so a defective part can be traced back to the exact lot
         (and from there, the supplier) for a claim."""
         days_result = await self.db.execute(
-            select(LaborSettings.part_warranty_days).where(LaborSettings.filial_id == sale.filial_id)
+            select(LaborSettings.part_warranty_days).where(
+                LaborSettings.filial_id == sale.filial_id
+            )
         )
         warranty_days = days_result.scalar_one_or_none() or DEFAULT_PART_WARRANTY_DAYS
         starts_at = datetime.now(timezone.utc)
@@ -788,6 +864,11 @@ class PartsService:
             if new_status not in SALE_TRANSITIONS.get(sale.status, set()):
                 raise InvalidSaleStatusTransitionError(sale.status.value, new_status.value)
 
+            if new_status == PartSaleStatus.CANCELADO and sale.amount_collected > 0:
+                raise BadRequestError(
+                    "No se puede cancelar una venta con cobros registrados."
+                )
+
             if new_status == PartSaleStatus.PEDIDO:
                 self._apply_dispatch(sale, dispatched_lines)
 
@@ -824,22 +905,177 @@ class PartsService:
                         _sync_availability(part)
 
             if new_status == PartSaleStatus.COMPLETADO:
-                from app.modules.administracion.enums import MovementSourceType
-                from app.modules.administracion.service import AdministracionService
-
-                admin_service = AdministracionService(self.db)
-                await admin_service.record_automatic_income(
-                    sale.filial_id,
-                    f"Cierre de venta de repuestos · {sale.client_name}",
-                    sale.total,
-                    sale.code,
-                    source_type=MovementSourceType.PART_SALE,
-                    source_id=sale.id,
-                )
+                # Confirming at the counter only means the part was handed
+                # over — it no longer silently posts income on its own.
+                # Payment is now its own step (see collect_sale_payment),
+                # which may happen before, during, or after this transition;
+                # an unpaid/partially-paid sale simply stays visible in
+                # Cuentas por Cobrar (see AdministracionService.list_receivables).
                 await self._create_counter_warranties(sale)
 
         await self.db.commit()
         return await self.get_sale(sale.id)
+
+    # Cobro — see the module docstring-style note in update_sale_status:
+    # confirming dispatch (completado) no longer implies payment. Each
+    # collection is just an IncomeEntry tagged source_type=PART_SALE,
+    # source_id=sale.id — pending_amount (see _attach_payment_status) is
+    # always total_with_taxes minus the sum of those, so partial collections
+    # accumulate naturally with no separate "invoice" row to manage.
+
+    async def get_sale_billing_context(self, sale_id: uuid.UUID) -> dict:
+        from app.modules.administracion.enums import AccountCurrency
+        from app.modules.administracion.models import Account
+        from app.modules.exchange_rates.models import ExchangeRate
+        from app.modules.service_orders.billing import billing_day
+
+        sale = await self.get_sale(sale_id)
+        rate = (
+            await self.db.execute(
+                select(ExchangeRate).where(
+                    ExchangeRate.currency == "USD", ExchangeRate.value_date == billing_day()
+                )
+            )
+        ).scalar_one_or_none()
+        accounts = (
+            (
+                await self.db.execute(
+                    select(Account)
+                    .where(
+                        Account.filial_id == sale.filial_id,
+                        Account.is_active.is_(True),
+                        Account.currency.in_([AccountCurrency.USD, AccountCurrency.BS]),
+                    )
+                    .order_by(Account.name)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return dict(
+            sale=sale,
+            bcv_rate=float(rate.rate_ves) if rate else None,
+            bcv_date=rate.value_date.isoformat() if rate else None,
+            accounts=[dict(id=str(a.id), name=a.name, currency=a.currency.value) for a in accounts],
+        )
+
+    async def quote_sale_payment(self, sale_id: uuid.UUID, payload: PartSalePaymentQuoteInput):
+        from app.modules.service_orders.billing import calculate_payment
+
+        context = await self.get_sale_billing_context(sale_id)
+        sale = context["sale"]
+        if sale.status == PartSaleStatus.CANCELADO or sale.pending_amount <= 0:
+            raise BadRequestError("Esta venta no tiene un saldo cobrable.")
+        pending = sale.pending_amount
+        rate = Decimal(str(context["bcv_rate"])) if context["bcv_rate"] else None
+        result = calculate_payment(
+            pending, payload.payment_method, payload.usd_base, sale.igtf_percentage, rate
+        )
+        return PartSalePaymentQuote(
+            pending_before=pending,
+            payment_method=payload.payment_method,
+            bcv_rate=context["bcv_rate"],
+            bcv_date=context["bcv_date"],
+            due_usd=result["due_usd"],
+            due_bs=result["due_bs"],
+            igtf_amount=result["igtf_amount"],
+            total_usd=result["total_usd"],
+        )
+
+    async def collect_sale_payment(
+        self, sale_id: uuid.UUID, payload: PartSalePaymentCreate, user_id: uuid.UUID | None
+    ) -> PartSale:
+        from app.modules.administracion.enums import (
+            AccountCurrency,
+            IncomeSource,
+            MovementSourceType,
+        )
+        from app.modules.administracion.models import Account, IncomeEntry
+        from app.modules.service_orders.billing import billing_day, calculate_payment, money
+
+        # Locks the sale row so two concurrent collection attempts can't both
+        # read the same pending_amount and together overcollect — there's no
+        # separate "invoice" row to lock here, the sale itself is it.
+        await self.db.execute(
+            select(PartSale)
+            .where(PartSale.id == sale_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        context = await self.get_sale_billing_context(sale_id)
+        sale = context["sale"]
+        if sale.status == PartSaleStatus.CANCELADO:
+            raise BadRequestError("No se puede cobrar una venta cancelada.")
+        if payload.paid_usd + payload.paid_bs <= 0:
+            raise BadRequestError("El cobro debe ser mayor a cero.")
+        pending_before = sale.pending_amount
+        if pending_before <= 0:
+            raise BadRequestError(
+                "Esta venta ya está pagada por completo.", error_code="sale_already_paid"
+            )
+
+        rate = Decimal(str(context["bcv_rate"])) if context["bcv_rate"] else None
+        quote = calculate_payment(
+            pending_before, payload.payment_method, payload.usd_base, sale.igtf_percentage, rate
+        )
+        if payload.paid_usd > money(quote["due_usd"]) or payload.paid_bs > money(quote["due_bs"]):
+            raise BadRequestError(
+                "El pago recibido no puede superar el saldo pendiente.",
+                error_code="payment_mismatch",
+            )
+
+        validated_payments = []
+        for currency, amount, account_id in (
+            (AccountCurrency.USD, payload.paid_usd, payload.usd_account_id),
+            (AccountCurrency.BS, payload.paid_bs, payload.bs_account_id),
+        ):
+            if amount == 0:
+                continue
+            account = await self.db.get(Account, account_id) if account_id else None
+            if (
+                account is None
+                or not account.is_active
+                or account.filial_id != sale.filial_id
+                or account.currency != currency
+            ):
+                raise BadRequestError(
+                    f"Selecciona una cuenta activa en {currency.value.upper()} de la filial."
+                )
+            validated_payments.append((currency, amount, account))
+
+        igtf = money(
+            payload.paid_usd
+            - money(payload.paid_usd / (1 + Decimal(str(sale.igtf_percentage)) / 100))
+        )
+        sale.igtf_amount = money(sale.igtf_amount) + igtf
+        for currency, amount, account in validated_payments:
+            amount_usd = money(amount if currency == AccountCurrency.USD else amount / rate)
+            self.db.add(
+                IncomeEntry(
+                    filial_id=sale.filial_id,
+                    entry_date=billing_day(),
+                    source=IncomeSource.AUTOMATICO,
+                    origin_reference=sale.code,
+                    exchange_rate=float(rate) if rate else None,
+                    amount_usd=float(amount_usd),
+                    amount_bs=float(money(amount * rate))
+                    if currency == AccountCurrency.USD and rate
+                    else float(amount)
+                    if currency == AccountCurrency.BS
+                    else None,
+                    description=f"Cobro {sale.code} · {sale.client_name}",
+                    amount=float(amount),
+                    currency=currency,
+                    account_id=account.id,
+                    reference=payload.payment_reference or None,
+                    registered_by_user_id=user_id,
+                    source_type=MovementSourceType.PART_SALE,
+                    source_id=sale.id,
+                )
+            )
+
+        await self.db.commit()
+        return await self.get_sale(sale_id)
 
     async def _next_sale_sequence(self, filial_id: uuid.UUID) -> int:
         result = await self.db.execute(

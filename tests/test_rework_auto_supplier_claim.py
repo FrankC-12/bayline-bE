@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, seed_order_types_sync
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -29,7 +29,7 @@ from app.modules.service_orders.enums import (
     WarrantyClaimStatus,
     WarrantyClaimType,
 )
-from app.modules.service_orders.models import ServiceOrder, ServiceOrderInvoice
+from app.modules.service_orders.models import ServiceOrder, ServiceOrderInvoice, ServiceOrderTypeCatalog
 from app.modules.service_orders.schemas import WarrantyClaimAuthorizationInput, WarrantyClaimConvertInput, WarrantyClaimCreate
 from app.modules.service_orders.service import ServiceOrderService
 from app.modules.warehouse.models import PartLot, Warehouse
@@ -57,7 +57,15 @@ def env():
         session.add(vehicle)
         session.commit()
 
-        order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+        seed_order_types_sync(session, filial_id)
+        regular_type_id = session.execute(
+            select(ServiceOrderTypeCatalog.id).where(
+                ServiceOrderTypeCatalog.filial_id == filial_id, ServiceOrderTypeCatalog.code == "regular"
+            )
+        ).scalar_one()
+        order = ServiceOrder(
+            filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id, order_type_id=regular_type_id,
+        )
         session.add(order)
         session.commit()
         session.add(

@@ -148,7 +148,7 @@ async def test_collect_invoice_posts_income_and_clears_the_receivable(ready):
         collected_by,
     )
 
-    assert result.pending_amount == float(invoice.total_usd) - 0.0
+    assert result.pending_amount == 0.0
     assert await billing.list_receivables(order.filial_id) == []
 
     refreshed = await billing.get_invoice_by_id(invoice.id)
@@ -164,7 +164,7 @@ async def test_collect_invoice_posts_income_and_clears_the_receivable(ready):
 
 
 @pytest.mark.asyncio
-async def test_collect_invoice_rejects_a_non_usd_account(ready):
+async def test_collect_invoice_accepts_bs_account_and_reduces_pending(ready):
     await prepare(ready)
     _, session, order, _, _, billing, accounts, _ = ready
     holding_client = make_holding_client(session, order.filial_id)
@@ -180,14 +180,21 @@ async def test_collect_invoice_rejects_a_non_usd_account(ready):
     session.add(bs_account)
     session.commit()
 
-    with pytest.raises(BadRequestError):
-        await billing.collect_invoice(
-            invoice.id,
-            CollectInvoicePaymentInput(
-                account_id=bs_account.id, withholding_amount=Decimal("0"), net_collected_amount=Decimal("18.64")
-            ),
-            uuid.uuid4(),
-        )
+    from app.modules.exchange_rates.models import ExchangeRate
+    from sqlalchemy import select
+
+    rate = session.scalars(select(ExchangeRate)).one()
+    result = await billing.collect_invoice(
+        invoice.id,
+        CollectInvoicePaymentInput(
+            account_id=bs_account.id, withholding_amount=Decimal("0"),
+            net_collected_amount=Decimal(str(rate.rate_ves)) * 5,
+        ),
+        None,
+    )
+    assert result.pending_amount == pytest.approx(float(invoice.total_usd) - 5)
+    assert (await billing.get_invoice_by_id(invoice.id)).collected_at is None
+    assert len(await billing.list_receivables(order.filial_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -326,3 +333,23 @@ async def test_holding_report_counts_invoice_level_retentions_as_withheld(ready)
     report = await billing.get_holding_warranty_receivables(holding_id)
 
     assert report.filiales[0].total_withheld == pytest.approx(quote.iva_retention_amount, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_invoice_two_abonos_close_only_when_fully_settled(ready):
+    await prepare(ready)
+    _, session, order, _, _, billing, accounts, _ = ready
+    payload = await invoice_payload(billing, order, accounts)
+    invoice = await billing.issue(order.id, payload.model_copy(update={"paid_usd": Decimal("0"), "paid_bs": Decimal("0")}), None)
+    result = await billing.collect_invoice(invoice.id, CollectInvoicePaymentInput(
+        account_id=accounts[0].id, withholding_amount=0, net_collected_amount=5), None)
+    assert result.pending_amount == pytest.approx(float(invoice.total_usd) - 5)
+    assert invoice.collected_at is None
+    with pytest.raises(BadRequestError):
+        await billing.collect_invoice(invoice.id, CollectInvoicePaymentInput(
+            account_id=accounts[0].id, withholding_amount=0, net_collected_amount=invoice.total_usd), None)
+    result = await billing.collect_invoice(invoice.id, CollectInvoicePaymentInput(
+        account_id=accounts[0].id, withholding_amount=0, net_collected_amount=Decimal(str(result.pending_amount))), None)
+    assert result.pending_amount == 0
+    assert invoice.collected_at is not None
+    assert await billing.list_receivables(order.filial_id) == []

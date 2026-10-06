@@ -9,7 +9,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -43,7 +43,10 @@ def env():
         vehicle = Vehicle(client_id=client.id, brand="Toyota", model="Corolla", plate="ABC123")
         session.add(vehicle)
         session.commit()
-        order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+        order = ServiceOrder(
+            filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+            order_type_id=make_order_type(session, filial_id),
+        )
         session.add(order)
         session.add(
             PartLot(

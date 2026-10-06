@@ -33,6 +33,61 @@ from app.modules.warehouse.exceptions import InsufficientStockError
 from app.modules.warehouse.models import PartLot, StockMovement, Warehouse
 
 
+def seed_order_types_sync(session, filial_id) -> None:
+    """Seeds all 6 system tipos de ODS for a filial — needed whenever a test
+    exercises convert_warranty_claim_to_order (which looks up "retrabajo")
+    or create_order with a claim-linked type, not just the plain default.
+    Flushes so a query against the same (often autoflush=False) session sees
+    the new rows right away. Sync, for use from a plain (non-async) fixture."""
+    from app.modules.service_orders.models import ServiceOrderTypeCatalog
+    from app.modules.service_orders.service import SYSTEM_ORDER_TYPES
+
+    for entry in SYSTEM_ORDER_TYPES:
+        session.add(
+            ServiceOrderTypeCatalog(
+                filial_id=filial_id, code=entry["code"], name=entry["name"],
+                description=entry["description"], is_system=True,
+                claim_type=entry["claim_type"], is_selectable=entry["is_selectable"],
+            )
+        )
+    session.flush()
+
+
+async def seed_order_types(session, filial_id) -> None:
+    """Same as seed_order_types_sync, awaitable for use from an async test body."""
+    seed_order_types_sync(session, filial_id)
+
+
+def make_order_type(session, filial_id, *, code: str = "regular") -> uuid.UUID:
+    """ServiceOrder.order_type_id is a required FK to ServiceOrderTypeCatalog
+    (no more column default, since the default "regular" type is resolved
+    per-filial at the service layer) — every test fixture that constructs a
+    ServiceOrder directly needs one of these first."""
+    from app.modules.service_orders.models import ServiceOrderTypeCatalog
+
+    order_type = ServiceOrderTypeCatalog(filial_id=filial_id, code=code, name=code.title(), is_system=True)
+    session.add(order_type)
+    session.flush()
+    return order_type.id
+
+
+def get_or_make_order_type(session, filial_id, *, code: str = "regular") -> uuid.UUID:
+    """Like make_order_type, but reuses an existing row for (filial_id, code)
+    instead of always inserting — use this when a fixture/helper creates more
+    than one ServiceOrder for the SAME filial_id, since a second unconditional
+    make_order_type call would violate the (filial_id, code) unique constraint."""
+    from sqlalchemy import select
+
+    from app.modules.service_orders.models import ServiceOrderTypeCatalog
+
+    existing = session.execute(
+        select(ServiceOrderTypeCatalog.id).where(
+            ServiceOrderTypeCatalog.filial_id == filial_id, ServiceOrderTypeCatalog.code == code
+        )
+    ).scalar_one_or_none()
+    return existing if existing is not None else make_order_type(session, filial_id, code=code)
+
+
 class AsyncAdapter:
     """Run the async service against a real synchronous SQLAlchemy test session."""
 

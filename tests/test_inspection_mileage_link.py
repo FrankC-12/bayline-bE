@@ -12,7 +12,7 @@ os.environ["DEBUG"] = "false"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -34,11 +34,13 @@ def env():
         yield InspectionService(adapter), ServiceOrderService(adapter), session
 
 
-async def _make_scheduled_order(service: ServiceOrderService, vehicle_id: uuid.UUID) -> ServiceOrder:
+async def _make_scheduled_order(service: ServiceOrderService, session, vehicle_id: uuid.UUID) -> ServiceOrder:
+    filial_id = uuid.uuid4()
     return await service.create_order(
         ServiceOrderCreate(
-            filial_id=uuid.uuid4(),
+            filial_id=filial_id,
             vehicle_id=vehicle_id,
+            order_type_id=make_order_type(session, filial_id),
             customer_reason="Mantenimiento programado",
             advisor_user_id=uuid.uuid4(),
             promised_at=datetime(2026, 9, 10, 9, 0),
@@ -51,7 +53,7 @@ async def _make_scheduled_order(service: ServiceOrderService, vehicle_id: uuid.U
 async def test_linking_an_inspection_mirrors_its_mileage_onto_the_order(env):
     inspections, orders, session = env
     vehicle_id = uuid.uuid4()
-    order = await _make_scheduled_order(orders, vehicle_id)
+    order = await _make_scheduled_order(orders, session, vehicle_id)
     assert order.intake_mileage is None
 
     inspection = PreliminaryInspection(
@@ -73,8 +75,8 @@ async def test_linking_an_inspection_mirrors_its_mileage_onto_the_order(env):
 async def test_cannot_link_an_already_linked_inspection(env):
     inspections, orders, session = env
     vehicle_id = uuid.uuid4()
-    order_a = await _make_scheduled_order(orders, vehicle_id)
-    order_b = await _make_scheduled_order(orders, vehicle_id)
+    order_a = await _make_scheduled_order(orders, session, vehicle_id)
+    order_b = await _make_scheduled_order(orders, session, vehicle_id)
 
     inspection = PreliminaryInspection(
         filial_id=order_a.filial_id,

@@ -72,7 +72,7 @@ async def test_legacy_vehicle_with_no_location_is_left_null(env):
     field loop only overwrites when a new value is actually supplied."""
     service, session, filial_id, user = env
     vehicle = DealershipVehicle(
-        filial_id=filial_id, status=VehicleStatus.DISPONIBLE, condition=VehicleCondition.USADO,
+        filial_id=filial_id, status=VehicleStatus.DISPONIBLE, condition=VehicleCondition.USADO, mileage=80000,
         brand="Ford", model="Fiesta", year=2018, vin=str(uuid.uuid4())[:17], sku="SKU-2",
         price_cash=5_000, price_financed=5_500, cost_price=4_000,
     )

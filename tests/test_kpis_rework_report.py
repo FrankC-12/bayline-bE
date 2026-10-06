@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, get_or_make_order_type
 
 from app.core.database import Base
 from app.modules.clients.enums import ClientType, DocumentType
@@ -49,7 +49,10 @@ def make_vehicle(session, client_id):
 
 def make_invoiced_order(session, filial_id, client_id, technician_user_id, issued_at):
     vehicle = make_vehicle(session, client_id)
-    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id, technician_user_id=technician_user_id)
+    order = ServiceOrder(
+        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id, technician_user_id=technician_user_id,
+        order_type_id=get_or_make_order_type(session, filial_id),
+    )
     session.add(order)
     session.commit()
     invoice = ServiceOrderInvoice(

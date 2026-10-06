@@ -29,6 +29,7 @@ from app.modules.administracion.enums import (
     SupplierType,
 )
 from app.modules.administracion.exceptions import (
+    AccountCurrencyMismatchError,
     AttachmentRequiredError,
     ClosedPeriodEntryDateError,
     EntryAlreadyReversedError,
@@ -124,6 +125,54 @@ def test_income_create_cliente_counterparty_accepted():
         counterparty_client_id=uuid.uuid4(), counterparty_name=None,
     )
     assert payload.counterparty_client_id is not None
+
+
+# --- Currency must match the target account's, or the amount silently never
+# reaches that account's own balance (_account_balance sums entries filtered
+# by currency == account.currency) even though it's correctly converted and
+# counted everywhere else (movement list, dashboard monthly aggregate). ---
+
+
+@pytest.mark.asyncio
+async def test_usd_income_into_a_bs_account_is_rejected(env):
+    service, _, filial_id, _usd_account, bs_account, _ = env
+    payload = _income_payload(filial_id, bs_account.id, currency=AccountCurrency.USD, amount=20)
+    with pytest.raises(AccountCurrencyMismatchError):
+        await service.create_income(payload, None, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_bs_income_into_a_usd_account_is_rejected(env):
+    service, session, filial_id, usd_account, _bs_account, _ = env
+    session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=date.today()))
+    session.commit()
+    payload = _income_payload(filial_id, usd_account.id, currency=AccountCurrency.BS, amount=800)
+    with pytest.raises(AccountCurrencyMismatchError):
+        await service.create_income(payload, None, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_usd_expense_into_a_bs_account_is_rejected(env):
+    service, _, filial_id, _usd_account, bs_account, _ = env
+    payload = _expense_payload(filial_id, bs_account.id, currency=AccountCurrency.USD, amount=20)
+    with pytest.raises(AccountCurrencyMismatchError):
+        await service.create_expense(payload, None, uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_matching_currency_income_is_reflected_in_the_account_balance(env):
+    """Regression for the $20 silently missing from Banplus's balance — a
+    correctly currency-matched entry must actually move the account's own
+    computed balance, not just its amount_usd/amount_bs snapshot."""
+    service, session, filial_id, _usd_account, bs_account, _ = env
+    session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=date.today()))
+    session.commit()
+    before = await service.get_account_detail(bs_account.id)
+    payload = _income_payload(filial_id, bs_account.id, currency=AccountCurrency.BS, amount=99)
+    await service.create_income(payload, None, uuid.uuid4())
+
+    after = await service.get_account_detail(bs_account.id)
+    assert after["balance"] == before["balance"] + 99
 
 
 # --- Exchange rate: frozen at entry_date, required for a non-USD entry ---

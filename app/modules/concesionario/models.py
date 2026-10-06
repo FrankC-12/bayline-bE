@@ -1,7 +1,18 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,7 +35,10 @@ class DealershipVehicle(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     status: Mapped[VehicleStatus] = mapped_column(
         Enum(VehicleStatus, name="dealership_vehicle_status"),
@@ -44,6 +58,7 @@ class DealershipVehicle(Base):
     model: Mapped[str] = mapped_column(String(60), nullable=False)
     version: Mapped[str | None] = mapped_column(String(60), nullable=True)
     year: Mapped[int] = mapped_column(Integer, nullable=False)
+    mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
     color: Mapped[str | None] = mapped_column(String(40), nullable=True)
     fuel_type: Mapped[FuelType | None] = mapped_column(
         Enum(FuelType, name="dealership_vehicle_fuel_type"), nullable=True
@@ -61,17 +76,25 @@ class DealershipVehicle(Base):
     # true from reception (see ComprasService.add_reception) until the
     # supplier invoice linked to the OC is registered and fixes the real
     # cost, or a stand-in guess for a unit added by hand with no OC behind it.
-    cost_is_estimated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    cost_is_estimated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Traceability back to Compras — all three null for a unit added by hand
     # (AddVehicleModal), all three set for one born from a reception.
     purchase_order_line_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("vehicle_purchase_order_lines.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("vehicle_purchase_order_lines.id", ondelete="SET NULL"),
+        nullable=True,
     )
     reception_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("vehicle_purchase_order_receptions.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("vehicle_purchase_order_receptions.id", ondelete="SET NULL"),
+        nullable=True,
     )
     purchase_order_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("vehicle_purchase_order_invoices.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("vehicle_purchase_order_invoices.id", ondelete="SET NULL"),
+        nullable=True,
     )
     price_currency: Mapped[str] = mapped_column(String(3), nullable=False, default="USD")
     iva_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=16)
@@ -137,18 +160,26 @@ class VehicleSale(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     vehicle_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dealership_vehicles.id", ondelete="RESTRICT"), nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("dealership_vehicles.id", ondelete="RESTRICT"),
+        nullable=False,
     )
+    mileage_at_sale: Mapped[int | None] = mapped_column(Integer, nullable=True)
     client_name: Mapped[str] = mapped_column(String(150), nullable=False)
     client_document: Mapped[str | None] = mapped_column(String(20), nullable=True)
     advisor_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    sale_type: Mapped[SaleType] = mapped_column(Enum(SaleType, name="vehicle_sale_type"), nullable=False)
+    sale_type: Mapped[SaleType] = mapped_column(
+        Enum(SaleType, name="vehicle_sale_type"), nullable=False
+    )
     # Only set for sale_type=contado — how the payment was actually split,
     # since that's what determines the IGTF charged (see igtf_amount below).
     # Null for sale_type=financiado, which never touches IGTF.
@@ -162,7 +193,9 @@ class VehicleSale(Base):
     # Set only when final_price came out below the vehicle's cost_price —
     # requires an "administracion"-level override, recorded here alongside
     # who authorized it. False/null for every ordinary, at-or-above-cost sale.
-    below_cost_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    below_cost_override: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     below_cost_override_note: Mapped[str | None] = mapped_column(String(500), nullable=True)
     authorized_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -173,3 +206,20 @@ class VehicleSale(Base):
     @property
     def code(self) -> str:
         return f"CV-{self.sequence_number:04d}"
+
+
+class VehicleStatusEvent(Base):
+    __tablename__ = "dealership_vehicle_status_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vehicle_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dealership_vehicles.id", ondelete="RESTRICT"), index=True
+    )
+    previous_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    new_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    # Preserve the actor identity even if the account is subsequently removed.
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    reservation_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

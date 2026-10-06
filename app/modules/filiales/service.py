@@ -36,6 +36,15 @@ class FilialService:
 
         filial = Filial(holding_id=payload.holding_id, name=payload.name, slug=payload.slug)
         self.db.add(filial)
+        await self.db.flush()
+
+        # A filial can't create any ODS at all without at least a "regular"
+        # tipo de ODS to default to — seed the 6 system types (see
+        # service_orders.service.SYSTEM_ORDER_TYPES) right away.
+        from app.modules.service_orders.service import seed_default_order_types
+
+        await seed_default_order_types(self.db, filial.id)
+
         await self.db.commit()
         await self.db.refresh(filial)
         return filial

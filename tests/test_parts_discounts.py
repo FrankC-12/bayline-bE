@@ -6,7 +6,7 @@ from decimal import Decimal
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
-from test_part_sales_fifo import inventory as fifo_inventory
+from test_part_sales_fifo import inventory as fifo_inventory, make_order_type
 
 from app.modules.parts.pricing import PARTS_MULTIPLIERS
 from app.modules.parts.schemas import PartSaleCreate
@@ -53,7 +53,8 @@ def order_inventory(inventory):
     # ODS snapshots the current catalog cost; changing margins must never read it again.
     lots[-1].unit_cost = 12
     order = ServiceOrder(
-        id=uuid.uuid4(), filial_id=data["filial_id"], vehicle_id=uuid.uuid4(), sequence_number=2001
+        id=uuid.uuid4(), filial_id=data["filial_id"], vehicle_id=uuid.uuid4(), sequence_number=2001,
+        order_type_id=make_order_type(session, data["filial_id"]),
     )
     session.add(order)
     session.commit()

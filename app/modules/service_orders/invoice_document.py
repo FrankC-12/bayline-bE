@@ -35,6 +35,9 @@ def render_invoice(document: dict) -> str:
         if document["bcv_rate"] is not None
         else "No utilizada (pago íntegro en USD)"
     )
+    paid_usd = sum(float(p["amount"]) for p in document["payments"] if p["currency"].lower() == "usd")
+    paid_bs = sum(float(p["amount"]) for p in document["payments"] if p["currency"].lower() == "bs")
+    pending = max(0, float(document.get("net_expected", document["total_usd"])) - paid_usd - (paid_bs / float(document["bcv_rate"]) if document.get("bcv_rate") else 0))
     return f"""<!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{text(document['code'])}</title><style>
@@ -59,5 +62,5 @@ p{{line-height:1.6}}footer{{margin-top:30px;font-size:11px;color:#657080}}
 <h2>Comprobante de pago</h2><p>Método: {text({'usd':'USD','bs':'Bs.','mixed':'Mixto'}[document['payment_method']])}<br>
 Tasa BCV: {rate}<br>Referencia: {text(document['payment_reference']) or '—'}</p>
 <table><tr><th>Moneda</th><th>Cuenta receptora</th><th>Importe recibido</th></tr>{payments}</table>
-<p>Recibido: USD {amount(document['due_usd'])} + Bs. {amount(document['due_bs'])}. Saldo pendiente: 0.00.</p>
+<p>Recibido: USD {amount(paid_usd)} + Bs. {amount(paid_bs)}. Saldo pendiente al emitir: USD {amount(pending)}.</p>
 <footer>Documento {text(document['id'])} · Importes registrados al emitir la factura.</footer></body></html>"""

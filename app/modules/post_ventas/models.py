@@ -119,7 +119,10 @@ class Tempario(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     category: Mapped[TemparioCategory] = mapped_column(
         Enum(TemparioCategory, name="tempario_category"), nullable=False
@@ -132,6 +135,12 @@ class Tempario(Base):
     compatible_vehicles: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     tools: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     requires_parts: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    labor_warranty_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="RESTRICT"), nullable=True
+    )
+    parts_warranty_policy_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="RESTRICT"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

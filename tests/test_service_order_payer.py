@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -53,6 +53,7 @@ def env():
 
         order = ServiceOrder(
             filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id, advisor_user_id=uuid.uuid4(),
+            order_type_id=make_order_type(session, filial_id),
         )
         session.add(order)
         session.commit()

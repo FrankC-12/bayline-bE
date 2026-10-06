@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -55,7 +55,10 @@ def env():
         session.add(vehicle)
         session.commit()
 
-        order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+        order = ServiceOrder(
+            filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+            order_type_id=make_order_type(session, filial_id),
+        )
         session.add(order)
         session.commit()
 
@@ -113,7 +116,7 @@ async def test_a_fresh_reservation_blocks_another_line_from_the_same_lot(env):
     make_lot(session, filial_id, warehouse, part, quantity=2, unit_cost=10, received_at=datetime(2026, 1, 1, tzinfo=UTC))
     make_lot(session, filial_id, warehouse, part, quantity=10, unit_cost=20, received_at=datetime(2026, 2, 1, tzinfo=UTC))
 
-    other_order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=order.vehicle_id)
+    other_order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=order.vehicle_id, order_type_id=order.order_type_id)
     session.add(other_order)
     session.commit()
 
@@ -134,7 +137,7 @@ async def test_a_lapsed_reservation_no_longer_blocks_another_line(env):
     make_lot(session, filial_id, warehouse, part, quantity=2, unit_cost=10, received_at=datetime(2026, 1, 1, tzinfo=UTC))
     make_lot(session, filial_id, warehouse, part, quantity=10, unit_cost=20, received_at=datetime(2026, 2, 1, tzinfo=UTC))
 
-    other_order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=order.vehicle_id)
+    other_order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=order.vehicle_id, order_type_id=order.order_type_id)
     session.add(other_order)
     session.commit()
 

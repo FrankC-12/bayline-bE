@@ -129,3 +129,20 @@ async def test_resaving_a_legacy_nonstandard_plate_unchanged_still_persists(env)
         ),
     )
     assert resaved.vehicles[0].plate == "XYZ999O"
+
+
+@pytest.mark.asyncio
+async def test_andres_kook_legacy_plate_does_not_block_contact_updates(env):
+    service, filial_id = env
+    client = await service.create_client(ClientCreate(
+        filial_id=filial_id, full_name="Andres kook", client_type=ClientType.PARTICULAR,
+        document_type=DocumentType.V, document_number="55667788", phone_primary="04121234567",
+        address="Caracas", vehicles=[VehicleInput(brand="Toyota", model="Hilux", plate="ABDKHBC8")]))
+    vehicle_id = client.vehicles[0].id
+    result = await service.update_client(client.id, ClientUpdate(
+        phone_primary="04141234567", email="andres@example.com", address="Valencia",
+        vehicles=[VehicleInput(id=vehicle_id, brand="Toyota", model="Hilux", plate="ABDKHBC8")]))
+    assert result.vehicles[0].plate == "ABDKHBC8"
+    assert result.phone_primary == "04141234567"
+    assert result.email == "andres@example.com"
+    assert result.address == "Valencia"

@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 from app.core.database import Base
 from app.core.exceptions import BadRequestError
@@ -173,6 +173,7 @@ async def test_entry_is_cumplido_when_a_completed_task_matches_its_tempario(flee
         sequence_number=1001,
         status=ServiceOrderStatus.ORDEN_CERRADA,
         closed_at=datetime.now(UTC),
+        order_type_id=make_order_type(session, fleet["filial_id"]),
     )
     session.add(order)
     session.flush()
@@ -208,6 +209,7 @@ async def test_entry_is_omitido_when_a_later_entry_was_done_instead(fleet):
         sequence_number=1002,
         status=ServiceOrderStatus.ORDEN_CERRADA,
         closed_at=datetime.now(UTC),
+        order_type_id=make_order_type(session, fleet["filial_id"]),
     )
     session.add(order)
     session.flush()

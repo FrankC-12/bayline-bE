@@ -11,20 +11,20 @@ from datetime import date, datetime
 os.environ["DEBUG"] = "false"
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, seed_order_types
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
 from app.modules.inspections.models import PreliminaryInspection
-from app.modules.service_orders.enums import ServiceOrderType, WarrantyClaimStatus, WarrantyClaimType
+from app.modules.service_orders.enums import WarrantyClaimStatus, WarrantyClaimType
 from app.modules.service_orders.exceptions import (
     WarrantyClaimNotFoundError,
     WarrantyClaimOrderMismatchError,
     WarrantyClaimRequiredForOrderTypeError,
 )
-from app.modules.service_orders.models import WarrantyClaim
+from app.modules.service_orders.models import ServiceOrderTypeCatalog, WarrantyClaim
 from app.modules.service_orders.schemas import ServiceOrderCreate
 from app.modules.service_orders.service import ServiceOrderService
 
@@ -35,6 +35,21 @@ def env():
     Base.metadata.create_all(engine)
     with Session(engine, expire_on_commit=False, autoflush=False) as session:
         yield ServiceOrderService(AsyncAdapter(session)), session
+
+
+async def _order_type_id(session, filial_id, code: str) -> uuid.UUID:
+    """Seeds the filial's 6 system tipos de ODS on first use (a test may ask
+    for more than one code for the same filial_id) and resolves the given one."""
+    already_seeded = session.execute(
+        select(ServiceOrderTypeCatalog.id).where(ServiceOrderTypeCatalog.filial_id == filial_id)
+    ).first()
+    if not already_seeded:
+        await seed_order_types(session, filial_id)
+    return session.execute(
+        select(ServiceOrderTypeCatalog.id).where(
+            ServiceOrderTypeCatalog.filial_id == filial_id, ServiceOrderTypeCatalog.code == code
+        )
+    ).scalar_one()
 
 
 def _make_inspection(session, vehicle_id, mileage=15000):
@@ -80,7 +95,7 @@ async def test_garantia_fabrica_order_requires_a_claim(env):
         await service.create_order(
             _payload(
                 filial_id, vehicle_id, advisor_id, inspection.id,
-                order_type=ServiceOrderType.GARANTIA_FABRICA,
+                order_type_id=await _order_type_id(session, filial_id, "garantia_fabrica"),
             )
         )
 
@@ -96,7 +111,7 @@ async def test_claim_for_a_different_vehicle_is_rejected(env):
         await service.create_order(
             _payload(
                 filial_id, vehicle_id, advisor_id, inspection.id,
-                order_type=ServiceOrderType.GARANTIA_FABRICA, warranty_claim_id=claim.id,
+                order_type_id=await _order_type_id(session, filial_id, "garantia_fabrica"), warranty_claim_id=claim.id,
             )
         )
 
@@ -112,7 +127,7 @@ async def test_claim_of_the_wrong_type_is_rejected(env):
         await service.create_order(
             _payload(
                 filial_id, vehicle_id, advisor_id, inspection.id,
-                order_type=ServiceOrderType.GARANTIA_FABRICA, warranty_claim_id=claim.id,
+                order_type_id=await _order_type_id(session, filial_id, "garantia_fabrica"), warranty_claim_id=claim.id,
             )
         )
 
@@ -130,7 +145,7 @@ async def test_an_unauthorized_claim_is_rejected(env):
         await service.create_order(
             _payload(
                 filial_id, vehicle_id, advisor_id, inspection.id,
-                order_type=ServiceOrderType.GARANTIA_FABRICA, warranty_claim_id=claim.id,
+                order_type_id=await _order_type_id(session, filial_id, "garantia_fabrica"), warranty_claim_id=claim.id,
             )
         )
 
@@ -145,7 +160,7 @@ async def test_an_unknown_claim_id_raises_not_found(env):
         await service.create_order(
             _payload(
                 filial_id, vehicle_id, advisor_id, inspection.id,
-                order_type=ServiceOrderType.GARANTIA_FABRICA, warranty_claim_id=uuid.uuid4(),
+                order_type_id=await _order_type_id(session, filial_id, "garantia_fabrica"), warranty_claim_id=uuid.uuid4(),
             )
         )
 
@@ -160,11 +175,11 @@ async def test_a_matching_authorized_claim_links_successfully(env):
     order = await service.create_order(
         _payload(
             filial_id, vehicle_id, advisor_id, inspection.id,
-            order_type=ServiceOrderType.GARANTIA_FABRICA, warranty_claim_id=claim.id,
+            order_type_id=await _order_type_id(session, filial_id, "garantia_fabrica"), warranty_claim_id=claim.id,
         )
     )
 
-    assert order.order_type == ServiceOrderType.GARANTIA_FABRICA
+    assert order.order_type.code == "garantia_fabrica"
     assert order.warranty_claim_id == claim.id
 
 
@@ -178,7 +193,7 @@ async def test_comeback_and_campana_also_require_the_matching_claim_type(env):
     comeback_order = await service.create_order(
         _payload(
             filial_id, vehicle_id, advisor_id, comeback_inspection.id,
-            order_type=ServiceOrderType.COMEBACK, warranty_claim_id=comeback_claim.id,
+            order_type_id=await _order_type_id(session, filial_id, "comeback"), warranty_claim_id=comeback_claim.id,
         )
     )
     assert comeback_order.warranty_claim_id == comeback_claim.id
@@ -188,7 +203,7 @@ async def test_comeback_and_campana_also_require_the_matching_claim_type(env):
     campana_order = await service.create_order(
         _payload(
             filial_id, vehicle_id, advisor_id, campana_inspection.id,
-            order_type=ServiceOrderType.CAMPANA, warranty_claim_id=campana_claim.id,
+            order_type_id=await _order_type_id(session, filial_id, "campana"), warranty_claim_id=campana_claim.id,
         )
     )
     assert campana_order.warranty_claim_id == campana_claim.id
@@ -204,7 +219,7 @@ async def test_a_stray_claim_id_is_ignored_for_a_regular_order(env):
     order = await service.create_order(
         _payload(
             filial_id, vehicle_id, advisor_id, inspection.id,
-            order_type=ServiceOrderType.REGULAR, warranty_claim_id=claim.id,
+            order_type_id=await _order_type_id(session, filial_id, "regular"), warranty_claim_id=claim.id,
         )
     )
 

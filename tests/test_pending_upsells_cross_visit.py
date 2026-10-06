@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -59,17 +59,21 @@ def env():
         # open (an upsell can only be created against an editable order);
         # individual tests close it afterward to simulate "that visit
         # ended, this one resurfaces at a later visit".
+        order_type_id = make_order_type(session, filial_id)
         origin_order = ServiceOrder(
             filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id, advisor_user_id=uuid.uuid4(),
+            order_type_id=order_type_id,
         )
         # Today's new visit for the same vehicle — open.
         new_order = ServiceOrder(
             filial_id=filial_id, sequence_number=2, vehicle_id=vehicle.id, advisor_user_id=uuid.uuid4(),
+            order_type_id=order_type_id,
         )
         # A visit for a DIFFERENT vehicle — open, used to prove cross-vehicle
         # apply is rejected.
         other_vehicle_order = ServiceOrder(
             filial_id=filial_id, sequence_number=3, vehicle_id=other_vehicle.id, advisor_user_id=uuid.uuid4(),
+            order_type_id=order_type_id,
         )
         session.add_all([origin_order, new_order, other_vehicle_order])
         session.commit()

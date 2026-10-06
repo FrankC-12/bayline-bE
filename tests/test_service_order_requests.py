@@ -12,7 +12,7 @@ os.environ["DEBUG"] = "false"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, get_or_make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -53,7 +53,10 @@ def env():
 
 
 def _make_dispatched_transfer(session, part, vehicle, filial_id):
-    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+    order = ServiceOrder(
+        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+        order_type_id=get_or_make_order_type(session, filial_id),
+    )
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
@@ -152,7 +155,10 @@ async def test_completing_a_request_updates_its_status_and_stays_listed(env):
 @pytest.mark.asyncio
 async def test_pending_transfer_is_excluded(env):
     service, session, filial_id, part, vehicle = env
-    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+    order = ServiceOrder(
+        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+        order_type_id=get_or_make_order_type(session, filial_id),
+    )
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(service_order_id=order.id, sequence_number=1, status=TransferStatus.PENDIENTE)

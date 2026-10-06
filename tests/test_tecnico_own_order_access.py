@@ -97,3 +97,23 @@ async def test_a_role_with_neither_module_is_rejected_from_listing(make_user):
     db, user, filial_id = make_user("clientes-vehiculos", AccessLevel.EDITAR)
     with pytest.raises(InsufficientPermissionsError):
         await _ensure_list_access(user, filial_id, db)
+
+
+# EDITAR-level ownership — used by update_task_status and the task timer
+# start/pause endpoints, which a técnico needs to work their own assigned
+# tasks even without general asesor-servicios access.
+
+
+@pytest.mark.asyncio
+async def test_tecnico_gets_editar_on_their_own_assigned_order(make_user):
+    db, user, filial_id = make_user("tecnico-servicio", AccessLevel.EDITAR)
+    order = _order(filial_id, technician_user_id=user.user_id)
+    await _ensure_order_access(user, order, db, AccessLevel.EDITAR)
+
+
+@pytest.mark.asyncio
+async def test_tecnico_does_not_get_editar_on_someone_elses_order(make_user):
+    db, user, filial_id = make_user("tecnico-servicio", AccessLevel.EDITAR)
+    order = _order(filial_id, technician_user_id=uuid.uuid4())
+    with pytest.raises(InsufficientPermissionsError):
+        await _ensure_order_access(user, order, db, AccessLevel.EDITAR)

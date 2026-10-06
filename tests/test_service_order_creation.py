@@ -17,7 +17,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -92,7 +92,10 @@ async def test_create_order_inherits_mileage_from_inspection_and_links_it(env):
     inspection = _make_inspection(session, vehicle_id, mileage=15000)
 
     order = await service.create_order(
-        _payload(filial_id, vehicle_id, advisor_id, inspection_id=inspection.id)
+        _payload(
+            filial_id, vehicle_id, advisor_id, inspection_id=inspection.id,
+            order_type_id=make_order_type(session, filial_id),
+        )
     )
 
     assert order.intake_mileage == 15000
@@ -145,6 +148,7 @@ async def test_create_order_inherits_customer_reason_from_inspection_notes(env):
         _payload(
             filial_id, vehicle_id, advisor_id,
             inspection_id=inspection.id, customer_reason="Motivo distinto tecleado en el panel",
+            order_type_id=make_order_type(session, filial_id),
         )
     )
 
@@ -165,11 +169,14 @@ async def test_create_order_requires_a_reason_when_neither_side_has_one(env):
 
 @pytest.mark.asyncio
 async def test_scheduled_order_can_omit_inspection_and_mileage(env):
-    service, _session = env
+    service, session = env
     filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
 
     order = await service.create_order(
-        _payload(filial_id, vehicle_id, advisor_id, scheduled_at="2026-09-15T10:00:00+00:00")
+        _payload(
+            filial_id, vehicle_id, advisor_id, scheduled_at="2026-09-15T10:00:00+00:00",
+            order_type_id=make_order_type(session, filial_id),
+        )
     )
 
     assert order.intake_mileage is None

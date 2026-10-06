@@ -39,6 +39,9 @@ from app.modules.service_orders.schemas import (
     ServiceOrderCloseInput,
     ServiceOrderCreate,
     ServiceOrderRead,
+    ServiceOrderTypeCreate,
+    ServiceOrderTypeRead,
+    ServiceOrderTypeUpdate,
     ServiceOrderUpdate,
     TaskCreate,
     TaskPayerUpdate,
@@ -117,14 +120,22 @@ async def _ensure_list_access(
     raise InsufficientPermissionsError()
 
 
-async def _ensure_order_access(current_user: CurrentUser, order, db: AsyncSession) -> None:
+async def _ensure_order_access(
+    current_user: CurrentUser,
+    order,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
     """Same idea as _ensure_list_access but for a single already-fetched
-    order: a técnico without asesor-servicios access can still view it if
-    they're the técnico assigned to it."""
-    if await _has_access(current_user, order.filial_id, db, MODULE_ID):
+    order: a técnico without asesor-servicios access can still act on it —
+    at the requested level — if they're the técnico assigned to it. Used
+    with level=EDITAR for task status/timer changes, which a técnico needs
+    to work their own assigned tasks (but not e.g. delete a task or change
+    who pays for it — those stay asesor-only via the plain _ensure_access)."""
+    if await _has_access(current_user, order.filial_id, db, MODULE_ID, level):
         return
     if (
-        await _has_access(current_user, order.filial_id, db, TECNICO_MODULE_ID)
+        await _has_access(current_user, order.filial_id, db, TECNICO_MODULE_ID, level)
         and order.technician_user_id == current_user.user_id
     ):
         return
@@ -144,6 +155,56 @@ async def _ensure_cobrar_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, COBRAR_MODULE_ID, level)
+
+
+# Managing the "tipos de ODS" catalog (create/rename/deactivate) is a
+# Postventas admin action — gated by that module, separate from
+# asesor-servicios, which still just needs to LIST them (via _ensure_access
+# below) to populate the "tipo de orden" picker on a new ODS.
+ORDER_TYPES_MODULE_ID = "post-ventas"
+
+
+async def _ensure_order_types_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    level: AccessLevel = AccessLevel.VER,
+) -> None:
+    await ensure_module_access(db, current_user, filial_id, ORDER_TYPES_MODULE_ID, level)
+
+
+@router.get("/service-order-types", response_model=list[ServiceOrderTypeRead])
+async def list_order_types(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> list[ServiceOrderTypeRead]:
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_order_types(filial_id)
+
+
+@router.post(
+    "/service-order-types", response_model=ServiceOrderTypeRead, status_code=status.HTTP_201_CREATED
+)
+async def create_order_type(
+    payload: ServiceOrderTypeCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ServiceOrderTypeRead:
+    await _ensure_order_types_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_order_type(payload.filial_id, payload)
+
+
+@router.patch("/service-order-types/{order_type_id}", response_model=ServiceOrderTypeRead)
+async def update_order_type(
+    order_type_id: uuid.UUID,
+    payload: ServiceOrderTypeUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ServiceOrderTypeRead:
+    existing = await service.get_order_type(order_type_id)
+    await _ensure_order_types_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.update_order_type(order_type_id, payload)
 
 
 @router.get("/service-orders", response_model=list[ServiceOrderRead])
@@ -261,6 +322,21 @@ async def get_order_summary(
     return await service.get_order_summary(order_id)
 
 
+def _task_read(task) -> TaskRead:
+    return TaskRead(
+        id=task.id,
+        tempario_id=task.tempario_id,
+        code_snapshot=task.code_snapshot,
+        name_snapshot=task.name_snapshot,
+        hours_snapshot=float(task.hours_snapshot),
+        status=task.status,
+        payer=task.payer,
+        created_at=task.created_at,
+        timer_started_at=task.timer_started_at,
+        timer_accumulated_seconds=task.timer_accumulated_seconds,
+    )
+
+
 @router.get("/service-orders/{order_id}/tasks", response_model=list[TaskRead])
 async def list_tasks(
     order_id: uuid.UUID,
@@ -270,19 +346,7 @@ async def list_tasks(
     order = await service.get_order(order_id)
     await _ensure_order_access(current_user, order, service.db)
     tasks = await service.list_tasks(order_id)
-    return [
-        TaskRead(
-            id=t.id,
-            tempario_id=t.tempario_id,
-            code_snapshot=t.code_snapshot,
-            name_snapshot=t.name_snapshot,
-            hours_snapshot=float(t.hours_snapshot),
-            status=t.status,
-            payer=t.payer,
-            created_at=t.created_at,
-        )
-        for t in tasks
-    ]
+    return [_task_read(t) for t in tasks]
 
 
 @router.post("/service-orders/{order_id}/tasks", status_code=status.HTTP_201_CREATED)
@@ -309,19 +373,37 @@ async def update_task_status(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> TaskRead:
-    filial_id = await service.get_task_filial(task_id)
-    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    order = await service.get_task_order(task_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
     task = await service.update_task_status(task_id, payload.status)
-    return TaskRead(
-        id=task.id,
-        tempario_id=task.tempario_id,
-        code_snapshot=task.code_snapshot,
-        name_snapshot=task.name_snapshot,
-        hours_snapshot=float(task.hours_snapshot),
-        status=task.status,
-        payer=task.payer,
-        created_at=task.created_at,
-    )
+    return _task_read(task)
+
+
+@router.post("/service-order-tasks/{task_id}/timer/start", response_model=TaskRead)
+async def start_task_timer(
+    task_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> TaskRead:
+    """Manual cronómetro — independent of the task's status. A técnico can
+    start it on their own assigned order's tasks, same ownership rule as
+    update_task_status above."""
+    order = await service.get_task_order(task_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    task = await service.start_task_timer(task_id)
+    return _task_read(task)
+
+
+@router.post("/service-order-tasks/{task_id}/timer/pause", response_model=TaskRead)
+async def pause_task_timer(
+    task_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> TaskRead:
+    order = await service.get_task_order(task_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    task = await service.pause_task_timer(task_id)
+    return _task_read(task)
 
 
 @router.patch("/service-orders/{order_id}/tasks/{task_id}/payer")
@@ -638,6 +720,27 @@ async def invoice_document(
     return {"filename": f"{invoice.code}.html", "html": render_invoice(invoice.document)}
 
 
+@router.get("/service-orders/{order_id}/invoice/pdf")
+async def invoice_pdf(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from fastapi.responses import Response
+    from app.modules.service_orders.billing import BillingService
+    from app.core.documents.invoice_pdf import render_invoice_pdf, from_service_invoice
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    invoice = await BillingService(service.db).get_invoice(order_id)
+    # UUID filename avoids trusting editable document codes in response headers.
+    return Response(
+        render_invoice_pdf(from_service_invoice(invoice.document)),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="factura-{invoice.id}.pdf"'},
+    )
+
+
 # Cuentas por cobrar — top-level paths (not nested under /service-orders/{order_id})
 # since a receivable belongs to an invoice, not to a single order lookup.
 
@@ -682,6 +785,20 @@ async def close_service_order(
     return await service.close_order(
         order_id, payload.next_maintenance_due_at, payload.next_maintenance_tempario_id
     )
+
+
+@router.post("/service-orders/{order_id}/force-complete", response_model=ServiceOrderRead)
+async def force_complete_service_order(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> ServiceOrderRead:
+    """Manual override — normally the order completes on its own once every
+    task is done and every ODT dispatched (see ServiceOrderService._sync_status_from_tasks).
+    This forces it anyway with something still pending."""
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.force_complete_order(order_id, current_user)
 
 
 @router.post("/service-orders/{order_id}/cancel", response_model=ServiceOrderRead)

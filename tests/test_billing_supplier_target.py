@@ -91,7 +91,8 @@ async def test_billing_the_same_supplier_twice_reuses_the_same_linked_client(rea
     first_invoice = await issue_to_supplier(billing, order, accounts, supplier.id)
 
     other_order = ServiceOrder(
-        id=uuid.uuid4(), filial_id=order.filial_id, vehicle_id=order.vehicle_id, sequence_number=2002
+        id=uuid.uuid4(), filial_id=order.filial_id, vehicle_id=order.vehicle_id, sequence_number=2002,
+        order_type_id=order.order_type_id,
     )
     session.add(other_order)
     session.commit()

@@ -1,3 +1,5 @@
+import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -19,7 +21,12 @@ from app.modules.service_orders.enums import (
     ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
-    ServiceOrderType,
+    SYSTEM_ORDER_TYPE_CAMPANA,
+    SYSTEM_ORDER_TYPE_COMEBACK,
+    SYSTEM_ORDER_TYPE_GARANTIA_FABRICA,
+    SYSTEM_ORDER_TYPE_MPT,
+    SYSTEM_ORDER_TYPE_REGULAR,
+    SYSTEM_ORDER_TYPE_RETRABAJO,
     TaskStatus,
     TransferStatus,
     UpsellStatus,
@@ -35,7 +42,11 @@ from app.modules.service_orders.exceptions import (
     ServiceOrderNotCancelledError,
     ServiceOrderNotFoundError,
     ServiceOrderRequiredForComebackError,
+    ServiceOrderTypeInvalidError,
+    ServiceOrderTypeNotFoundError,
     TaskNotFoundError,
+    TaskTimerAlreadyRunningError,
+    TaskTimerNotRunningError,
     TransferLineNotEditableError,
     TransferNotFoundError,
     UpsellNotFoundError,
@@ -58,6 +69,7 @@ from app.modules.service_orders.models import (
     ServiceOrderTransfer,
     ServiceOrderTransferLine,
     ServiceOrderTransferLotAllocation,
+    ServiceOrderTypeCatalog,
     Upsell,
     UpsellPart,
     UpsellTask,
@@ -69,6 +81,8 @@ from app.modules.service_orders.schemas import (
     OrderSummary,
     PendingUpsellRead,
     ServiceOrderCreate,
+    ServiceOrderTypeCreate,
+    ServiceOrderTypeUpdate,
     ServiceOrderUpdate,
     TaskRead,
     TransferLineRead,
@@ -125,33 +139,174 @@ ACTIVE_STATUSES = [
 ]
 HISTORY_STATUSES = [ServiceOrderStatus.ORDEN_CERRADA, ServiceOrderStatus.CANCELADO]
 
-# order_type values that require linking an existing, authorized WarrantyClaim
-# of the matching claim_type for the same vehicle — see create_order.
-CLAIM_LINKED_ORDER_TYPES: dict[ServiceOrderType, WarrantyClaimType] = {
-    ServiceOrderType.GARANTIA_FABRICA: WarrantyClaimType.FABRICA,
-    ServiceOrderType.COMEBACK: WarrantyClaimType.COMEBACK,
-    ServiceOrderType.CAMPANA: WarrantyClaimType.CAMPANA_RECALL,
-}
+# Seeded as "tipos de ODS de sistema" into every filial — see
+# seed_default_order_types, called from both FilialService.create_filial and
+# this migration's one-time backfill for existing filiales. code/claim_type/
+# is_selectable are only ever set here, never exposed to the admin's
+# create/update schema — anything an admin creates from Postventas behaves
+# like SYSTEM_ORDER_TYPE_REGULAR (claim_type=None, is_selectable=True).
+SYSTEM_ORDER_TYPES: list[dict] = [
+    {
+        "code": SYSTEM_ORDER_TYPE_REGULAR,
+        "name": "Regular",
+        "description": "Mantenimiento o reparación estándar, sin garantía ni reclamo asociado.",
+        "claim_type": None,
+        "is_selectable": True,
+    },
+    {
+        "code": SYSTEM_ORDER_TYPE_MPT,
+        "name": "MPT",
+        "description": (
+            "Reservado para un futuro módulo de mantenimiento programado — "
+            "no disponible para selección manual todavía."
+        ),
+        "claim_type": None,
+        "is_selectable": False,
+    },
+    {
+        "code": SYSTEM_ORDER_TYPE_RETRABAJO,
+        "name": "Retrabajo",
+        "description": (
+            "Se asigna automáticamente al convertir un reclamo de garantía de "
+            "taller en una orden — nunca se elige a mano."
+        ),
+        "claim_type": None,
+        "is_selectable": False,
+    },
+    {
+        "code": SYSTEM_ORDER_TYPE_GARANTIA_FABRICA,
+        "name": "Garantía de fábrica",
+        "description": "Requiere vincular un reclamo de garantía de fábrica autorizado para el mismo vehículo.",
+        "claim_type": WarrantyClaimType.FABRICA,
+        "is_selectable": True,
+    },
+    {
+        "code": SYSTEM_ORDER_TYPE_COMEBACK,
+        "name": "Comeback",
+        "description": "Requiere vincular un reclamo de garantía de taller (comeback) autorizado para el mismo vehículo.",
+        "claim_type": WarrantyClaimType.COMEBACK,
+        "is_selectable": True,
+    },
+    {
+        "code": SYSTEM_ORDER_TYPE_CAMPANA,
+        "name": "Campaña / Recall",
+        "description": "Requiere vincular un reclamo de campaña o recall autorizado para el mismo vehículo.",
+        "claim_type": WarrantyClaimType.CAMPANA_RECALL,
+        "is_selectable": True,
+    },
+]
 
 
-def _incomplete_completion_message(
-    pending_tasks: list["ServiceOrderTask"], pending_transfers: list["ServiceOrderTransfer"]
-) -> str:
-    parts = []
-    if pending_tasks:
-        names = ", ".join(t.name_snapshot for t in pending_tasks)
-        word = "tarea" if len(pending_tasks) == 1 else "tareas"
-        parts.append(f"{len(pending_tasks)} {word} sin terminar ({names})")
-    if pending_transfers:
-        codes = ", ".join(t.code for t in pending_transfers)
-        word = "ODT" if len(pending_transfers) == 1 else "ODTs"
-        parts.append(f"{len(pending_transfers)} {word} sin despachar ({codes})")
-    return "No se puede completar la orden — pendiente: " + " y ".join(parts) + "."
+async def seed_default_order_types(db: AsyncSession, filial_id: uuid.UUID) -> None:
+    """Called once for every filial — on creation (FilialService.create_filial)
+    and, historically, by this feature's own migration for filiales that
+    already existed. Does not commit; the caller's own transaction does."""
+    for entry in SYSTEM_ORDER_TYPES:
+        db.add(
+            ServiceOrderTypeCatalog(
+                filial_id=filial_id,
+                code=entry["code"],
+                name=entry["name"],
+                description=entry["description"],
+                is_system=True,
+                claim_type=entry["claim_type"],
+                is_selectable=entry["is_selectable"],
+            )
+        )
+
+
+def _slugify_order_type_code(name: str) -> str:
+    normalized = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized.lower()).strip("_")
+    return slug or "tipo"
 
 
 class ServiceOrderService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
+
+    async def list_order_types(self, filial_id: uuid.UUID) -> list[ServiceOrderTypeCatalog]:
+        result = await self.db.execute(
+            select(ServiceOrderTypeCatalog)
+            .where(ServiceOrderTypeCatalog.filial_id == filial_id)
+            .order_by(ServiceOrderTypeCatalog.is_system.desc(), ServiceOrderTypeCatalog.name)
+        )
+        return list(result.scalars().all())
+
+    async def get_order_type(self, order_type_id: uuid.UUID) -> ServiceOrderTypeCatalog:
+        order_type = await self.db.get(ServiceOrderTypeCatalog, order_type_id)
+        if order_type is None:
+            raise ServiceOrderTypeNotFoundError(str(order_type_id))
+        return order_type
+
+    async def create_order_type(
+        self, filial_id: uuid.UUID, payload: ServiceOrderTypeCreate
+    ) -> ServiceOrderTypeCatalog:
+        base_code = _slugify_order_type_code(payload.name)
+        code = base_code
+        suffix = 2
+        existing_codes = {
+            row.code
+            for row in (
+                await self.db.execute(
+                    select(ServiceOrderTypeCatalog.code).where(
+                        ServiceOrderTypeCatalog.filial_id == filial_id
+                    )
+                )
+            ).all()
+        }
+        while code in existing_codes:
+            code = f"{base_code}_{suffix}"
+            suffix += 1
+
+        order_type = ServiceOrderTypeCatalog(
+            filial_id=filial_id,
+            code=code,
+            name=payload.name,
+            description=payload.description,
+            is_system=False,
+            claim_type=None,
+            is_selectable=True,
+        )
+        self.db.add(order_type)
+        await self.db.commit()
+        await self.db.refresh(order_type)
+        return order_type
+
+    async def update_order_type(
+        self, order_type_id: uuid.UUID, payload: ServiceOrderTypeUpdate
+    ) -> ServiceOrderTypeCatalog:
+        order_type = await self.get_order_type(order_type_id)
+        if payload.name is not None:
+            order_type.name = payload.name
+        if payload.description is not None:
+            order_type.description = payload.description
+        if payload.is_active is not None:
+            order_type.is_active = payload.is_active
+        await self.db.commit()
+        await self.db.refresh(order_type)
+        return order_type
+
+    async def _resolve_order_type(
+        self, filial_id: uuid.UUID, order_type_id: uuid.UUID | None
+    ) -> ServiceOrderTypeCatalog:
+        """None resolves to this filial's "regular" system type. Otherwise
+        the given id must belong to this filial and be active."""
+        if order_type_id is None:
+            result = await self.db.execute(
+                select(ServiceOrderTypeCatalog).where(
+                    ServiceOrderTypeCatalog.filial_id == filial_id,
+                    ServiceOrderTypeCatalog.code == SYSTEM_ORDER_TYPE_REGULAR,
+                )
+            )
+            order_type = result.scalar_one_or_none()
+            if order_type is None:
+                raise ServiceOrderTypeInvalidError()
+            return order_type
+        order_type = await self.db.get(ServiceOrderTypeCatalog, order_type_id)
+        if order_type is None or order_type.filial_id != filial_id or not order_type.is_active:
+            raise ServiceOrderTypeInvalidError()
+        return order_type
 
     async def list_orders(
         self,
@@ -229,10 +384,13 @@ class ServiceOrderService:
                 error_code="customer_reason_required",
             )
 
-        # garantia_fabrica/comeback/campana must reference an existing,
-        # authorized claim for THIS vehicle, of the matching claim_type —
-        # otherwise "Reclamo" is meaningless metadata anyone could type.
-        required_claim_type = CLAIM_LINKED_ORDER_TYPES.get(payload.order_type)
+        order_type = await self._resolve_order_type(payload.filial_id, payload.order_type_id)
+
+        # A type whose catalog row carries a claim_type (garantia_fabrica/
+        # comeback/campana, by default) must reference an existing, authorized
+        # claim for THIS vehicle, of that matching claim_type — otherwise
+        # "Reclamo" is meaningless metadata anyone could type.
+        required_claim_type = order_type.claim_type
         if required_claim_type is not None:
             if payload.warranty_claim_id is None:
                 raise WarrantyClaimRequiredForOrderTypeError()
@@ -254,7 +412,7 @@ class ServiceOrderService:
         order = ServiceOrder(
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
-            order_type=payload.order_type,
+            order_type_id=order_type.id,
             warranty_claim_id=payload.warranty_claim_id if required_claim_type is not None else None,
             discount_label=payload.discount_label,
             notes=payload.notes,
@@ -291,33 +449,17 @@ class ServiceOrderService:
             )
         order = await require_editable_order(self.db, order_id)
 
-        becoming_completado = (
-            payload.status == ServiceOrderStatus.COMPLETADO and order.status != ServiceOrderStatus.COMPLETADO
-        )
-        if becoming_completado:
-            order.completed_at = datetime.now(UTC)
-            # A cancelada task was deliberately dropped, not left unfinished —
-            # it must not block closing the order any more than a completada one does.
-            pending_tasks = [
-                t
-                for t in await self.list_tasks(order_id)
-                if t.status not in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA)
-            ]
-            # Only PENDIENTE (never dispatched) blocks closing — PEDIDO and
-            # COMPLETADO have both already left the shelf, "!= PEDIDO" would
-            # wrongly flag an already-Completado ODT as undispatched.
-            pending_transfers = [
-                t for t in await self.list_transfers(order_id) if t.status == TransferStatus.PENDIENTE
-            ]
-            if pending_tasks or pending_transfers:
-                if not payload.confirm_incomplete_completion:
-                    raise BadRequestError(
-                        _incomplete_completion_message(pending_tasks, pending_transfers),
-                        error_code="order_incomplete",
-                    )
-                order.completed_with_pending_items = True
-                order.completed_override_by_user_id = current_user.user_id if current_user else None
-                order.completed_override_at = datetime.now(UTC)
+        if payload.status is not None:
+            # pendiente/en_progreso/completado are derived from the order's
+            # tasks (and ODTs, for completado) — see _sync_status_from_tasks.
+            # The one manual override is force_complete_order, a separate action.
+            # Checked after require_editable_order so a closed/cancelled order
+            # still surfaces "read only", same as every other mutation below.
+            raise BadRequestError(
+                "El estado de la orden se calcula automáticamente según sus tareas. "
+                "Para completarla con pendientes, usa la acción de forzar completado.",
+                error_code="status_is_automatic",
+            )
 
         if payload.discount_label is not None and payload.discount_label != order.discount_label:
             order.discount_label = payload.discount_label
@@ -327,12 +469,10 @@ class ServiceOrderService:
                         Decimal(str(line.cost_total)), line.quantity, order.discount_label
                     )
 
-        if payload.status and payload.status != order.status:
-            if payload.status not in ALLOWED_TRANSITIONS.get(order.status, set()):
-                raise InvalidStatusTransitionError(order.status.value, payload.status.value)
-            order.status = payload.status
-        if payload.order_type is not None:
-            order.order_type = payload.order_type
+        if payload.order_type_id is not None:
+            order.order_type_id = (
+                await self._resolve_order_type(order.filial_id, payload.order_type_id)
+            ).id
 
         if payload.clear_technician:
             order.technician_user_id = None
@@ -374,6 +514,36 @@ class ServiceOrderService:
         if payload.notes is not None:
             order.notes = payload.notes
 
+        await self.db.commit()
+        await self.db.refresh(order)
+        return order
+
+    async def force_complete_order(
+        self, order_id: uuid.UUID, current_user: CurrentUser | None = None
+    ) -> ServiceOrder:
+        """The one manual override left for completion — normally
+        _sync_status_from_tasks completes an order on its own once every
+        task's done and every ODT dispatched. This lets an asesor complete
+        it anyway with something still pending (e.g. a part backordered
+        indefinitely), recording who did it and leaving a visible flag on
+        the order (completed_with_pending_items)."""
+        order = await require_editable_order(self.db, order_id)
+        if order.status not in (ServiceOrderStatus.PENDIENTE, ServiceOrderStatus.EN_PROGRESO):
+            raise InvalidStatusTransitionError(order.status.value, ServiceOrderStatus.COMPLETADO.value)
+        pending_tasks = [
+            t
+            for t in await self.list_tasks(order_id)
+            if t.status not in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA)
+        ]
+        pending_transfers = [
+            t for t in await self.list_transfers(order_id) if t.status == TransferStatus.PENDIENTE
+        ]
+        order.status = ServiceOrderStatus.COMPLETADO
+        order.completed_at = datetime.now(UTC)
+        order.completed_with_pending_items = bool(pending_tasks or pending_transfers)
+        if order.completed_with_pending_items:
+            order.completed_override_by_user_id = current_user.user_id if current_user else None
+            order.completed_override_at = datetime.now(UTC)
         await self.db.commit()
         await self.db.refresh(order)
         return order
@@ -519,13 +689,55 @@ class ServiceOrderService:
         )
         return list(result.scalars().all())
 
+    async def _sync_status_from_tasks(self, order: ServiceOrder) -> None:
+        """PENDIENTE/EN_PROGRESO/COMPLETADO are derived from the order's own
+        tasks, not set by hand — called after any task add/status-change/
+        delete. ORDEN_CERRADA/CANCELADO are terminal and untouched here (and
+        unreachable anyway: require_editable_order blocks task mutations on
+        them). CANCELADA tasks are excluded from the computation — a
+        deliberately dropped task shouldn't keep an order looking unfinished,
+        same reasoning as force_complete_order's pending-tasks check. Going
+        to COMPLETADO still requires every ODT to be dispatched (not left
+        PENDIENTE); if a task-complete order still has one, it stays
+        EN_PROGRESO until that's resolved. Use force_complete_order to
+        override and complete anyway."""
+        if order.status not in (
+            ServiceOrderStatus.PENDIENTE,
+            ServiceOrderStatus.EN_PROGRESO,
+            ServiceOrderStatus.COMPLETADO,
+        ):
+            return
+
+        all_tasks = await self.list_tasks(order.id)
+        relevant = [t for t in all_tasks if t.status != TaskStatus.CANCELADA]
+        if not all_tasks:
+            target = ServiceOrderStatus.PENDIENTE
+        elif not relevant or all(t.status == TaskStatus.COMPLETADA for t in relevant):
+            # No non-cancelled tasks left (everything was dropped) counts the
+            # same as everything being finished — nothing actionable remains.
+            transfers_pending = any(
+                t.status == TransferStatus.PENDIENTE for t in await self.list_transfers(order.id)
+            )
+            target = ServiceOrderStatus.EN_PROGRESO if transfers_pending else ServiceOrderStatus.COMPLETADO
+        elif all(t.status == TaskStatus.PENDIENTE for t in relevant):
+            target = ServiceOrderStatus.PENDIENTE
+        else:
+            target = ServiceOrderStatus.EN_PROGRESO
+
+        if target == order.status:
+            return
+        if target == ServiceOrderStatus.COMPLETADO:
+            order.completed_at = datetime.now(UTC)
+            order.completed_with_pending_items = False
+        order.status = target
+
     async def add_task(
         self,
         service_order_id: uuid.UUID,
         tempario_id: uuid.UUID,
         payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE,
     ) -> ServiceOrderTask:
-        await require_editable_order(self.db, service_order_id)
+        order = await require_editable_order(self.db, service_order_id)
         tempario_result = await self.db.execute(
             select(Tempario).options(selectinload(Tempario.parts)).where(Tempario.id == tempario_id)
         )
@@ -533,7 +745,23 @@ class ServiceOrderService:
         if tempario is None:
             raise TaskNotFoundError(str(tempario_id))
 
+        if tempario.filial_id != order.filial_id:
+            raise BadRequestError("El tempario debe pertenecer a la filial de la orden.")
+        warranty_snapshot = {}
+        for coverage in ("labor", "parts"):
+            policy_id = getattr(tempario, f"{coverage}_warranty_policy_id")
+            policy = await self.db.get(WarrantyPolicy, policy_id) if policy_id else None
+            if policy is not None and policy.status == WarrantyPolicyStatus.ACTIVA:
+                warranty_snapshot[coverage] = {
+                    "id": str(policy.id),
+                    "name": policy.name,
+                    "duration_days": None if policy.no_expiration else policy.duration_days,
+                    "duration_km": None if policy.no_expiration else policy.duration_km,
+                    "covered_by": policy.covered_by.value,
+                }
+
         task = ServiceOrderTask(
+            warranty_snapshot=warranty_snapshot,
             service_order_id=service_order_id,
             tempario_id=tempario.id,
             code_snapshot=tempario.code,
@@ -563,6 +791,7 @@ class ServiceOrderService:
                     if warning:
                         warnings.append(warning)
 
+        await self._sync_status_from_tasks(order)
         await self.db.commit()
         await self.db.refresh(task)
         # Not a mapped column — a transient hint for the router to surface as
@@ -578,12 +807,48 @@ class ServiceOrderService:
         order = await self.get_order(task.service_order_id)
         return order.filial_id
 
-    async def update_task_status(self, task_id: uuid.UUID, status: TaskStatus) -> ServiceOrderTask:
+    async def get_task_order(self, task_id: uuid.UUID) -> ServiceOrder:
+        """Like get_task_filial but returns the full order — needed to check
+        a técnico's own-order access, which depends on technician_user_id,
+        not just filial_id."""
+        task = await self.db.get(ServiceOrderTask, task_id)
+        if task is None:
+            raise TaskNotFoundError(str(task_id))
+        return await self.get_order(task.service_order_id)
+
+    async def start_task_timer(self, task_id: uuid.UUID) -> ServiceOrderTask:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
         await require_editable_order(self.db, task.service_order_id)
+        if task.timer_started_at is not None:
+            raise TaskTimerAlreadyRunningError()
+        task.timer_started_at = datetime.now(UTC)
+        await self.db.commit()
+        await self.db.refresh(task)
+        return task
+
+    async def pause_task_timer(self, task_id: uuid.UUID) -> ServiceOrderTask:
+        task = await self.db.get(ServiceOrderTask, task_id)
+        if task is None:
+            raise TaskNotFoundError(str(task_id))
+        await require_editable_order(self.db, task.service_order_id)
+        if task.timer_started_at is None:
+            raise TaskTimerNotRunningError()
+        elapsed = (datetime.now(UTC) - task.timer_started_at).total_seconds()
+        task.timer_accumulated_seconds += max(0, round(elapsed))
+        task.timer_started_at = None
+        await self.db.commit()
+        await self.db.refresh(task)
+        return task
+
+    async def update_task_status(self, task_id: uuid.UUID, status: TaskStatus) -> ServiceOrderTask:
+        task = await self.db.get(ServiceOrderTask, task_id)
+        if task is None:
+            raise TaskNotFoundError(str(task_id))
+        order = await require_editable_order(self.db, task.service_order_id)
         task.status = status
+        await self._sync_status_from_tasks(order)
         await self.db.commit()
         await self.db.refresh(task)
         return task
@@ -602,8 +867,9 @@ class ServiceOrderService:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
-        await require_editable_order(self.db, task.service_order_id)
+        order = await require_editable_order(self.db, task.service_order_id)
         await self.db.delete(task)
+        await self._sync_status_from_tasks(order)
         await self.db.commit()
 
     # Transfers (Órdenes de Transferencia / ODT)
@@ -808,6 +1074,9 @@ class ServiceOrderService:
             transfer.status = TransferStatus.PEDIDO
             transfer.fulfilled_by_user_id = fulfilled_by_user_id
             transfer.fulfilled_at = datetime.now(UTC)
+            # Dispatching the last PENDIENTE ODT can be what finally lets an
+            # already task-complete order reach COMPLETADO.
+            await self._sync_status_from_tasks(order)
 
         await self.db.commit()
         await self.db.refresh(transfer)
@@ -1135,6 +1404,8 @@ class ServiceOrderService:
                     status=t.status,
                     payer=t.payer,
                     created_at=t.created_at,
+                    timer_started_at=t.timer_started_at,
+                    timer_accumulated_seconds=t.timer_accumulated_seconds,
                 )
                 for t in tasks
             ],
@@ -1815,10 +2086,18 @@ class ServiceOrderService:
         if intake_mileage is None:
             intake_mileage = original_order.intake_mileage if original_order else claim.reported_mileage
         cause_label = claim.failure_cause or claim.reported_symptom or claim.claim_type.value
+        retrabajo_type = (
+            await self.db.execute(
+                select(ServiceOrderTypeCatalog).where(
+                    ServiceOrderTypeCatalog.filial_id == claim.filial_id,
+                    ServiceOrderTypeCatalog.code == SYSTEM_ORDER_TYPE_RETRABAJO,
+                )
+            )
+        ).scalar_one()
         new_order = ServiceOrder(
             filial_id=claim.filial_id,
             vehicle_id=claim.vehicle_id,
-            order_type=ServiceOrderType.RETRABAJO,
+            order_type_id=retrabajo_type.id,
             advisor_user_id=original_order.advisor_user_id if original_order else None,
             intake_mileage=intake_mileage,
             customer_reason=f"Retrabajo de garantía — {cause_label}",

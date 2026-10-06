@@ -85,6 +85,8 @@ async def test_every_order_mutation_is_rejected_by_http(order_inventory, monkeyp
         ("POST", order_url + "/tasks", {"tempario_id": str(uuid.uuid4())}),
         ("POST", order_url + "/transfers/lines", {"part_id": str(part_id), "quantity": 1}),
         ("PATCH", f"/api/v1/service-order-tasks/{task.id}", {"status": "completada"}),
+        ("POST", f"/api/v1/service-order-tasks/{task.id}/timer/start", None),
+        ("POST", f"/api/v1/service-order-tasks/{task.id}/timer/pause", None),
         ("DELETE", f"/api/v1/service-order-tasks/{task.id}", None),
         ("POST", f"/api/v1/service-order-transfers/{transfer.id}/mark-ordered", None),
         (

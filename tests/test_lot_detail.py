@@ -14,7 +14,7 @@ os.environ["DEBUG"] = "false"
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
-from test_part_sales_fifo import AsyncAdapter
+from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
@@ -106,7 +106,10 @@ async def test_counter_sale_movement_is_included(env):
 async def test_dispatched_odt_movement_is_included(env):
     service, session, filial_id, _warehouse, part, lot = env
     vehicle = _make_client_vehicle(session, filial_id)
-    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+    order = ServiceOrder(
+        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+        order_type_id=make_order_type(session, filial_id),
+    )
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
@@ -141,7 +144,10 @@ async def test_pending_odt_allocation_is_excluded(env):
     only carries a preview allocation — it must not appear as a real salida."""
     service, session, filial_id, warehouse, part, lot = env
     vehicle = _make_client_vehicle(session, filial_id)
-    order = ServiceOrder(filial_id=filial_id, sequence_number=2, vehicle_id=vehicle.id)
+    order = ServiceOrder(
+        filial_id=filial_id, sequence_number=2, vehicle_id=vehicle.id,
+        order_type_id=make_order_type(session, filial_id),
+    )
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
@@ -179,7 +185,10 @@ async def test_movements_from_both_sources_are_merged_newest_first(env):
     session.commit()
 
     vehicle = _make_client_vehicle(session, filial_id)
-    order = ServiceOrder(filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id)
+    order = ServiceOrder(
+        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+        order_type_id=make_order_type(session, filial_id),
+    )
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(

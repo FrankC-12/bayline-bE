@@ -1,8 +1,4 @@
-"""Cuentas por Cobrar must include every uncollected sale, not just ODS
-invoices — a parts counter sale never posts any income until it reaches
-COMPLETADO (PartsService.update_sale_status), so anything short of that is,
-by the system's own definition, still outstanding. This is also what makes
-CxC + ingresos reconcile exactly against Rentabilidad's net_sales."""
+"""Receivables include unpaid and partially paid parts sales regardless of delivery."""
 
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -73,13 +69,13 @@ async def test_uncollected_part_sales_appear_in_receivables_with_aging(env):
 
 
 @pytest.mark.asyncio
-async def test_completed_and_cancelled_part_sales_are_excluded(env):
+async def test_completed_unpaid_sale_remains_and_cancelled_sale_is_excluded(env):
     admin, session, filial_id = env
     make_part_sale(session, filial_id, 5001, PartSaleStatus.COMPLETADO, 150.0)
     make_part_sale(session, filial_id, 5002, PartSaleStatus.CANCELADO, 240.0)
 
     receivables = await admin.list_receivables(filial_id)
-    assert [r for r in receivables if r.document_type == "part_sale"] == []
+    assert [r.code for r in receivables if r.document_type == "part_sale"] == ["VR-5001"]
 
 
 @pytest.mark.asyncio
