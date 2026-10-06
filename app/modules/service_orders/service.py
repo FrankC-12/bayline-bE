@@ -619,7 +619,7 @@ class ServiceOrderService:
         result = await self.db.execute(
             select(ServiceOrder)
             .where(ServiceOrder.id == order_id)
-            .with_for_update()
+            .with_for_update(of=ServiceOrder)
             .execution_options(populate_existing=True)
         )
         order = result.scalar_one_or_none()
