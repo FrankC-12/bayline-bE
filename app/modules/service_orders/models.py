@@ -641,3 +641,21 @@ class WarrantyClaim(Base):
     @property
     def code(self) -> str:
         return f"RG-{self.sequence_number}"
+
+
+class ServiceOrderCollectionRequest(Base):
+    """An immutable receipt for a client's retry key, committed with its income."""
+
+    __tablename__ = "service_order_collection_requests"
+
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("service_order_invoices.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    income_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("income_entries.id", ondelete="RESTRICT"), nullable=False,
+    )
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    response: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

@@ -1,0 +1,17 @@
+# Disposable database: no application credentials, mounts, or persistent volumes.
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bayline_test
+      POSTGRES_PASSWORD: bayline_test
+      POSTGRES_DB: bayline_test
+    ports:
+      - "127.0.0.1::5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bayline_test -d bayline_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

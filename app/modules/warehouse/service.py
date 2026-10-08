@@ -773,10 +773,17 @@ class AlmacenService:
         in the 'Órdenes de Transferencia' screen."""
         from app.modules.clients.models import Vehicle
         from app.modules.service_orders.enums import TransferStatus as ServiceOrderTransferStatus
-        from app.modules.service_orders.models import ServiceOrder, ServiceOrderTransfer
+        from app.modules.service_orders.models import (
+            ServiceOrder, ServiceOrderTransfer, ServiceOrderTransferLine,
+        )
 
         rows = await self.db.execute(
             select(ServiceOrderTransfer, ServiceOrder, Vehicle)
+            .options(
+                selectinload(ServiceOrderTransfer.lines).selectinload(
+                    ServiceOrderTransferLine.allocations
+                )
+            )
             .join(ServiceOrder, ServiceOrder.id == ServiceOrderTransfer.service_order_id)
             .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
             .where(

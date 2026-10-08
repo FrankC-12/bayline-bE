@@ -55,3 +55,26 @@ async def test_oversized_image_is_rejected(tmp_path: Path):
             max_mb=1,
         )
     assert not (tmp_path / "part-returns").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_reads_only_limit_plus_one_byte_and_never_writes_oversize(tmp_path):
+    class HugeUpload:
+        content_type = "image/jpeg"
+        async def read(self, size=-1):
+            assert size == 1024 * 1024 + 1
+            return b"x" * size
+    with pytest.raises(BadRequestError) as exc:
+        await save_upload_image(HugeUpload(), directory=tmp_path, subdir="evidence", url_prefix="/uploads", max_mb=1)
+    assert exc.value.error_code == "file_too_large"
+    assert not (tmp_path / "evidence").exists()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_upload_is_rejected_without_reading(tmp_path):
+    class InvalidUpload:
+        content_type = "text/html"
+        async def read(self, size=-1):
+            raise AssertionError("Unsupported uploads must not be read")
+    with pytest.raises(BadRequestError):
+        await save_upload_image(InvalidUpload(), directory=tmp_path, subdir="evidence", url_prefix="/uploads", max_mb=1)

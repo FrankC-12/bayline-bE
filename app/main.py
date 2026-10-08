@@ -12,6 +12,7 @@ from scalar_fastapi import get_scalar_api_reference
 from app.core.config import get_settings
 from app.core.database import AsyncSessionLocal
 from app.core.http_security import HttpSecurityMiddleware
+from app.core.request_tracking import RequestTrackingMiddleware
 from app.core.exception_handlers import register_exception_handlers
 from app.modules.auth.router import router as auth_router
 from app.modules.holdings.router import router as holdings_router
@@ -76,9 +77,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
 app.add_middleware(HttpSecurityMiddleware)
+app.add_middleware(RequestTrackingMiddleware)
 
 register_exception_handlers(app)
 

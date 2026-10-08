@@ -259,3 +259,26 @@ async def test_can_cancel_before_full_reception(env):
     cancelled = await service.cancel_vehicle_purchase_order(order.id)
 
     assert cancelled.status == VehiclePurchaseOrderStatus.CANCELADA
+
+
+@pytest.mark.asyncio
+async def test_cancelled_order_cannot_receive_vehicles(env):
+    service, session, filial_id, supplier_id = env
+    order = await service.create_vehicle_purchase_order(_order_payload(filial_id, supplier_id), None)
+    await service.cancel_vehicle_purchase_order(order.id)
+    with pytest.raises(InvalidVehiclePurchaseOrderStatusTransitionError):
+        await service.add_reception(order.id, ReceptionCreate(units=[
+            ReceptionUnitInput(purchase_order_line_id=order.lines[0].id, vin="1HGCM82633A009999")
+        ]), None)
+    assert session.scalar(select(DealershipVehicle).where(DealershipVehicle.vin == "1HGCM82633A009999")) is None
+
+
+@pytest.mark.asyncio
+async def test_purchase_cannot_reference_supplier_in_another_filial(env):
+    from app.core.exceptions import BadRequestError
+    service, session, filial_id, _ = env
+    other_supplier = Supplier(filial_id=uuid.uuid4(), business_name="Proveedor de otra filial", rif="J-22222222-2", supplier_type=SupplierType.IMPORTADOR)
+    session.add(other_supplier)
+    session.commit()
+    with pytest.raises(BadRequestError, match="filial"):
+        await service.create_vehicle_purchase_order(_order_payload(filial_id, other_supplier.id), None)

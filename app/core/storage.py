@@ -67,7 +67,9 @@ def _validate_image(data: bytes, content_type: str | None, max_mb: int) -> str:
 async def _save_upload(
     file: UploadFile, *, directory: Path, subdir: str, url_prefix: str, max_mb: int, allowed: set[str]
 ) -> str:
-    data = await file.read()
+    # Reject the declared type before reading and bound memory even for huge uploads.
+    _validate(b"", file.content_type, max_mb, allowed)
+    data = await file.read(max_mb * 1024 * 1024 + 1)
     extension = _validate(data, file.content_type, max_mb, allowed)
     filename = f"{uuid.uuid4()}{extension}"
 
@@ -76,7 +78,7 @@ async def _save_upload(
 
     target_dir = directory / subdir
     target_dir.mkdir(parents=True, exist_ok=True)
-    (target_dir / filename).write_bytes(data)
+    await asyncio.to_thread((target_dir / filename).write_bytes, data)
 
     return f"{url_prefix}/{subdir}/{filename}"
 

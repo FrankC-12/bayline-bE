@@ -37,6 +37,7 @@ from app.modules.service_orders.guards import require_editable_order
 from app.modules.service_orders.models import (
     ServiceOrder,
     ServiceOrderInvoice,
+    ServiceOrderCollectionRequest,
     ServiceOrderTask,
     ServiceOrderTransferLine,
 )
@@ -555,33 +556,82 @@ class BillingService:
         return [self._receivable_to_read(invoice, order, client) for invoice, order, client in result.all()]
 
     async def collect_invoice(
-        self, invoice_id: uuid.UUID, payload: CollectInvoicePaymentInput, collected_by_user_id: uuid.UUID | None
+        self,
+        invoice_id: uuid.UUID,
+        payload: CollectInvoicePaymentInput,
+        collected_by_user_id: uuid.UUID | None,
     ) -> ReceivableRead:
-        invoice = (await self.db.execute(
-            select(ServiceOrderInvoice).where(ServiceOrderInvoice.id == invoice_id)
-            .with_for_update().execution_options(populate_existing=True)
-        )).scalar_one_or_none()
+        try:
+            return await self._collect_invoice(invoice_id, payload, collected_by_user_id)
+        except IntegrityError as exc:
+            await self.db.rollback()
+            raise ConflictError(
+                "El identificador de cobro ya fue utilizado.", error_code="collection_request_conflict"
+            ) from exc
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    async def _collect_invoice(
+        self,
+        invoice_id: uuid.UUID,
+        payload: CollectInvoicePaymentInput,
+        collected_by_user_id: uuid.UUID | None,
+    ) -> ReceivableRead:
+        invoice = (
+            await self.db.execute(
+                select(ServiceOrderInvoice)
+                .where(ServiceOrderInvoice.id == invoice_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         if invoice is None:
             raise InvoiceNotFoundError(str(invoice_id))
+        request_hash = digest(payload.model_dump(mode="json"))
+        if payload.request_id is not None:
+            existing = await self.db.get(ServiceOrderCollectionRequest, payload.request_id)
+            if existing is not None:
+                if existing.invoice_id != invoice_id or existing.request_hash != request_hash:
+                    raise ConflictError(
+                        "Este identificador de cobro corresponde a otros datos.",
+                        error_code="collection_request_conflict",
+                    )
+                return ReceivableRead.model_validate(existing.response)
         if invoice.collected_at is not None:
             raise InvoiceAlreadyCollectedError()
 
         account = await self.db.get(Account, payload.account_id)
         order = await self.db.get(ServiceOrder, invoice.service_order_id)
-        if (account is None or not account.is_active or account.filial_id != order.filial_id
-                or account.currency not in (AccountCurrency.USD, AccountCurrency.BS)):
+        if (
+            account is None
+            or not account.is_active
+            or account.filial_id != order.filial_id
+            or account.currency not in (AccountCurrency.USD, AccountCurrency.BS)
+        ):
             raise BadRequestError("Selecciona una cuenta activa en USD o Bs. de la filial.")
-        rate_row = (await self.db.execute(select(ExchangeRate).where(
-            ExchangeRate.currency == "USD", ExchangeRate.value_date == billing_day()
-        ))).scalar_one_or_none()
+        rate_row = (
+            await self.db.execute(
+                select(ExchangeRate).where(
+                    ExchangeRate.currency == "USD", ExchangeRate.value_date == billing_day()
+                )
+            )
+        ).scalar_one_or_none()
         rate = Decimal(str(rate_row.rate_ves)) if rate_row else None
         if account.currency == AccountCurrency.BS and (rate is None or rate <= 0):
-            raise BadRequestError("No hay tasa BCV del día para cobrar en Bs.", error_code="bcv_rate_required")
-        amount_usd = money(payload.net_collected_amount if account.currency == AccountCurrency.USD
-                           else payload.net_collected_amount / rate)
+            raise BadRequestError(
+                "No hay tasa BCV del día para cobrar en Bs.", error_code="bcv_rate_required"
+            )
+        amount_usd = money(
+            payload.net_collected_amount
+            if account.currency == AccountCurrency.USD
+            else payload.net_collected_amount / rate
+        )
         settled = amount_usd + payload.withholding_amount
         if settled <= 0 or settled > money(self._pending_amount(invoice)):
-            raise BadRequestError("El cobro y las retenciones deben ser mayores a cero y no superar el saldo pendiente.")
+            raise BadRequestError(
+                "El cobro y las retenciones deben ser mayores a cero y no superar el saldo pendiente."
+            )
         income = IncomeEntry(
             filial_id=order.filial_id,
             entry_date=billing_day(),
@@ -592,7 +642,15 @@ class BillingService:
             currency=account.currency,
             exchange_rate=float(rate) if rate else None,
             amount_usd=float(amount_usd),
-            amount_bs=float(money(payload.net_collected_amount * rate)) if account.currency == AccountCurrency.USD and rate else float(payload.net_collected_amount) if account.currency == AccountCurrency.BS else None,
+            amount_bs=(
+                float(money(payload.net_collected_amount * rate))
+                if account.currency == AccountCurrency.USD and rate
+                else (
+                    float(payload.net_collected_amount)
+                    if account.currency == AccountCurrency.BS
+                    else None
+                )
+            ),
             account_id=account.id,
             registered_by_user_id=collected_by_user_id,
             source_type=MovementSourceType.SERVICE_ORDER,
@@ -608,11 +666,20 @@ class BillingService:
         invoice.collected_by_user_id = collected_by_user_id
         invoice.collected_at = datetime.now(UTC) if self._pending_amount(invoice) <= 0 else None
 
-        await self.db.commit()
-        await self.db.refresh(invoice)
-
         client = await self.db.get(Client, invoice.billed_client_id)
-        return self._receivable_to_read(invoice, order, client)
+        response = self._receivable_to_read(invoice, order, client)
+        if payload.request_id is not None:
+            self.db.add(
+                ServiceOrderCollectionRequest(
+                    request_id=payload.request_id,
+                    invoice_id=invoice.id,
+                    income_id=income.id,
+                    request_hash=request_hash,
+                    response=response.model_dump(mode="json"),
+                )
+            )
+        await self.db.commit()
+        return response
 
     async def get_holding_warranty_receivables(self, holding_id: uuid.UUID) -> HoldingWarrantyReceivablesReport:
         filiales = (

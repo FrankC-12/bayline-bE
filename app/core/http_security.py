@@ -1,7 +1,7 @@
 """Protect cookie-authenticated mutations, including login, refresh and
 logout.
 
-A request authenticating with an Authorization: Bearer header instead
+A request without an access cookie, authenticating with an Authorization: Bearer header instead
 (mobile/native clients) is exempt from the Origin check below — classic CSRF
 relies on the browser silently attaching the victim's cookies to a forged
 cross-origin request; it has no way to also forge an Authorization header it
@@ -22,6 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from app.core.config import get_settings
+from app.modules.auth.cookies import ACCESS_COOKIE
 
 
 class HttpSecurityMiddleware(BaseHTTPMiddleware):
@@ -38,7 +39,10 @@ class HttpSecurityMiddleware(BaseHTTPMiddleware):
                     status_code=400,
                 )
             if request.method not in {"GET", "HEAD", "OPTIONS"}:
-                has_bearer_token = request.headers.get("authorization", "").lower().startswith("bearer ")
+                has_bearer_token = (
+                    request.headers.get("authorization", "").lower().startswith("bearer ")
+                    and not request.cookies.get(ACCESS_COOKIE)
+                )
                 is_token_endpoint = request.url.path in {
                     f"{settings.api_v1_prefix}/auth/login",
                     f"{settings.api_v1_prefix}/auth/refresh",

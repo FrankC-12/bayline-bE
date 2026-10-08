@@ -5,6 +5,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.exceptions import BadRequestError
+from app.modules.administracion.models import Supplier
+
 from app.modules.compras.enums import VehiclePurchaseOrderStatus
 from app.modules.compras.exceptions import (
     DuplicateVehicleVinError,
@@ -59,8 +62,8 @@ class ComprasService:
         current_max = result.scalar()
         return (current_max or 3000) + 1
 
-    async def _get_order_model(self, order_id: uuid.UUID) -> VehiclePurchaseOrder:
-        result = await self.db.execute(
+    async def _get_order_model(self, order_id: uuid.UUID, *, for_update: bool = False) -> VehiclePurchaseOrder:
+        query = (
             select(VehiclePurchaseOrder)
             .options(
                 selectinload(VehiclePurchaseOrder.lines),
@@ -74,6 +77,9 @@ class ComprasService:
             # collection once one is added later in the same call.
             .execution_options(populate_existing=True)
         )
+        if for_update:
+            query = query.with_for_update(of=VehiclePurchaseOrder)
+        result = await self.db.execute(query)
         order = result.scalar_one_or_none()
         if order is None:
             raise VehiclePurchaseOrderNotFoundError(str(order_id))
@@ -180,6 +186,10 @@ class ComprasService:
     async def create_vehicle_purchase_order(
         self, payload: VehiclePurchaseOrderCreate, created_by_user_id: uuid.UUID | None
     ) -> VehiclePurchaseOrderRead:
+        supplier = await self.db.get(Supplier, payload.supplier_id)
+        if supplier is None or supplier.filial_id != payload.filial_id:
+            raise BadRequestError("El proveedor debe pertenecer a la filial de la orden.",
+                                  error_code="purchase_supplier_filial_mismatch")
         sequence_number = await self._next_sequence(payload.filial_id)
         order = VehiclePurchaseOrder(
             filial_id=payload.filial_id,
@@ -222,7 +232,9 @@ class ComprasService:
     async def add_reception(
         self, order_id: uuid.UUID, payload: ReceptionCreate, received_by_user_id: uuid.UUID | None
     ) -> VehiclePurchaseOrderDetailRead:
-        order = await self._get_order_model(order_id)
+        order = await self._get_order_model(order_id, for_update=True)
+        if order.status not in CANCELABLE_STATUSES:
+            raise InvalidVehiclePurchaseOrderStatusTransitionError(order.status.value, "recibir unidades")
         lines_by_id = {line.id: line for line in order.lines}
         units_by_line = await self._units_by_line(list(lines_by_id.keys()))
 
@@ -290,7 +302,7 @@ class ComprasService:
     async def add_invoice(
         self, order_id: uuid.UUID, payload: VehiclePurchaseOrderInvoiceCreate, recorded_by_user_id: uuid.UUID | None
     ) -> VehiclePurchaseOrderDetailRead:
-        order = await self._get_order_model(order_id)
+        order = await self._get_order_model(order_id, for_update=True)
         line_ids = [line.id for line in order.lines]
         units_by_line = await self._units_by_line(line_ids)
         all_units = [unit for units in units_by_line.values() for unit in units]
@@ -338,7 +350,7 @@ class ComprasService:
         return await self._to_detail_read(await self._get_order_model(order.id))
 
     async def cancel_vehicle_purchase_order(self, order_id: uuid.UUID) -> VehiclePurchaseOrderRead:
-        order = await self._get_order_model(order_id)
+        order = await self._get_order_model(order_id, for_update=True)
         if order.status not in CANCELABLE_STATUSES:
             raise InvalidVehiclePurchaseOrderStatusTransitionError(
                 order.status.value, VehiclePurchaseOrderStatus.CANCELADA.value

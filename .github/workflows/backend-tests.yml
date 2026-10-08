@@ -1,0 +1,43 @@
+name: Backend tests
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: bayline_test
+          POSTGRES_PASSWORD: bayline_test
+          POSTGRES_DB: bayline_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bayline_test -d bayline_test"
+          --health-interval 1s --health-timeout 3s --health-retries 30
+    env:
+      APP_ENV: test
+      DEBUG: "false"
+      DATABASE_URL: postgresql+asyncpg://bayline_test:bayline_test@127.0.0.1:5432/bayline_test
+      TEST_DATABASE_URL: postgresql+asyncpg://bayline_test:bayline_test@127.0.0.1:5432/bayline_test
+      SECRET_KEY: isolated-ci-key-not-for-application-use
+      PLATFORM_ADMIN_EMAIL: tests@example.com
+      PLATFORM_ADMIN_PASSWORD: tests-only
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Build database from real migrations
+        run: python -m alembic upgrade head
+      - name: Verify latest migration rollback and reapply
+        run: |
+          python -m alembic downgrade -1
+          python -m alembic upgrade head
+      - name: Unit and PostgreSQL integration tests
+        run: python -m pytest -q

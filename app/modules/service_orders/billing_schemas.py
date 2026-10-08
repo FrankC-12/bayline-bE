@@ -92,6 +92,7 @@ class ReceivableRead(BaseModel):
 
 
 class CollectInvoicePaymentInput(BaseModel):
+    request_id: uuid.UUID | None = None
     account_id: uuid.UUID
     withholding_amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
     net_collected_amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)

@@ -14,7 +14,8 @@ def get_current_user(request: Request) -> CurrentUser:
     """Validate the access cookie (web) or an `Authorization: Bearer` token
     (mobile/native clients, which have no browser cookie jar to rely on) —
     whichever the request actually sent. See also HttpSecurityMiddleware,
-    which skips its Origin/CSRF check for Bearer-authenticated requests."""
+    which exempts Bearer-only requests from the Origin check while still
+    requiring the CSRF protection header."""
     token = request.cookies.get(ACCESS_COOKIE)
     if not token:
         auth_header = request.headers.get("authorization", "")

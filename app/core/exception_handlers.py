@@ -1,3 +1,5 @@
+import logging
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -6,6 +8,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.core.exceptions import DomainError
+
+logger = logging.getLogger(__name__)
 
 # Pydantic v2's built-in messages (Field(min_length=...), type coercion,
 # missing fields, etc.) come out in English — this app has no other English
@@ -74,6 +78,7 @@ def _build_error_response(
     message: str,
     path: str,
     details: list | None = None,
+    request_id: str | None = None,
 ) -> JSONResponse:
     content = {
         "statusCode": status_code,
@@ -84,7 +89,10 @@ def _build_error_response(
     }
     if details:
         content["details"] = details
-    return JSONResponse(status_code=status_code, content=content)
+    if request_id:
+        content["requestId"] = request_id
+    return JSONResponse(status_code=status_code, content=content,
+                        headers={"X-Request-ID": request_id} if request_id else None)
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -93,7 +101,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(DomainError)
     async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
         return _build_error_response(
-            exc.status_code, exc.error_code, exc.message, request.url.path, details=exc.details
+            exc.status_code, exc.error_code, exc.message, request.url.path, details=exc.details,
+            request_id=getattr(request.state, "request_id", None)
         )
 
     @app.exception_handler(RequestValidationError)
@@ -115,13 +124,24 @@ def register_exception_handlers(app: FastAPI) -> None:
             message,
             request.url.path,
             details=field_errors,
+            request_id=getattr(request.state, "request_id", None),
         )
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        request_id = getattr(request.state, "request_id", None)
+        # Exception messages from SQL drivers can contain bound customer data.
+        # Keep the stack locations and exception type, without locals or message.
+        frames = "\n".join(
+            f"{frame.filename}:{frame.lineno} in {frame.name}"
+            for frame in traceback.extract_tb(exc.__traceback__)
+        )
+        logger.error("unexpected_error request_id=%s exception_type=%s stack=%s",
+                     request_id, type(exc).__name__, frames)
         return _build_error_response(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "internal_error",
             "Ocurrió un error inesperado. Intenta de nuevo.",
             request.url.path,
+            request_id=request_id,
         )

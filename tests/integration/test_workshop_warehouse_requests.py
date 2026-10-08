@@ -1,0 +1,88 @@
+"""The workshop-to-warehouse feed must work with fresh asynchronous sessions."""
+
+import uuid
+
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from app.core.exception_handlers import register_exception_handlers
+from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.schemas import CurrentUser
+from app.modules.filiales.models import Filial
+from app.modules.parts.models import Part, PartCategory
+from app.modules.service_orders.service import ServiceOrderService
+from app.modules.warehouse import router as routes
+from app.modules.warehouse.models import PartLot, Warehouse
+from app.modules.warehouse.service import AlmacenService
+
+
+@pytest.mark.asyncio
+async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(billing_db):
+    ctx = billing_db
+    async with ctx.sessions() as db:
+        filial = await db.get(Filial, ctx.filial_id)
+        category = PartCategory(holding_id=filial.holding_id, name="Lubricantes")
+        warehouse = Warehouse(filial_id=ctx.filial_id, name="Principal")
+        db.add_all([category, warehouse])
+        await db.flush()
+        part = Part(
+            filial_id=ctx.filial_id,
+            category_id=category.id,
+            code="QA-002",
+            name="Aceite 15W40",
+            price=13,
+        )
+        db.add(part)
+        await db.flush()
+        db.add(
+            PartLot(
+                filial_id=ctx.filial_id,
+                warehouse_id=warehouse.id,
+                part_id=part.id,
+                quantity_received=5,
+                quantity_remaining=5,
+                unit_cost=10,
+            )
+        )
+        await db.commit()
+        workshop = ServiceOrderService(db)
+        await workshop.add_transfer_line(ctx.order_id, part.id, 2)
+        transfer = (await workshop.list_transfers(ctx.order_id))[0]
+        # Drafts should not arrive at Almacén before the workshop submits the request.
+        async with ctx.sessions() as reader:
+            assert await AlmacenService(reader).list_service_order_requests(ctx.filial_id) == []
+        await workshop.mark_transfer_ordered(transfer.id)
+        transfer_id = transfer.id
+
+    # A new HTTP request/session prevents SQLite identity-map caching from hiding lazy loads.
+    async with ctx.sessions() as db:
+        service = AlmacenService(db)
+        app = FastAPI()
+        register_exception_handlers(app)
+        app.include_router(routes.router, prefix="/api/v1")
+        user = CurrentUser(
+            user_id=uuid.uuid4(),
+            email="warehouse@example.com",
+            role_id=uuid.uuid4(),
+            role_slug="filial-admin",
+            scope="filial",
+            filial_id=ctx.filial_id,
+            holding_id=None,
+        )
+        app.dependency_overrides[get_current_user] = lambda: user
+        app.dependency_overrides[routes.get_service] = lambda: service
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+            path = f"/api/v1/almacen/service-order-requests?filial_id={ctx.filial_id}"
+            response = await http.get(path)
+            assert response.status_code == 200
+            row = response.json()[0]
+            assert row["id"] == str(transfer_id)
+            assert row["status"] == "pedido"
+            assert row["warehouse_seen"] is False
+            assert row["lines"][0]["part_name"] == "Aceite 15W40"
+            assert row["lines"][0]["warehouses"][0]["warehouse_name"] == "Principal"
+            assert row["lines"][0]["warehouses"][0]["quantity"] == 2
+            assert (
+                await http.get(f"/api/v1/almacen/service-order-requests?filial_id={uuid.uuid4()}")
+            ).status_code == 403
