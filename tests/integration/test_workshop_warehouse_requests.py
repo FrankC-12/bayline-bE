@@ -11,7 +11,11 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part, PartCategory
+from app.modules.roles.enums import AccessLevel, RoleScope
+from app.modules.roles.models import Role, RoleModulePermission
+from app.modules.service_orders import router as order_routes
 from app.modules.service_orders.service import ServiceOrderService
+from app.modules.users.models import User
 from app.modules.warehouse import router as routes
 from app.modules.warehouse.models import PartLot, Warehouse
 from app.modules.warehouse.service import AlmacenService
@@ -61,17 +65,35 @@ async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(bi
         app = FastAPI()
         register_exception_handlers(app)
         app.include_router(routes.router, prefix="/api/v1")
+        app.include_router(order_routes.router, prefix="/api/v1")
+        role = Role(
+            name="Almacenista QA", slug=f"almacenista-qa-{uuid.uuid4()}", scope=RoleScope.FILIAL
+        )
+        db.add(role)
+        await db.flush()
+        db.add(
+            RoleModulePermission(role_id=role.id, module_id="almacen", access=AccessLevel.EDITAR)
+        )
+        operator = User(
+            full_name="Almacenista QA",
+            email=f"{uuid.uuid4()}@example.com",
+            role_id=role.id,
+            filial_id=ctx.filial_id,
+        )
+        db.add(operator)
+        await db.commit()
         user = CurrentUser(
-            user_id=uuid.uuid4(),
-            email="warehouse@example.com",
-            role_id=uuid.uuid4(),
-            role_slug="filial-admin",
+            user_id=operator.id,
+            email=operator.email,
+            role_id=role.id,
+            role_slug=role.slug,
             scope="filial",
             filial_id=ctx.filial_id,
             holding_id=None,
         )
         app.dependency_overrides[get_current_user] = lambda: user
         app.dependency_overrides[routes.get_service] = lambda: service
+        app.dependency_overrides[order_routes.get_service] = lambda: ServiceOrderService(db)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
             path = f"/api/v1/almacen/service-order-requests?filial_id={ctx.filial_id}"
             response = await http.get(path)
@@ -83,6 +105,21 @@ async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(bi
             assert row["lines"][0]["part_name"] == "Aceite 15W40"
             assert row["lines"][0]["warehouses"][0]["warehouse_name"] == "Principal"
             assert row["lines"][0]["warehouses"][0]["quantity"] == 2
+            # The warehouse feed must provide enough detail without granting
+            # access to the advisor's ODS screen.
+            assert (await http.get(f"/api/v1/service-orders/{ctx.order_id}")).status_code == 403
+            assert (
+                await http.post(
+                    f"/api/v1/almacen/service-order-requests/{transfer_id}/acknowledge?filial_id={ctx.filial_id}"
+                )
+            ).status_code == 204
+            assert (
+                await http.post(
+                    f"/api/v1/almacen/service-order-requests/{transfer_id}/complete?filial_id={ctx.filial_id}"
+                )
+            ).status_code == 204
+            response = await http.get(path)
+            assert response.json()[0]["status"] == "completado"
             assert (
                 await http.get(f"/api/v1/almacen/service-order-requests?filial_id={uuid.uuid4()}")
             ).status_code == 403

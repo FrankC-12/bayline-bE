@@ -31,7 +31,14 @@ class RoleService:
         return list(result.scalars().all())
 
     async def get_role(self, role_id: uuid.UUID) -> Role:
-        query = select(Role).options(selectinload(Role.permissions)).where(Role.id == role_id)
+        query = (
+            select(Role)
+            .options(selectinload(Role.permissions))
+            .where(Role.id == role_id)
+            # Permission rows may have been replaced in this same session.
+            # Reload the collection so the save response reflects the commit.
+            .execution_options(populate_existing=True)
+        )
         result = await self.db.execute(query)
         role = result.scalar_one_or_none()
         if role is None:

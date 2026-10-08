@@ -54,6 +54,9 @@ class UserService:
             select(User)
             .options(selectinload(User.permission_overrides))
             .where(User.id == user_id)
+            # Replacing override rows does not refresh an already-loaded
+            # relationship in the identity map. Return the committed values.
+            .execution_options(populate_existing=True)
         )
         result = await self.db.execute(query)
         user = result.scalar_one_or_none()
