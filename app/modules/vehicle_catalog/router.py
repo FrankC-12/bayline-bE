@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.filiales.exceptions import FilialNotFoundError
 from app.modules.filiales.models import Filial
@@ -45,6 +46,26 @@ async def _holding_id_for_filial(db: AsyncSession, filial_id: uuid.UUID) -> uuid
     return filial.holding_id
 
 
+async def _ensure_catalog_read_access(
+    current_user: CurrentUser,
+    filial_id: uuid.UUID,
+    db: AsyncSession,
+    include_inactive: bool,
+) -> None:
+    if include_inactive:
+        await _ensure_access(current_user, filial_id, db)
+        return
+    # Operational selectors consume the active catalog without granting access
+    # to its management screen. Each check retains filial and user overrides.
+    for module_id in (MODULE_ID, "clientes-vehiculos", "repuestos", "concesionario", "post-ventas"):
+        try:
+            await ensure_module_access(db, current_user, filial_id, module_id, AccessLevel.VER)
+            return
+        except InsufficientPermissionsError:
+            continue
+    raise InsufficientPermissionsError()
+
+
 @router.get("/brands", response_model=list[VehicleBrandRead])
 async def list_brands(
     filial_id: uuid.UUID = Query(...),
@@ -56,7 +77,7 @@ async def list_brands(
     """The holding-wide brand/model catalog — shared by every filial. Used both
     by the Ajustes management screen (include_inactive=true) and by every
     brand/model select elsewhere in the app (active only, the default)."""
-    await _ensure_access(current_user, filial_id, db)
+    await _ensure_catalog_read_access(current_user, filial_id, db, include_inactive)
     holding_id = await _holding_id_for_filial(db, filial_id)
     return await service.list_brands(holding_id, include_inactive)
 

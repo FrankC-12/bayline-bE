@@ -43,7 +43,7 @@ ROLES_SEED = [
         "scope": RoleScope.FILIAL,
         "permissions": [
             {"module_id": "asesor-servicios", "access": AccessLevel.EDITAR},
-            {"module_id": "clientes-vehiculos", "access": AccessLevel.VER},
+            {"module_id": "clientes-vehiculos", "access": AccessLevel.EDITAR},
             {"module_id": "kpis", "access": AccessLevel.VER},
         ],
     },

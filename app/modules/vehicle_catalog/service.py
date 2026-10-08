@@ -55,13 +55,17 @@ class VehicleCatalogService:
     async def list_brands(self, holding_id: uuid.UUID, include_inactive: bool = False) -> list[VehicleBrand]:
         query = (
             select(VehicleBrand)
-            .options(selectinload(VehicleBrand.models))
             .where(VehicleBrand.holding_id == holding_id)
             .order_by(VehicleBrand.name)
             .execution_options(populate_existing=True)
         )
         if not include_inactive:
             query = query.where(VehicleBrand.is_active.is_(True))
+            query = query.options(
+                selectinload(VehicleBrand.models.and_(VehicleModel.is_active.is_(True)))
+            )
+        else:
+            query = query.options(selectinload(VehicleBrand.models))
         result = await self.db.execute(query)
         return list(result.scalars().all())
 
