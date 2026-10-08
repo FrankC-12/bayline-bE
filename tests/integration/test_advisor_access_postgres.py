@@ -16,6 +16,7 @@ from app.core.exception_handlers import register_exception_handlers
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.clients import router as clients
+from app.modules.post_ventas import router as postventas
 from app.modules.roles.enums import AccessLevel, RoleScope
 from app.modules.roles.models import Role, RoleModulePermission
 from app.modules.service_orders import router as orders
@@ -72,6 +73,7 @@ async def test_legacy_advisor_can_register_clients_and_read_orders(billing_db):
         register_exception_handlers(app)
         app.include_router(clients.router, prefix="/api/v1")
         app.include_router(orders.router, prefix="/api/v1")
+        app.include_router(postventas.router, prefix="/api/v1")
         app.dependency_overrides[get_current_user] = lambda: current
         app.dependency_overrides[get_db] = lambda: db
         payload = dict(
@@ -101,6 +103,39 @@ async def test_legacy_advisor_can_register_clients_and_read_orders(billing_db):
             response = await http.get(f"/api/v1/service-orders/{ctx.order_id}")
             assert response.status_code == 200, response.text
             assert response.json()["order_type"]["name"]
+            response = await http.get(f"/api/v1/temparios?filial_id={ctx.filial_id}")
+            assert response.status_code == 200, response.text
+            tempario_id = response.json()[0]["id"]
+            response = await http.get(f"/api/v1/temparios/{tempario_id}")
+            assert response.status_code == 200, response.text
+            response = await http.post(
+                f"/api/v1/service-orders/{ctx.order_id}/tasks",
+                json={"tempario_id": tempario_id},
+            )
+            assert response.status_code == 201, response.text
+            assert (await http.get(f"/api/v1/service-orders/{ctx.order_id}/tasks")).json()[-1][
+                "tempario_id"
+            ] == tempario_id
+            assert (
+                await http.patch(
+                    f"/api/v1/temparios/{tempario_id}", json={"name": "Cambio no autorizado"}
+                )
+            ).status_code == 403
+            assert (
+                await http.get(f"/api/v1/temparios?filial_id={uuid.uuid4()}")
+            ).status_code == 403
+            db.add(
+                UserModulePermission(
+                    user_id=current.user_id, module_id="asesor-servicios", access=AccessLevel.VER
+                )
+            )
+            await db.commit()
+            assert (
+                await http.post(
+                    f"/api/v1/service-orders/{ctx.order_id}/tasks",
+                    json={"tempario_id": tempario_id},
+                )
+            ).status_code == 403
             assert (
                 await http.get(f"/api/v1/service-orders?filial_id={uuid.uuid4()}")
             ).status_code == 403

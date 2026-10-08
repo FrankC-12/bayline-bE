@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.post_ventas.schemas import (
     MaintenancePlanCreate,
@@ -44,6 +45,19 @@ async def _ensure_access(
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
 
 
+async def _ensure_tempario_read_access(
+    current_user: CurrentUser, filial_id: uuid.UUID, db: AsyncSession
+) -> None:
+    # Advisors select existing temparios for ODS; catalog management remains
+    # restricted to Postventas. Both paths enforce filial and user overrides.
+    try:
+        await _ensure_access(current_user, filial_id, db)
+    except InsufficientPermissionsError:
+        await ensure_module_access(
+            db, current_user, filial_id, "asesor-servicios", AccessLevel.VER
+        )
+
+
 @router.get("/temparios", response_model=list[TemparioRead])
 async def list_temparios(
     filial_id: uuid.UUID = Query(...),
@@ -51,7 +65,7 @@ async def list_temparios(
     current_user: CurrentUser = Depends(get_current_user),
     service: PostVentasService = Depends(get_service),
 ) -> list[TemparioRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_tempario_read_access(current_user, filial_id, service.db)
     return await service.list_temparios(filial_id, search)
 
 
@@ -62,7 +76,7 @@ async def get_tempario(
     service: PostVentasService = Depends(get_service),
 ) -> TemparioRead:
     tempario = await service.get_tempario(tempario_id)
-    await _ensure_access(current_user, tempario.filial_id, service.db)
+    await _ensure_tempario_read_access(current_user, tempario.filial_id, service.db)
     return tempario
 
 
