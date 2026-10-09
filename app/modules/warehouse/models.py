@@ -39,6 +39,7 @@ class Warehouse(Base):
     )
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_workshop_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -124,6 +125,7 @@ class Transfer(Base):
     destination_warehouse_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=False
     )
+    workshop_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("service_order_transfers.id", ondelete="SET NULL"), nullable=True, index=True)
     status: Mapped[TransferStatus] = mapped_column(
         Enum(TransferStatus, name="warehouse_transfer_status"),
         nullable=False,
@@ -155,6 +157,7 @@ class TransferLine(Base):
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="CASCADE"), nullable=False
     )
+    workshop_request_line_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("service_order_transfer_lines.id", ondelete="SET NULL"), nullable=True)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, default=0)
 

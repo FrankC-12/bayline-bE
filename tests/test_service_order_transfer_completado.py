@@ -83,14 +83,15 @@ async def test_cannot_complete_an_odt_still_pendiente(env):
 
 
 @pytest.mark.asyncio
-async def test_cannot_complete_an_already_completed_odt(env):
+async def test_repeating_completion_is_idempotent(env):
     service, _session, order, part = env
     transfer = await service.add_transfer_line(order.id, part.id, 2)
     await service.mark_transfer_ordered(transfer.id)
     await service.complete_transfer(transfer.id, uuid.uuid4())
 
-    with pytest.raises(InvalidTransferStatusTransitionError):
-        await service.complete_transfer(transfer.id, uuid.uuid4())
+    original_completed_at = transfer.completed_at
+    await service.complete_transfer(transfer.id, uuid.uuid4())
+    assert transfer.completed_at.replace(tzinfo=None) == original_completed_at.replace(tzinfo=None)
 
 
 @pytest.mark.asyncio

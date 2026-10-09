@@ -121,5 +121,6 @@ async def test_requesting_the_short_part_from_almacen_is_what_actually_blocks(en
     transfers = await service.list_transfers(order.id)
     transfer = transfers[0]
 
+    await service.mark_transfer_ordered(transfer.id)
     with pytest.raises(InsufficientStockError):
-        await service.mark_transfer_ordered(transfer.id)
+        await service.complete_transfer(transfer.id)

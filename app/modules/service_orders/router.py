@@ -191,7 +191,9 @@ async def create_order_type(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> ServiceOrderTypeRead:
-    await _ensure_order_types_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_order_types_access(
+        current_user, payload.filial_id, service.db, AccessLevel.EDITAR
+    )
     return await service.create_order_type(payload.filial_id, payload)
 
 
@@ -203,7 +205,9 @@ async def update_order_type(
     service: ServiceOrderService = Depends(get_service),
 ) -> ServiceOrderTypeRead:
     existing = await service.get_order_type(order_type_id)
-    await _ensure_order_types_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_order_types_access(
+        current_user, existing.filial_id, service.db, AccessLevel.EDITAR
+    )
     return await service.update_order_type(order_type_id, payload)
 
 
@@ -453,7 +457,9 @@ async def add_transfer_line(
     missing_technician = order.technician_user_id is None
     if missing_task or missing_technician:
         raise TaskAndTechnicianRequiredError(missing_task, missing_technician)
-    transfer = await service.add_transfer_line(order_id, payload.part_id, payload.quantity, payer=payload.payer)
+    transfer = await service.add_transfer_line(
+        order_id, payload.part_id, payload.quantity, payer=payload.payer
+    )
     summary = await service.get_order_summary(order_id)
     summary.warnings = getattr(transfer, "stock_warnings", [])
     return summary
@@ -511,7 +517,7 @@ async def mark_transfer_ordered(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> TransferRead:
-    """Marks the ODT as 'Pedido' and decrements stock for every line in it."""
+    """Submit the request and reserve stock without consuming inventory."""
     filial_id = await service.get_transfer_filial(transfer_id)
     await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
     transfer = await service.mark_transfer_ordered(transfer_id, current_user.user_id)
@@ -537,7 +543,6 @@ async def mark_transfer_ordered(
         completed_at=transfer.completed_at,
         created_at=transfer.created_at,
     )
-
 
 
 @router.get("/upsells", response_model=list[UpsellRead])
@@ -727,8 +732,9 @@ async def invoice_pdf(
     service: ServiceOrderService = Depends(get_service),
 ):
     from fastapi.responses import Response
+
+    from app.core.documents.invoice_pdf import from_service_invoice, render_invoice_pdf
     from app.modules.service_orders.billing import BillingService
-    from app.core.documents.invoice_pdf import render_invoice_pdf, from_service_invoice
 
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db)
@@ -859,7 +865,9 @@ async def list_warranty_claims(
     service: ServiceOrderService = Depends(get_service),
 ) -> list[WarrantyClaimRead]:
     await _ensure_access(current_user, filial_id, service.db)
-    return await service.list_warranty_claims(filial_id, status_filter, vehicle_id, service_order_id)
+    return await service.list_warranty_claims(
+        filial_id, status_filter, vehicle_id, service_order_id
+    )
 
 
 @router.get("/warranty-claims/{claim_id}", response_model=WarrantyClaimRead)
@@ -874,7 +882,9 @@ async def get_warranty_claim(
     return claim
 
 
-@router.post("/warranty-claims", response_model=WarrantyClaimRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/warranty-claims", response_model=WarrantyClaimRead, status_code=status.HTTP_201_CREATED
+)
 async def create_warranty_claim(
     claim_type: WarrantyClaimType = Form(...),
     vehicle_id: uuid.UUID = Form(...),
@@ -930,7 +940,9 @@ async def create_warranty_claim(
         claimed_at=claimed_at,
         note=note,
     )
-    return await service.create_warranty_claim(payload, photo_urls, document_urls, current_user.user_id)
+    return await service.create_warranty_claim(
+        payload, photo_urls, document_urls, current_user.user_id
+    )
 
 
 @router.post("/warranty-claims/{claim_id}/authorize", response_model=WarrantyClaimRead)
@@ -946,7 +958,9 @@ async def authorize_warranty_claim(
     # but cannot approve or reject its own warranty request.
     claim = await service.get_warranty_claim(claim_id)
     filial_id = await service.get_vehicle_filial_id(claim.vehicle_id)
-    await ensure_module_access(service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR)
+    await ensure_module_access(
+        service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR
+    )
     return await service.authorize_warranty_claim(claim_id, payload, current_user.user_id)
 
 
@@ -961,5 +975,54 @@ async def convert_warranty_claim_to_order(
     # order is the continuation of the same approval decision.
     claim = await service.get_warranty_claim(claim_id)
     filial_id = await service.get_vehicle_filial_id(claim.vehicle_id)
-    await ensure_module_access(service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR)
+    await ensure_module_access(
+        service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR
+    )
     return await service.convert_warranty_claim_to_order(claim_id, payload, current_user.user_id)
+
+
+@router.get("/service-order-transfers/{transfer_id}/request-preview")
+async def preview_workshop_request(
+    transfer_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+
+    filial_id = await service.get_transfer_filial(transfer_id)
+    await _ensure_access(current_user, filial_id, service.db)
+    _, _, preview = await WorkshopDispatchService(service.db).preview(transfer_id)
+    return preview
+
+
+@router.post(
+    "/service-order-transfers/{transfer_id}/pickup", status_code=status.HTTP_204_NO_CONTENT
+)
+async def confirm_workshop_pickup(
+    transfer_id: uuid.UUID,
+    photo: UploadFile = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+
+    dispatch = WorkshopDispatchService(service.db)
+    request = await dispatch.request(transfer_id, lock=True)
+    order = await service.get_order(request.service_order_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    if request.status.value != "completado":
+        from app.core.exceptions import BadRequestError
+
+        raise BadRequestError("El almacén debe despachar antes de confirmar el retiro.")
+    if request.picked_up_at is None:
+        settings = get_settings()
+        request.pickup_photo_url = await save_upload_image(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="dispatch-pickups",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        request.picked_up_at = dt.datetime.now(dt.UTC)
+        request.picked_up_by_user_id = current_user.user_id
+        await service.db.commit()

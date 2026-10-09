@@ -134,8 +134,9 @@ async def test_requesting_more_than_available_warns_but_still_creates_the_line(e
     assert len(transfer.stock_warnings) == 1
     assert "insuficiente" in transfer.stock_warnings[0].lower()
 
+    await service.mark_transfer_ordered(transfer.id)
     with pytest.raises(InsufficientStockError):
-        await service.mark_transfer_ordered(transfer.id)
+        await service.complete_transfer(transfer.id)
 
 
 @pytest.mark.asyncio
@@ -143,6 +144,7 @@ async def test_dispatch_consumes_the_previewed_lots_and_matches_the_add_time_pri
     service, session, order, part, warehouse, older, newer = env
     transfer = await service.add_transfer_line(order.id, part.id, 7)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     session.refresh(older)
     session.refresh(newer)
@@ -166,6 +168,7 @@ async def test_dispatch_reprices_if_stock_shrank_since_the_line_was_added(env):
     session.commit()
 
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
     session.expire_all()
 
     from app.modules.service_orders.models import ServiceOrderTransferLine

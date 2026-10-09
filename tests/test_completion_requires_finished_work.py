@@ -116,11 +116,11 @@ async def test_a_task_en_espera_de_repuestos_moves_the_order_to_en_progreso(env)
 
 
 @pytest.mark.asyncio
-async def test_all_tasks_completed_but_an_odt_still_pending_keeps_the_order_en_progreso(env):
+async def test_all_tasks_completed_with_pending_odt_completes_order(env):
     service, order, tempario, _user = env
     task = await service.add_task(order.id, tempario.id)
     await service.update_task_status(task.id, TaskStatus.COMPLETADA)
-    assert order.status == ServiceOrderStatus.EN_PROGRESO
+    assert order.status == ServiceOrderStatus.COMPLETADO
     assert (await service.list_transfers(order.id))[0].status.value == "pendiente"
 
 

@@ -110,16 +110,51 @@ class AlmacenService:
         return warehouse
 
     async def create_warehouse(self, filial_id: uuid.UUID, name: str) -> Warehouse:
-        warehouse = Warehouse(filial_id=filial_id, name=name)
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
+        existing = (
+            await self.db.execute(
+                select(Warehouse.id).where(
+                    Warehouse.filial_id == filial_id, Warehouse.is_workshop_default.is_(True)
+                )
+            )
+        ).first()
+        warehouse = Warehouse(filial_id=filial_id, name=name, is_workshop_default=existing is None)
         self.db.add(warehouse)
         await self.db.commit()
         await self.db.refresh(warehouse)
         return warehouse
 
     async def update_warehouse(
-        self, warehouse_id: uuid.UUID, name: str | None, is_active: bool | None
+        self,
+        warehouse_id: uuid.UUID,
+        name: str | None,
+        is_active: bool | None,
+        is_workshop_default: bool | None = None,
     ) -> Warehouse:
         warehouse = await self.get_warehouse(warehouse_id)
+        if is_workshop_default is not None:
+            from sqlalchemy import update
+            from app.modules.filiales.models import Filial
+            from app.core.exceptions import BadRequestError
+
+            await self.db.execute(
+                select(Filial.id).where(Filial.id == warehouse.filial_id).with_for_update()
+            )
+            if is_workshop_default and (is_active is False or not warehouse.is_active):
+                raise BadRequestError("El almacén del taller debe estar activo.")
+            await self.db.execute(
+                update(Warehouse)
+                .where(Warehouse.filial_id == warehouse.filial_id)
+                .values(is_workshop_default=False)
+            )
+            await self.db.flush()
+            warehouse.is_workshop_default = is_workshop_default
+        if is_active is False and warehouse.is_workshop_default:
+            from app.core.exceptions import BadRequestError
+
+            raise BadRequestError("Asigna otro almacén al taller antes de desactivar este.")
         if name is not None:
             warehouse.name = name
         if is_active is not None:
@@ -152,7 +187,9 @@ class AlmacenService:
         result = await self.db.execute(query)
         return list(result.scalars().all())
 
-    async def _get_stock_in_reason(self, reason_id: uuid.UUID, holding_id: uuid.UUID) -> StockInReason:
+    async def _get_stock_in_reason(
+        self, reason_id: uuid.UUID, holding_id: uuid.UUID
+    ) -> StockInReason:
         result = await self.db.execute(
             select(StockInReason).where(
                 StockInReason.id == reason_id, StockInReason.holding_id == holding_id
@@ -193,7 +230,9 @@ class AlmacenService:
         await self.db.refresh(reason)
         return reason
 
-    async def _ensure_stock_in_reason_name_is_available(self, holding_id: uuid.UUID, name: str) -> None:
+    async def _ensure_stock_in_reason_name_is_available(
+        self, holding_id: uuid.UUID, name: str
+    ) -> None:
         result = await self.db.execute(
             select(StockInReason).where(
                 StockInReason.holding_id == holding_id,
@@ -301,8 +340,13 @@ class AlmacenService:
                     filial.holding_id, item.category or "Sin categoría"
                 )
                 part = Part(
-                    filial_id=filial_id, code=item.part_code, name=item.part_name,
-                    category_id=category.id, unit="Unidad", price=0, stock_quantity=0,
+                    filial_id=filial_id,
+                    code=item.part_code,
+                    name=item.part_name,
+                    category_id=category.id,
+                    unit="Unidad",
+                    price=0,
+                    stock_quantity=0,
                 )
                 _sync_availability(part)
                 self.db.add(part)
@@ -317,7 +361,10 @@ class AlmacenService:
                 skipped.append(item.part_code)
                 continue
             line = LotLineInput(
-                part_id=part.id, quantity=item.quantity, unit_cost=item.unit_cost, location=item.location
+                part_id=part.id,
+                quantity=item.quantity,
+                unit_cost=item.unit_cost,
+                location=item.location,
             )
             lot = await self._create_single_lot(
                 filial_id, warehouse_id, line, "Carga masiva", responsible_user_id
@@ -346,7 +393,9 @@ class AlmacenService:
                 **item.model_dump(), catalog_name=part.name if part else None
             )
             if normalized_code in seen_codes:
-                conflicts.append(reviewed.model_copy(update={"catalog_name": "Código repetido en archivo"}))
+                conflicts.append(
+                    reviewed.model_copy(update={"catalog_name": "Código repetido en archivo"})
+                )
             elif part is None:
                 new.append(reviewed)
             elif part.name.strip().casefold() != item.part_name.strip().casefold():
@@ -358,8 +407,12 @@ class AlmacenService:
 
     # Salidas (manual stock-out, e.g. consumption or returns to a supplier)
 
-    async def create_stock_out(self, payload: StockOutCreate, responsible_user_id: uuid.UUID | None = None) -> None:
-        consumed_cost = await self._consume_fifo(payload.warehouse_id, payload.part_id, payload.quantity)
+    async def create_stock_out(
+        self, payload: StockOutCreate, responsible_user_id: uuid.UUID | None = None
+    ) -> None:
+        consumed_cost = await self._consume_fifo(
+            payload.warehouse_id, payload.part_id, payload.quantity
+        )
 
         part = await self.db.get(Part, payload.part_id)
         if part is not None:
@@ -380,10 +433,18 @@ class AlmacenService:
         )
         await self.db.commit()
 
-    async def _consume_fifo(self, warehouse_id: uuid.UUID, part_id: uuid.UUID, quantity: int) -> float:
+    async def _consume_fifo(
+        self, warehouse_id: uuid.UUID, part_id: uuid.UUID, quantity: int, *, exclude_request_id=None
+    ) -> float:
         """Consumes `quantity` units from the oldest lots first. Returns the
         weighted average unit cost of what was consumed. Raises if there isn't
         enough stock at that warehouse for that part."""
+        await self.db.execute(
+            select(Part)
+            .where(Part.id == part_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         # Preserve prior consumption in this transaction before refreshing locked lots.
         await self.db.flush()
         result = await self.db.execute(
@@ -398,7 +459,10 @@ class AlmacenService:
             .execution_options(populate_existing=True)
         )
         lots = list(result.scalars().all())
-        available = sum(lot.quantity_remaining for lot in lots)
+        from app.modules.warehouse.reservations import reserved_by_lot
+
+        reserved = await reserved_by_lot(self.db, part_id, exclude_transfer_id=exclude_request_id)
+        available = sum(max(0, lot.quantity_remaining - reserved.get(lot.id, 0)) for lot in lots)
         if available < quantity:
             raise InsufficientStockError(available, quantity)
 
@@ -407,7 +471,7 @@ class AlmacenService:
         for lot in lots:
             if remaining <= 0:
                 break
-            take = min(lot.quantity_remaining, remaining)
+            take = min(max(0, lot.quantity_remaining - reserved.get(lot.id, 0)), remaining)
             lot.quantity_remaining -= take
             consumed_cost_total += take * float(lot.unit_cost)
             remaining -= take
@@ -474,32 +538,97 @@ class AlmacenService:
         return await self._get_transfer_model(transfer_id)
 
     async def update_transfer_status(
-        self, transfer_id: uuid.UUID, new_status: TransferStatus, responsible_user_id: uuid.UUID | None = None
+        self,
+        transfer_id: uuid.UUID,
+        new_status: TransferStatus,
+        responsible_user_id: uuid.UUID | None = None,
     ) -> Transfer:
+        try:
+            return await self._update_transfer_status(transfer_id, new_status, responsible_user_id)
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    async def _update_transfer_status(
+        self,
+        transfer_id: uuid.UUID,
+        new_status: TransferStatus,
+        responsible_user_id: uuid.UUID | None = None,
+    ) -> Transfer:
+        from app.modules.filiales.models import Filial
+
+        snapshot = await self.get_transfer(transfer_id)
+        await self.db.execute(
+            select(Filial.id).where(Filial.id == snapshot.filial_id).with_for_update()
+        )
+        await self.db.execute(
+            select(Transfer.id).where(Transfer.id == transfer_id).with_for_update()
+        )
         transfer = await self._get_transfer_model(transfer_id)
+        await self.db.refresh(transfer, attribute_names=["status"])
+        if transfer.workshop_request_id and new_status == TransferStatus.CANCELADA:
+            from app.core.exceptions import BadRequestError
+
+            raise BadRequestError(
+                "El traslado está reservado para una ODS; resuelve la solicitud antes de cancelarlo."
+            )
         if new_status == transfer.status:
             return transfer
         if new_status not in TRANSFER_TRANSITIONS.get(transfer.status, set()):
             raise InvalidTransferStatusTransitionError(transfer.status.value, new_status.value)
 
         if new_status == TransferStatus.COMPLETADA:
-            for line in transfer.lines:
+            for line in sorted(transfer.lines, key=lambda item: (str(item.part_id), str(item.id))):
                 weighted_cost = await self._consume_fifo(
-                    transfer.origin_warehouse_id, line.part_id, line.quantity
+                    transfer.origin_warehouse_id,
+                    line.part_id,
+                    line.quantity,
+                    exclude_request_id=transfer.workshop_request_id,
                 )
                 lot_number = await self._next_lot_number(transfer.filial_id)
-                self.db.add(
-                    PartLot(
-                        filial_id=transfer.filial_id,
-                        lot_number=lot_number,
-                        warehouse_id=transfer.destination_warehouse_id,
-                        part_id=line.part_id,
-                        quantity_received=line.quantity,
-                        quantity_remaining=line.quantity,
-                        unit_cost=weighted_cost,
-                        note=f"Transferencia {transfer.code}",
-                    )
+                received_lot = PartLot(
+                    filial_id=transfer.filial_id,
+                    lot_number=lot_number,
+                    warehouse_id=transfer.destination_warehouse_id,
+                    part_id=line.part_id,
+                    quantity_received=line.quantity,
+                    quantity_remaining=line.quantity,
+                    unit_cost=weighted_cost,
+                    note=f"Transferencia {transfer.code}",
                 )
+                self.db.add(received_lot)
+                await self.db.flush()
+                if line.workshop_request_line_id:
+                    from app.modules.service_orders.models import (
+                        ServiceOrderTransferLine,
+                        ServiceOrderTransferLotAllocation,
+                    )
+
+                    request_line = (
+                        await self.db.execute(
+                            select(ServiceOrderTransferLine)
+                            .options(selectinload(ServiceOrderTransferLine.allocations))
+                            .where(ServiceOrderTransferLine.id == line.workshop_request_line_id)
+                        )
+                    ).scalar_one()
+                    # Move this request's reservation to the received lot.
+                    remaining = line.quantity
+                    for allocation in list(request_line.allocations):
+                        if allocation.warehouse_id == transfer.origin_warehouse_id and remaining:
+                            take = min(remaining, allocation.quantity)
+                            allocation.quantity -= take
+                            remaining -= take
+                            if not allocation.quantity:
+                                request_line.allocations.remove(allocation)
+                    request_line.allocations.append(
+                        ServiceOrderTransferLotAllocation(
+                            lot_id=received_lot.id,
+                            warehouse_id=received_lot.warehouse_id,
+                            quantity=line.quantity,
+                            unit_cost=weighted_cost,
+                        )
+                    )
+                    await self.db.flush()
                 self.db.add(
                     StockMovement(
                         filial_id=transfer.filial_id,
@@ -540,7 +669,9 @@ class AlmacenService:
         search: str | None = None,
         part_id: uuid.UUID | None = None,
     ) -> list[InventoryRow]:
-        query = select(PartLot).where(PartLot.filial_id == filial_id, PartLot.quantity_remaining > 0)
+        query = select(PartLot).where(
+            PartLot.filial_id == filial_id, PartLot.quantity_remaining > 0
+        )
         if warehouse_id:
             query = query.where(PartLot.warehouse_id == warehouse_id)
         if part_id:
@@ -599,7 +730,11 @@ class AlmacenService:
         return rows
 
     async def set_inventory_location(
-        self, filial_id: uuid.UUID, part_id: uuid.UUID, warehouse_id: uuid.UUID, location: str | None
+        self,
+        filial_id: uuid.UUID,
+        part_id: uuid.UUID,
+        warehouse_id: uuid.UUID,
+        location: str | None,
     ) -> InventoryRow:
         """Edits where a part sits in a warehouse — e.g. "Estante A3". Since
         location isn't its own field (get_inventory derives it from the most
@@ -707,7 +842,6 @@ class AlmacenService:
                 )
             )
 
-        from app.modules.service_orders.enums import TransferStatus as ServiceOrderTransferStatus
         from app.modules.service_orders.models import (
             ServiceOrder,
             ServiceOrderTransfer,
@@ -721,7 +855,10 @@ class AlmacenService:
                 ServiceOrderTransferLine,
                 ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
             )
-            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+            .join(
+                ServiceOrderTransfer,
+                ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+            )
             .join(ServiceOrder, ServiceOrder.id == ServiceOrderTransfer.service_order_id)
             .where(
                 ServiceOrderTransferLotAllocation.lot_id == lot.id,
@@ -729,9 +866,7 @@ class AlmacenService:
                 # not yet "pedida a almacén" only carries a preview
                 # allocation. PEDIDO or COMPLETADO both mean it shipped;
                 # COMPLETADO just confirms the same dispatch was handed over.
-                ServiceOrderTransfer.status.in_(
-                    [ServiceOrderTransferStatus.PEDIDO, ServiceOrderTransferStatus.COMPLETADO]
-                ),
+                ServiceOrderTransfer.stock_deducted.is_(True),
             )
         )
         for allocation, transfer, order in odt_rows.all():
@@ -767,14 +902,18 @@ class AlmacenService:
             outbound_movements=movements,
         )
 
-    async def list_service_order_requests(self, filial_id: uuid.UUID) -> list[ServiceOrderPartRequestRead]:
+    async def list_service_order_requests(
+        self, filial_id: uuid.UUID
+    ) -> list[ServiceOrderPartRequestRead]:
         """Dispatched ODTs ('Marcar como Pedido' from a service order) for
         this filial — how a parts request from an ODS reaches almacén staff
         in the 'Órdenes de Transferencia' screen."""
         from app.modules.clients.models import Vehicle
         from app.modules.service_orders.enums import TransferStatus as ServiceOrderTransferStatus
         from app.modules.service_orders.models import (
-            ServiceOrder, ServiceOrderTransfer, ServiceOrderTransferLine,
+            ServiceOrder,
+            ServiceOrderTransfer,
+            ServiceOrderTransferLine,
         )
 
         rows = await self.db.execute(
@@ -797,7 +936,9 @@ class AlmacenService:
 
         warehouse_names = {
             w.id: w.name
-            for w in (await self.db.execute(select(Warehouse).where(Warehouse.filial_id == filial_id))).scalars()
+            for w in (
+                await self.db.execute(select(Warehouse).where(Warehouse.filial_id == filial_id))
+            ).scalars()
         }
 
         results: list[ServiceOrderPartRequestRead] = []
@@ -817,20 +958,38 @@ class AlmacenService:
                     )
                 lines.append(
                     ServiceOrderPartRequestLineRead(
+                        id=line.id,
                         part_id=line.part_id,
                         part_code=part.code if part else "",
                         part_name=part.name if part else "",
                         quantity=line.quantity,
+                        shortfall_quantity=line.shortfall_quantity,
+                        transfer_quantity=(
+                            sum(
+                                quantity
+                                for warehouse_id, quantity in quantity_by_warehouse.items()
+                                if warehouse_id != transfer.warehouse_id
+                            )
+                            if not transfer.stock_deducted
+                            else 0
+                        ),
                         warehouses=[
                             ServiceOrderPartRequestLineWarehouse(
                                 warehouse_id=warehouse_id,
-                                warehouse_name=warehouse_names.get(warehouse_id, "Almacén desconocido"),
+                                warehouse_name=warehouse_names.get(
+                                    warehouse_id, "Almacén desconocido"
+                                ),
                                 quantity=quantity,
                             )
                             for warehouse_id, quantity in quantity_by_warehouse.items()
                         ],
                     )
                 )
+            from app.modules.users.models import User
+
+            advisor = (
+                await self.db.get(User, order.advisor_user_id) if order.advisor_user_id else None
+            )
             results.append(
                 ServiceOrderPartRequestRead(
                     id=transfer.id,
@@ -842,6 +1001,19 @@ class AlmacenService:
                     fulfilled_at=transfer.fulfilled_at,
                     completed_at=transfer.completed_at,
                     warehouse_seen=transfer.warehouse_seen,
+                    warehouse_id=transfer.warehouse_id,
+                    warehouse_name=warehouse_names.get(transfer.warehouse_id),
+                    advisor_name=advisor.full_name if advisor else None,
+                    preparation_started_at=transfer.preparation_started_at,
+                    picked_up_at=transfer.picked_up_at,
+                    pickup_photo_url=transfer.pickup_photo_url,
+                    backorder_notified_at=transfer.backorder_notified_at,
+                    created_at=transfer.created_at,
+                    stage=(
+                        ("completado" if transfer.picked_up_at else "por_retirar")
+                        if transfer.status.value == "completado"
+                        else ("en_progreso" if transfer.preparation_started_at else "pendiente")
+                    ),
                     lines=lines,
                 )
             )
@@ -892,7 +1064,9 @@ class AlmacenService:
         return requests
 
     async def acknowledge_service_order_request(self, transfer_id: uuid.UUID) -> None:
-        from app.modules.service_orders.exceptions import TransferNotFoundError as ServiceOrderTransferNotFoundError
+        from app.modules.service_orders.exceptions import (
+            TransferNotFoundError as ServiceOrderTransferNotFoundError,
+        )
         from app.modules.service_orders.models import ServiceOrderTransfer
 
         transfer = await self.db.get(ServiceOrderTransfer, transfer_id)
@@ -913,7 +1087,10 @@ class AlmacenService:
         await ServiceOrderService(self.db).complete_transfer(transfer_id, completed_by_user_id)
 
     async def list_movements(
-        self, filial_id: uuid.UUID, part_id: uuid.UUID | None = None, warehouse_id: uuid.UUID | None = None
+        self,
+        filial_id: uuid.UUID,
+        part_id: uuid.UUID | None = None,
+        warehouse_id: uuid.UUID | None = None,
     ) -> list[StockMovement]:
         query = (
             select(StockMovement)

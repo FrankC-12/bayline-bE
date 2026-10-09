@@ -4,12 +4,16 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.schemas import CurrentUser
 from app.modules.filiales.exceptions import FilialNotFoundError
 from app.modules.filiales.models import Filial
+from app.modules.roles.enums import AccessLevel
+from app.modules.roles.permissions import ensure_module_access
 from app.modules.warehouse.schemas import (
     BulkLotCreate,
-    BulkLotReview,
     BulkLotResult,
+    BulkLotReview,
     InventoryLocationUpdate,
     InventoryRow,
     PartLotDetailRead,
@@ -30,10 +34,6 @@ from app.modules.warehouse.schemas import (
     WarehouseUpdate,
 )
 from app.modules.warehouse.service import AlmacenService, _lot_to_read, transfer_to_read
-from app.modules.auth.dependencies import get_current_user
-from app.modules.auth.schemas import CurrentUser
-from app.modules.roles.enums import AccessLevel
-from app.modules.roles.permissions import ensure_module_access
 
 MODULE_ID = "almacen"
 # Motivos de Entrada is managed from Ajustes, same permission boundary as the
@@ -101,7 +101,9 @@ async def update_warehouse(
 ) -> WarehouseRead:
     existing = await service.get_warehouse(warehouse_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.update_warehouse(warehouse_id, payload.name, payload.is_active)
+    return await service.update_warehouse(
+        warehouse_id, payload.name, payload.is_active, payload.is_workshop_default
+    )
 
 
 @router.get("/almacen/inventory", response_model=list[InventoryRow])
@@ -158,7 +160,9 @@ async def get_lot_detail(
     return await service.get_lot_detail(lot)
 
 
-@router.post("/almacen/stock-in", response_model=list[PartLotRead], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/almacen/stock-in", response_model=list[PartLotRead], status_code=status.HTTP_201_CREATED
+)
 async def create_stock_in(
     payload: StockInCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -170,7 +174,9 @@ async def create_stock_in(
     return [_lot_to_read(lot) for lot in lots]
 
 
-@router.post("/almacen/stock-in/bulk", response_model=BulkLotResult, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/almacen/stock-in/bulk", response_model=BulkLotResult, status_code=status.HTTP_201_CREATED
+)
 async def bulk_create_lots(
     payload: BulkLotCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -250,7 +256,9 @@ async def update_transfer_status(
 ) -> TransferRead:
     existing = await service.get_transfer(transfer_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    transfer = await service.update_transfer_status(transfer_id, payload.status, current_user.user_id)
+    transfer = await service.update_transfer_status(
+        transfer_id, payload.status, current_user.user_id
+    )
     return transfer_to_read(transfer)
 
 
@@ -266,7 +274,10 @@ async def list_service_order_requests(
     return await service.list_service_order_requests(filial_id)
 
 
-@router.post("/almacen/service-order-requests/{transfer_id}/acknowledge", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/almacen/service-order-requests/{transfer_id}/acknowledge",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
 async def acknowledge_service_order_request(
     transfer_id: uuid.UUID,
     filial_id: uuid.UUID = Query(...),
@@ -274,10 +285,16 @@ async def acknowledge_service_order_request(
     service: AlmacenService = Depends(get_service),
 ) -> None:
     await _ensure_access(current_user, filial_id, service.db)
+    from app.modules.service_orders.service import ServiceOrderService
+
+    actual_filial = await ServiceOrderService(service.db).get_transfer_filial(transfer_id)
+    await _ensure_access(current_user, actual_filial, service.db)
     await service.acknowledge_service_order_request(transfer_id)
 
 
-@router.post("/almacen/service-order-requests/{transfer_id}/complete", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/almacen/service-order-requests/{transfer_id}/complete", status_code=status.HTTP_204_NO_CONTENT
+)
 async def complete_service_order_request(
     transfer_id: uuid.UUID,
     filial_id: uuid.UUID = Query(...),
@@ -287,6 +304,10 @@ async def complete_service_order_request(
     """Almacén confirms the parts were physically handed over to the
     técnico — pauses the elapsed-time counter running since 'Pedido'."""
     await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    from app.modules.service_orders.service import ServiceOrderService
+
+    actual_filial = await ServiceOrderService(service.db).get_transfer_filial(transfer_id)
+    await _ensure_access(current_user, actual_filial, service.db, AccessLevel.EDITAR)
     await service.complete_service_order_request(transfer_id, current_user.user_id)
 
 
@@ -330,7 +351,9 @@ async def list_stock_in_reasons(
     return await service.list_stock_in_reasons(holding_id, include_inactive)
 
 
-@router.post("/stock-in-reasons", response_model=StockInReasonRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/stock-in-reasons", response_model=StockInReasonRead, status_code=status.HTTP_201_CREATED
+)
 async def create_stock_in_reason(
     payload: StockInReasonCreate,
     filial_id: uuid.UUID = Query(...),
@@ -377,3 +400,54 @@ async def deactivate_stock_in_reason(
     await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
     holding_id = await _holding_id_for_filial(service.db, filial_id)
     return await service.set_stock_in_reason_active(reason_id, holding_id, is_active=False)
+
+
+@router.post(
+    "/almacen/service-order-requests/{transfer_id}/start", status_code=status.HTTP_204_NO_CONTENT
+)
+async def start_workshop_dispatch(
+    transfer_id: uuid.UUID,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+):
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+    from app.modules.service_orders.service import ServiceOrderService
+
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    actual_filial = await ServiceOrderService(service.db).get_transfer_filial(transfer_id)
+    await _ensure_access(current_user, actual_filial, service.db, AccessLevel.EDITAR)
+    await WorkshopDispatchService(service.db).start(transfer_id, current_user.user_id)
+
+
+@router.get("/almacen/workshop-backorders")
+async def list_workshop_backorders(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+):
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    try:
+        await ensure_module_access(service.db, current_user, filial_id, "compras", AccessLevel.VER)
+    except InsufficientPermissionsError:
+        await ensure_module_access(
+            service.db, current_user, filial_id, "administracion", AccessLevel.VER
+        )
+    requests = await service.list_service_order_requests(filial_id)
+    return [
+        {
+            "request_id": str(request.id),
+            "order_code": request.service_order_code,
+            "request_code": request.code,
+            "warehouse_name": request.warehouse_name,
+            "part_id": str(line.part_id),
+            "part_code": line.part_code,
+            "part_name": line.part_name,
+            "quantity": line.shortfall_quantity,
+            "notified_at": request.backorder_notified_at,
+        }
+        for request in requests
+        for line in request.lines
+        if line.shortfall_quantity > 0 and request.status == "pedido"
+    ]

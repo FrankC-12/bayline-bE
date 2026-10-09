@@ -22,7 +22,9 @@ from app.modules.warehouse.service import AlmacenService
 
 
 @pytest.mark.asyncio
-async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(billing_db):
+async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(
+    billing_db, monkeypatch
+):
     ctx = billing_db
     async with ctx.sessions() as db:
         filial = await db.get(Filial, ctx.filial_id)
@@ -101,6 +103,7 @@ async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(bi
             row = response.json()[0]
             assert row["id"] == str(transfer_id)
             assert row["status"] == "pedido"
+            assert row["stage"] == "pendiente"
             assert row["warehouse_seen"] is False
             assert row["lines"][0]["part_name"] == "Aceite 15W40"
             assert row["lines"][0]["warehouses"][0]["warehouse_name"] == "Principal"
@@ -115,11 +118,43 @@ async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(bi
             ).status_code == 204
             assert (
                 await http.post(
+                    f"/api/v1/almacen/service-order-requests/{transfer_id}/start?filial_id={ctx.filial_id}"
+                )
+            ).status_code == 204
+            assert (await http.get(path)).json()[0]["stage"] == "en_progreso"
+            assert (
+                await http.post(
                     f"/api/v1/almacen/service-order-requests/{transfer_id}/complete?filial_id={ctx.filial_id}"
                 )
             ).status_code == 204
             response = await http.get(path)
             assert response.json()[0]["status"] == "completado"
+            assert response.json()[0]["stage"] == "por_retirar"
             assert (
                 await http.get(f"/api/v1/almacen/service-order-requests?filial_id={uuid.uuid4()}")
             ).status_code == 403
+
+            pickup_path = f"/api/v1/service-order-transfers/{transfer_id}/pickup"
+            photo = {"photo": ("retiro.jpg", b"photo", "image/jpeg")}
+            assert (await http.post(pickup_path, files=photo)).status_code == 403
+            db.add(
+                RoleModulePermission(
+                    role_id=role.id, module_id="asesor-servicios", access=AccessLevel.EDITAR
+                )
+            )
+            await db.commit()
+            assert (await http.post(pickup_path)).status_code == 422
+            stored = []
+
+            async def save_photo(file, **kwargs):
+                stored.append(file.filename)
+                return "/api/v1/uploads/dispatch-pickups/retirada.jpg"
+
+            monkeypatch.setattr(order_routes, "save_upload_image", save_photo)
+            assert (await http.post(pickup_path, files=photo)).status_code == 204
+            row = (await http.get(path)).json()[0]
+            assert row["stage"] == "completado"
+            assert row["picked_up_at"] is not None
+            assert row["pickup_photo_url"].endswith("retirada.jpg")
+            assert (await http.post(pickup_path, files=photo)).status_code == 204
+            assert stored == ["retiro.jpg"]

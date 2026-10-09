@@ -684,6 +684,8 @@ class PartsService:
             part = await self.get_part(part_id)
             if part.filial_id != payload.filial_id:
                 raise BadRequestError("El repuesto no pertenece a la filial.")
+            if consume:
+                await self.db.execute(select(Part).where(Part.id == part_id).with_for_update().execution_options(populate_existing=True))
             query = (
                 select(PartLot)
                 .where(
@@ -697,7 +699,11 @@ class PartsService:
             if consume:
                 query = query.with_for_update().execution_options(populate_existing=True)
             lots = list((await self.db.execute(query)).scalars().all())
-            allocations = allocate_fifo(lots, quantity, part_id=part.id, part_name=part.name)
+            from app.modules.warehouse.reservations import available_lots, reserved_by_lot
+            reserved = await reserved_by_lot(self.db, part.id)
+            picked = allocate_fifo(available_lots(lots, reserved), quantity, part_id=part.id, part_name=part.name)
+            by_id = {lot.id: lot for lot in lots}
+            allocations = [(by_id[lot.id], take) for lot, take in picked]
             cost, price, total = price_allocations(
                 allocations, quantity, PARTS_MULTIPLIERS[payload.discount_label]
             )

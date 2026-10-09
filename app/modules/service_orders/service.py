@@ -13,12 +13,10 @@ from app.core.exceptions import BadRequestError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
-from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS, price_parts_cost
-from app.modules.parts.service import _sync_availability
+from app.modules.parts.pricing import PARTS_MULTIPLIERS, price_parts_cost
 from app.modules.post_ventas.enums import WarrantyPolicyAppliesTo, WarrantyPolicyStatus
 from app.modules.post_ventas.models import LaborSettings, Tempario, WarrantyPolicy
 from app.modules.service_orders.enums import (
-    ReworkFailureCategory,
     ServiceOrderPayer,
     ServiceOrderStatus,
     SYSTEM_ORDER_TYPE_CAMPANA,
@@ -37,7 +35,6 @@ from app.modules.service_orders.exceptions import (
     BayNotFoundError,
     FailureCategoryRequiredError,
     InvalidStatusTransitionError,
-    InvalidTransferStatusTransitionError,
     OrderNotInvoicedError,
     ServiceOrderNotCancelledError,
     ServiceOrderNotFoundError,
@@ -98,9 +95,8 @@ from app.modules.service_orders.schemas import (
     WarrantyClaimCreate,
     WarrantyClaimRead,
 )
-from app.modules.warehouse.enums import MovementType
-from app.modules.warehouse.fifo import allocate_fifo, allocate_fifo_preview
-from app.modules.warehouse.models import PartLot, StockMovement
+from app.modules.warehouse.fifo import allocate_fifo_preview
+from app.modules.warehouse.models import PartLot
 from app.modules.administracion.models import PurchaseRequest, SupplierClaim
 
 # How long an ODT line's FIFO preview also acts as a soft reservation on the
@@ -406,14 +402,18 @@ class ServiceOrderService:
                     "El reclamo seleccionado no corresponde al tipo de orden elegido."
                 )
             if claim.status != WarrantyClaimStatus.AUTORIZADO:
-                raise WarrantyClaimOrderMismatchError("El reclamo seleccionado todavía no está autorizado.")
+                raise WarrantyClaimOrderMismatchError(
+                    "El reclamo seleccionado todavía no está autorizado."
+                )
 
         next_seq = await self._next_sequence_number(payload.filial_id)
         order = ServiceOrder(
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
             order_type_id=order_type.id,
-            warranty_claim_id=payload.warranty_claim_id if required_claim_type is not None else None,
+            warranty_claim_id=(
+                payload.warranty_claim_id if required_claim_type is not None else None
+            ),
             discount_label=payload.discount_label,
             notes=payload.notes,
             scheduled_at=payload.scheduled_at,
@@ -451,7 +451,7 @@ class ServiceOrderService:
 
         if payload.status is not None:
             # pendiente/en_progreso/completado are derived from the order's
-            # tasks (and ODTs, for completado) — see _sync_status_from_tasks.
+            # tasks — see _sync_status_from_tasks.
             # The one manual override is force_complete_order, a separate action.
             # Checked after require_editable_order so a closed/cancelled order
             # still surfaces "read only", same as every other mutation below.
@@ -529,7 +529,9 @@ class ServiceOrderService:
         the order (completed_with_pending_items)."""
         order = await require_editable_order(self.db, order_id)
         if order.status not in (ServiceOrderStatus.PENDIENTE, ServiceOrderStatus.EN_PROGRESO):
-            raise InvalidStatusTransitionError(order.status.value, ServiceOrderStatus.COMPLETADO.value)
+            raise InvalidStatusTransitionError(
+                order.status.value, ServiceOrderStatus.COMPLETADO.value
+            )
         pending_tasks = [
             t
             for t in await self.list_tasks(order_id)
@@ -555,7 +557,10 @@ class ServiceOrderService:
             await self.db.execute(select(WarrantyPolicy).where(WarrantyPolicy.id == policy_id))
         ).scalar_one_or_none()
         if policy is None:
-            raise BadRequestError("La política de garantía seleccionada no existe.", error_code="warranty_policy_not_found")
+            raise BadRequestError(
+                "La política de garantía seleccionada no existe.",
+                error_code="warranty_policy_not_found",
+            )
         if policy.status != WarrantyPolicyStatus.ACTIVA:
             raise BadRequestError(
                 "Esa política de garantía está inactiva y no puede seleccionarse.",
@@ -602,7 +607,9 @@ class ServiceOrderService:
     ) -> ServiceOrder:
         order = await require_editable_order(self.db, order_id)
         if ServiceOrderStatus.CANCELADO not in ALLOWED_TRANSITIONS.get(order.status, set()):
-            raise InvalidStatusTransitionError(order.status.value, ServiceOrderStatus.CANCELADO.value)
+            raise InvalidStatusTransitionError(
+                order.status.value, ServiceOrderStatus.CANCELADO.value
+            )
         order.status = ServiceOrderStatus.CANCELADO
         order.cancel_reason = reason
         order.cancelled_by_user_id = cancelled_by_user_id
@@ -615,7 +622,9 @@ class ServiceOrderService:
         await self.db.refresh(order)
         return order
 
-    async def reopen_order(self, order_id: uuid.UUID, reopened_by_user_id: uuid.UUID) -> ServiceOrder:
+    async def reopen_order(
+        self, order_id: uuid.UUID, reopened_by_user_id: uuid.UUID
+    ) -> ServiceOrder:
         result = await self.db.execute(
             select(ServiceOrder)
             .where(ServiceOrder.id == order_id)
@@ -696,11 +705,9 @@ class ServiceOrderService:
         unreachable anyway: require_editable_order blocks task mutations on
         them). CANCELADA tasks are excluded from the computation — a
         deliberately dropped task shouldn't keep an order looking unfinished,
-        same reasoning as force_complete_order's pending-tasks check. Going
-        to COMPLETADO still requires every ODT to be dispatched (not left
-        PENDIENTE); if a task-complete order still has one, it stays
-        EN_PROGRESO until that's resolved. Use force_complete_order to
-        override and complete anyway."""
+        same reasoning as force_complete_order's pending-tasks check.
+        Dispatch and pickup have their own lifecycle and do not block
+        the task-derived completion status."""
         if order.status not in (
             ServiceOrderStatus.PENDIENTE,
             ServiceOrderStatus.EN_PROGRESO,
@@ -715,10 +722,7 @@ class ServiceOrderService:
         elif not relevant or all(t.status == TaskStatus.COMPLETADA for t in relevant):
             # No non-cancelled tasks left (everything was dropped) counts the
             # same as everything being finished — nothing actionable remains.
-            transfers_pending = any(
-                t.status == TransferStatus.PENDIENTE for t in await self.list_transfers(order.id)
-            )
-            target = ServiceOrderStatus.EN_PROGRESO if transfers_pending else ServiceOrderStatus.COMPLETADO
+            target = ServiceOrderStatus.COMPLETADO
         elif all(t.status == TaskStatus.PENDIENTE for t in relevant):
             target = ServiceOrderStatus.PENDIENTE
         else:
@@ -853,7 +857,9 @@ class ServiceOrderService:
         await self.db.refresh(task)
         return task
 
-    async def update_task_payer(self, task_id: uuid.UUID, payer: ServiceOrderPayer) -> ServiceOrderTask:
+    async def update_task_payer(
+        self, task_id: uuid.UUID, payer: ServiceOrderPayer
+    ) -> ServiceOrderTask:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
@@ -914,7 +920,9 @@ class ServiceOrderService:
         await self.db.refresh(line)
         return line
 
-    async def set_transfer_line_quantity(self, line_id: uuid.UUID, quantity: int) -> ServiceOrderTransfer:
+    async def set_transfer_line_quantity(
+        self, line_id: uuid.UUID, quantity: int
+    ) -> ServiceOrderTransfer:
         """Changes how much of a part is requested — e.g. an oil change line
         for 6 liters drops to 2 once the client says they're bringing 4 of
         their own. Only while the ODT is still Pendiente: once dispatched
@@ -937,7 +945,7 @@ class ServiceOrderService:
             part = await self.db.get(Part, line.part_id)
             available = quantity - shortfall
             warning = (
-                f"Stock insuficiente para \"{part.name if part else line.part_id}\": disponible "
+                f'Stock insuficiente para "{part.name if part else line.part_id}": disponible '
                 f"{available} de {quantity} solicitadas. Se guardó el cambio de todas formas — "
                 "solicítalo a almacén cuando haya existencia."
             )
@@ -983,123 +991,16 @@ class ServiceOrderService:
     async def mark_transfer_ordered(
         self, transfer_id: uuid.UUID, fulfilled_by_user_id: uuid.UUID | None = None
     ) -> ServiceOrderTransfer:
-        result = await self.db.execute(
-            select(ServiceOrderTransfer)
-            .options(selectinload(ServiceOrderTransfer.lines))
-            .where(ServiceOrderTransfer.id == transfer_id)
-        )
-        transfer = result.scalar_one_or_none()
-        if transfer is None:
-            raise TransferNotFoundError(str(transfer_id))
+        from app.modules.service_orders.dispatch import WorkshopDispatchService
 
-        await require_editable_order(self.db, transfer.service_order_id)
-        await self.db.refresh(transfer, attribute_names=["status"])
-        if transfer.status == TransferStatus.PENDIENTE:
-            order = await self.get_order(transfer.service_order_id)
-            for line in transfer.lines:
-                part = await self.db.get(Part, line.part_id)
-                if part is None:
-                    continue
-                # Dispatch consumes real FIFO lots (oldest first, across every
-                # warehouse in the filial — ODTs have never been scoped to a
-                # single warehouse) so the part can later be traced to a lot,
-                # a purchase order, and a supplier. Mirrors PartsService.create_sale.
-                real_lots = list(
-                    (
-                        await self.db.execute(
-                            select(PartLot)
-                            .where(
-                                PartLot.filial_id == order.filial_id,
-                                PartLot.part_id == line.part_id,
-                                PartLot.quantity_remaining > 0,
-                            )
-                            .order_by(PartLot.received_at, PartLot.id)
-                            .with_for_update()
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                # Net of whatever OTHER pending lines still have reserved —
-                # this line's own reservation is excluded, so as long as
-                # nothing else touched inventory since it was previewed, this
-                # lands on the exact same lots at the exact same price. If
-                # its reservation lapsed (or a rare concurrent-preview race
-                # let two lines reserve the same units), this simply falls
-                # back to whatever's actually available now, same as before
-                # this line-level reservation existed.
-                reserved = await self._reserved_quantity_by_lot(line.part_id, exclude_line_id=line.id)
-                real_lots_by_id = {lot.id: lot for lot in real_lots}
-                available_lots = [
-                    _AvailableLot(
-                        id=lot.id,
-                        unit_cost=lot.unit_cost,
-                        warehouse_id=lot.warehouse_id,
-                        quantity_remaining=max(0, lot.quantity_remaining - reserved.get(lot.id, 0)),
-                    )
-                    for lot in real_lots
-                ]
-                allocations = allocate_fifo(available_lots, line.quantity, part_id=part.id, part_name=part.name)
-                # Replace the add-time preview with the real, final
-                # consumption — inventory may have shifted since the line
-                # was added (another order could have taken the cheaper
-                # lot first), so re-derive the line's price from what was
-                # actually dispatched, not what was previewed.
-                cost = sum((Decimal(str(lot.unit_cost)) * take for lot, take in allocations), Decimal(0))
-                line.allocations = [
-                    ServiceOrderTransferLotAllocation(
-                        lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost, warehouse_id=lot.warehouse_id
-                    )
-                    for lot, take in allocations
-                ]
-                line.cost_total = cost
-                line.unit_price, line.line_total = price_parts_cost(cost, line.quantity, order.discount_label)
-                for lot, take in allocations:
-                    real_lot = real_lots_by_id[lot.id]
-                    real_lot.quantity_remaining -= take
-                    self.db.add(
-                        StockMovement(
-                            filial_id=order.filial_id,
-                            warehouse_id=lot.warehouse_id,
-                            part_id=line.part_id,
-                            movement_type=MovementType.SALIDA,
-                            quantity=take,
-                            unit_cost=lot.unit_cost,
-                            reference=transfer.code,
-                            responsible_user_id=fulfilled_by_user_id,
-                        )
-                    )
-                part.stock_quantity = max(0, part.stock_quantity - line.quantity)
-                _sync_availability(part)
-            transfer.status = TransferStatus.PEDIDO
-            transfer.fulfilled_by_user_id = fulfilled_by_user_id
-            transfer.fulfilled_at = datetime.now(UTC)
-            # Dispatching the last PENDIENTE ODT can be what finally lets an
-            # already task-complete order reach COMPLETADO.
-            await self._sync_status_from_tasks(order)
-
-        await self.db.commit()
-        await self.db.refresh(transfer)
-        return transfer
+        return await WorkshopDispatchService(self.db).submit(transfer_id, fulfilled_by_user_id)
 
     async def complete_transfer(
         self, transfer_id: uuid.UUID, completed_by_user_id: uuid.UUID | None = None
     ) -> ServiceOrderTransfer:
-        """Confirms almacén physically handed the parts over — from
-        Pedido only, never automatic. Pauses the elapsed-time counter
-        running since fulfilled_at (see AlmacenService.list_service_order_requests)."""
-        transfer = await self.db.get(ServiceOrderTransfer, transfer_id)
-        if transfer is None:
-            raise TransferNotFoundError(str(transfer_id))
-        if transfer.status != TransferStatus.PEDIDO:
-            raise InvalidTransferStatusTransitionError(transfer.status.value, TransferStatus.COMPLETADO.value)
+        from app.modules.service_orders.dispatch import WorkshopDispatchService
 
-        transfer.status = TransferStatus.COMPLETADO
-        transfer.completed_by_user_id = completed_by_user_id
-        transfer.completed_at = datetime.now(UTC)
-        await self.db.commit()
-        await self.db.refresh(transfer)
-        return transfer
+        return await WorkshopDispatchService(self.db).dispatch(transfer_id, completed_by_user_id)
 
     async def _get_or_create_pending_transfer(
         self, service_order_id: uuid.UUID
@@ -1172,7 +1073,10 @@ class ServiceOrderService:
         # so the price doesn't drift before dispatch. Still no stock is
         # actually touched until dispatch.
         cost, allocations, shortfall = await self._fifo_preview_cost(
-            order.filial_id, part_id, new_quantity, exclude_line_id=existing.id if existing else None
+            order.filial_id,
+            part_id,
+            new_quantity,
+            exclude_line_id=existing.id if existing else None,
         )
 
         warning: str | None = None
@@ -1180,7 +1084,7 @@ class ServiceOrderService:
             part = await self.db.get(Part, part_id)
             available = new_quantity - shortfall
             warning = (
-                f"Stock insuficiente para \"{part.name if part else part_id}\": disponible "
+                f'Stock insuficiente para "{part.name if part else part_id}": disponible '
                 f"{available} de {new_quantity} solicitadas. Se agregó la línea de todas formas — "
                 "solicítalo a almacén cuando haya existencia."
             )
@@ -1195,7 +1099,9 @@ class ServiceOrderService:
             self.db.add(existing)
         existing.quantity = new_quantity
         existing.cost_total = cost
-        existing.unit_price, existing.line_total = price_parts_cost(cost, new_quantity, order.discount_label)
+        existing.unit_price, existing.line_total = price_parts_cost(
+            cost, new_quantity, order.discount_label
+        )
         existing.allocations = [
             ServiceOrderTransferLotAllocation(
                 lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost, warehouse_id=lot.warehouse_id
@@ -1218,26 +1124,9 @@ class ServiceOrderService:
         are real consumption already reflected in PartLot.quantity_remaining
         — counting them again here would double-subtract, so only PENDIENTE
         transfers are considered."""
-        cutoff = datetime.now(UTC) - RESERVATION_TTL
-        query = (
-            select(ServiceOrderTransferLotAllocation.lot_id, func.sum(ServiceOrderTransferLotAllocation.quantity))
-            .join(PartLot, PartLot.id == ServiceOrderTransferLotAllocation.lot_id)
-            .join(
-                ServiceOrderTransferLine,
-                ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
-            )
-            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
-            .where(
-                PartLot.part_id == part_id,
-                ServiceOrderTransferLotAllocation.created_at >= cutoff,
-                ServiceOrderTransfer.status == TransferStatus.PENDIENTE,
-            )
-            .group_by(ServiceOrderTransferLotAllocation.lot_id)
-        )
-        if exclude_line_id is not None:
-            query = query.where(ServiceOrderTransferLotAllocation.transfer_line_id != exclude_line_id)
-        result = await self.db.execute(query)
-        return dict(result.all())
+        from app.modules.warehouse.reservations import reserved_by_lot
+
+        return await reserved_by_lot(self.db, part_id, exclude_line_id=exclude_line_id)
 
     async def _fifo_preview_cost(
         self,
@@ -1283,7 +1172,9 @@ class ServiceOrderService:
         cost = sum((Decimal(str(lot.unit_cost)) * take for lot, take in allocations), Decimal(0))
         if shortfall > 0:
             fallback_cost = (
-                allocations[-1][0].unit_cost if allocations else await self._last_known_unit_cost(part_id)
+                allocations[-1][0].unit_cost
+                if allocations
+                else await self._last_known_unit_cost(part_id)
             )
             cost += Decimal(str(fallback_cost)) * shortfall
         return cost, allocations, shortfall
@@ -1321,9 +1212,15 @@ class ServiceOrderService:
                         id=tr.id,
                         code=f"{order.code}-{tr.code}",
                         status=tr.status,
+                        warehouse_id=tr.warehouse_id,
+                        preparation_started_at=tr.preparation_started_at,
+                        picked_up_at=tr.picked_up_at,
+                        pickup_photo_url=tr.pickup_photo_url,
+                        stock_deducted=tr.stock_deducted,
+                        completed_at=tr.completed_at,
+                        fulfilled_at=tr.fulfilled_at,
                         created_at=tr.created_at,
                         subtotal=None,
-                        fulfilled_at=tr.fulfilled_at,
                         fulfilled_by_user_id=tr.fulfilled_by_user_id,
                         lines=[
                             TransferLineRead(
@@ -1365,10 +1262,12 @@ class ServiceOrderService:
         all_lines = [line for tr in transfers for line in tr.lines]
 
         labor_subtotal = (
-            sum(float(t.hours_snapshot) for t in tasks if t.payer == ServiceOrderPayer.CLIENTE) * hourly_rate
+            sum(float(t.hours_snapshot) for t in tasks if t.payer == ServiceOrderPayer.CLIENTE)
+            * hourly_rate
         )
         non_client_labor = (
-            sum(float(t.hours_snapshot) for t in tasks if t.payer != ServiceOrderPayer.CLIENTE) * hourly_rate
+            sum(float(t.hours_snapshot) for t in tasks if t.payer != ServiceOrderPayer.CLIENTE)
+            * hourly_rate
         )
         parts_subtotal = sum(
             float(line.line_total) for line in all_lines if line.payer == ServiceOrderPayer.CLIENTE
@@ -1384,12 +1283,14 @@ class ServiceOrderService:
         for payer in ServiceOrderPayer:
             labor = sum(float(t.hours_snapshot) for t in tasks if t.payer == payer) * hourly_rate
             parts = sum(float(line.line_total) for line in all_lines if line.payer == payer)
-            payer_breakdown.append({
-                "payer": payer,
-                "labor_subtotal": labor,
-                "parts_subtotal": parts,
-                "subtotal": labor + parts,
-            })
+            payer_breakdown.append(
+                {
+                    "payer": payer,
+                    "labor_subtotal": labor,
+                    "parts_subtotal": parts,
+                    "subtotal": labor + parts,
+                }
+            )
 
         return OrderSummary(
             payer_breakdown=payer_breakdown,
@@ -1426,6 +1327,13 @@ class ServiceOrderService:
                         for line in tr.lines
                     ],
                     subtotal=sum(float(line.line_total) for line in tr.lines),
+                    warehouse_id=tr.warehouse_id,
+                    preparation_started_at=tr.preparation_started_at,
+                    picked_up_at=tr.picked_up_at,
+                    pickup_photo_url=tr.pickup_photo_url,
+                    stock_deducted=tr.stock_deducted,
+                    completed_at=tr.completed_at,
+                    fulfilled_at=tr.fulfilled_at,
                     created_at=tr.created_at,
                 )
                 for tr in transfers
@@ -1447,11 +1355,15 @@ class ServiceOrderService:
         return upsell
 
     async def _hourly_rate(self, filial_id: uuid.UUID) -> float:
-        result = await self.db.execute(select(LaborSettings).where(LaborSettings.filial_id == filial_id))
+        result = await self.db.execute(
+            select(LaborSettings).where(LaborSettings.filial_id == filial_id)
+        )
         settings = result.scalar_one_or_none()
         return float(settings.hourly_rate) if settings else 25.0
 
-    def _upsell_to_read(self, upsell: Upsell, hourly_rate: float, discount_label: str) -> UpsellRead:
+    def _upsell_to_read(
+        self, upsell: Upsell, hourly_rate: float, discount_label: str
+    ) -> UpsellRead:
         multiplier = float(PARTS_MULTIPLIERS[discount_label])
         labor_cost = sum(float(t.hours_snapshot) for t in upsell.tasks) * hourly_rate
         parts = [
@@ -1515,7 +1427,10 @@ class ServiceOrderService:
         )
         rows = result.all()
         hourly_rate = await self._hourly_rate(filial_id)
-        return [self._upsell_to_read(upsell, hourly_rate, discount_label) for upsell, discount_label in rows]
+        return [
+            self._upsell_to_read(upsell, hourly_rate, discount_label)
+            for upsell, discount_label in rows
+        ]
 
     async def get_upsell(self, upsell_id: uuid.UUID) -> UpsellRead:
         upsell = await self._get_upsell_model(upsell_id)
@@ -1531,7 +1446,12 @@ class ServiceOrderService:
         advisor sees on a new ODS. Excludes the current order since its own
         (same-visit, still-open) upsells already have their own UI."""
         query = (
-            select(Upsell, ServiceOrder.discount_label, ServiceOrder.sequence_number, ServiceOrder.filial_id)
+            select(
+                Upsell,
+                ServiceOrder.discount_label,
+                ServiceOrder.sequence_number,
+                ServiceOrder.filial_id,
+            )
             .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
             .where(
                 ServiceOrder.vehicle_id == vehicle_id,
@@ -1620,7 +1540,10 @@ class ServiceOrderService:
         return await self.get_upsell(upsell.id)
 
     async def decide_upsell(
-        self, upsell_id: uuid.UUID, payload: UpsellDecisionInput, decided_by_user_id: uuid.UUID | None
+        self,
+        upsell_id: uuid.UUID,
+        payload: UpsellDecisionInput,
+        decided_by_user_id: uuid.UUID | None,
     ) -> UpsellRead:
         upsell = await self._get_upsell_model(upsell_id)
         if upsell.status not in (UpsellStatus.PENDIENTE, UpsellStatus.POSPUESTO):
@@ -1649,7 +1572,9 @@ class ServiceOrderService:
                     error_code="upsell_vehicle_mismatch",
                 )
             for task in upsell.tasks:
-                await self.add_task(target_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE)
+                await self.add_task(
+                    target_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE
+                )
             for part in upsell.parts:
                 await self.add_transfer_line(
                     target_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE
@@ -1674,7 +1599,9 @@ class ServiceOrderService:
     # supplier-assumed defective part, or a manufacturer campaign/recall.
     # Creating a claim never touches an existing order; converting one does.
 
-    async def _warranty_claim_to_read(self, claim: WarrantyClaim, vehicle: Vehicle) -> WarrantyClaimRead:
+    async def _warranty_claim_to_read(
+        self, claim: WarrantyClaim, vehicle: Vehicle
+    ) -> WarrantyClaimRead:
         tempario_name = None
         if claim.tempario_id is not None:
             tempario = await self.db.get(Tempario, claim.tempario_id)
@@ -1715,20 +1642,18 @@ class ServiceOrderService:
                             select(ServiceOrderTransferLotAllocation.id)
                             .join(
                                 ServiceOrderTransferLine,
-                                ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
+                                ServiceOrderTransferLine.id
+                                == ServiceOrderTransferLotAllocation.transfer_line_id,
                             )
                             .join(
-                                ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id
+                                ServiceOrderTransfer,
+                                ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
                             )
                             .where(
                                 ServiceOrderTransfer.service_order_id == claim.service_order_id,
                                 ServiceOrderTransferLine.part_id == claim.part_id,
-                                # PEDIDO or COMPLETADO — both mean it was actually
-                                # dispatched; COMPLETADO is just a later confirmation
-                                # of the same allocation, not a different one.
-                                ServiceOrderTransfer.status.in_(
-                                    [TransferStatus.PEDIDO, TransferStatus.COMPLETADO]
-                                ),
+                                # Only physical dispatch can establish a supplier claim.
+                                ServiceOrderTransfer.stock_deducted.is_(True),
                             )
                             .limit(1)
                         )
@@ -1801,16 +1726,20 @@ class ServiceOrderService:
                 .join(PartLot, PartLot.id == ServiceOrderTransferLotAllocation.lot_id)
                 .join(
                     ServiceOrderTransferLine,
-                    ServiceOrderTransferLine.id == ServiceOrderTransferLotAllocation.transfer_line_id,
+                    ServiceOrderTransferLine.id
+                    == ServiceOrderTransferLotAllocation.transfer_line_id,
                 )
-                .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                .join(
+                    ServiceOrderTransfer,
+                    ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                )
                 .where(
                     ServiceOrderTransfer.service_order_id == order.id,
                     ServiceOrderTransferLine.part_id == claim.part_id,
                     # PEDIDO or COMPLETADO — both mean it was actually
                     # dispatched; COMPLETADO is just a later confirmation of
                     # the same allocation, not a different one.
-                    ServiceOrderTransfer.status.in_([TransferStatus.PEDIDO, TransferStatus.COMPLETADO]),
+                    ServiceOrderTransfer.stock_deducted.is_(True),
                 )
             )
         ).all()
@@ -1858,7 +1787,9 @@ class ServiceOrderService:
 
     async def _next_claim_sequence_number(self, filial_id: uuid.UUID) -> int:
         result = await self.db.execute(
-            select(func.max(WarrantyClaim.sequence_number)).where(WarrantyClaim.filial_id == filial_id)
+            select(func.max(WarrantyClaim.sequence_number)).where(
+                WarrantyClaim.filial_id == filial_id
+            )
         )
         current_max = result.scalar()
         return (current_max or 100) + 1
@@ -1880,7 +1811,9 @@ class ServiceOrderService:
             select(WarrantyClaim)
             .where(
                 WarrantyClaim.vehicle_id == vehicle_id,
-                WarrantyClaim.status.in_([WarrantyClaimStatus.SOLICITADO, WarrantyClaimStatus.AUTORIZADO]),
+                WarrantyClaim.status.in_(
+                    [WarrantyClaimStatus.SOLICITADO, WarrantyClaimStatus.AUTORIZADO]
+                ),
                 *conditions,
             )
             .order_by(WarrantyClaim.created_at.desc())
@@ -1919,15 +1852,23 @@ class ServiceOrderService:
         if vehicle.vin:
             post_ventas = PostVentasService(self.db)
             try:
-                factory_warranty = await post_ventas.get_vehicle_warranty_by_vin(filial_id, vehicle.vin)
+                factory_warranty = await post_ventas.get_vehicle_warranty_by_vin(
+                    filial_id, vehicle.vin
+                )
             except VehicleWarrantyNotFoundError:
                 factory_warranty = None
-            workshop_warranties = await post_ventas.list_workshop_warranties_by_vin(filial_id, vehicle.vin)
+            workshop_warranties = await post_ventas.list_workshop_warranties_by_vin(
+                filial_id, vehicle.vin
+            )
             if service_order_id is not None:
-                workshop_warranties = [w for w in workshop_warranties if w.service_order_id == service_order_id]
+                workshop_warranties = [
+                    w for w in workshop_warranties if w.service_order_id == service_order_id
+                ]
 
         duplicate = await self._check_duplicate_open_claim(vehicle_id, tempario_id, part_id)
-        duplicate_read = await self._warranty_claim_to_read(duplicate, vehicle) if duplicate else None
+        duplicate_read = (
+            await self._warranty_claim_to_read(duplicate, vehicle) if duplicate else None
+        )
 
         return WarrantyClaimContext(
             current_mileage=current_mileage,
@@ -1968,7 +1909,10 @@ class ServiceOrderService:
                 line = (
                     await self.db.execute(
                         select(ServiceOrderTransferLine)
-                        .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                        .join(
+                            ServiceOrderTransfer,
+                            ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                        )
                         .where(
                             ServiceOrderTransfer.service_order_id == payload.service_order_id,
                             ServiceOrderTransferLine.part_id == payload.part_id,
@@ -1981,7 +1925,9 @@ class ServiceOrderService:
         from app.modules.clients.service import ClientService
 
         current_mileage = await ClientService(self.db).get_current_mileage(payload.vehicle_id)
-        mileage_inconsistent = current_mileage is not None and payload.reported_mileage < current_mileage
+        mileage_inconsistent = (
+            current_mileage is not None and payload.reported_mileage < current_mileage
+        )
 
         sequence_number = await self._next_claim_sequence_number(filial_id)
         claim = WarrantyClaim(
@@ -2010,7 +1956,10 @@ class ServiceOrderService:
         return await self._warranty_claim_to_read(claim, vehicle)
 
     async def authorize_warranty_claim(
-        self, claim_id: uuid.UUID, payload: WarrantyClaimAuthorizationInput, authorized_by_user_id: uuid.UUID | None
+        self,
+        claim_id: uuid.UUID,
+        payload: WarrantyClaimAuthorizationInput,
+        authorized_by_user_id: uuid.UUID | None,
     ) -> WarrantyClaimRead:
         claim = await self.db.get(WarrantyClaim, claim_id)
         if claim is None:
@@ -2060,7 +2009,10 @@ class ServiceOrderService:
         return await self._warranty_claim_to_read(claim, vehicle)
 
     async def convert_warranty_claim_to_order(
-        self, claim_id: uuid.UUID, payload: WarrantyClaimConvertInput, converted_by_user_id: uuid.UUID | None
+        self,
+        claim_id: uuid.UUID,
+        payload: WarrantyClaimConvertInput,
+        converted_by_user_id: uuid.UUID | None,
     ) -> WarrantyClaimRead:
         claim = await self.db.get(WarrantyClaim, claim_id)
         if claim is None:
@@ -2071,7 +2023,9 @@ class ServiceOrderService:
             raise WarrantyClaimNotAuthorizedError()
 
         vehicle = await self._get_vehicle_with_client(claim.vehicle_id)
-        original_order = await self.get_order(claim.service_order_id) if claim.service_order_id else None
+        original_order = (
+            await self.get_order(claim.service_order_id) if claim.service_order_id else None
+        )
 
         payer_by_type = {
             WarrantyClaimType.FABRICA: ServiceOrderPayer.GARANTIA_FABRICA,
@@ -2084,7 +2038,9 @@ class ServiceOrderService:
         next_seq = await self._next_sequence_number(claim.filial_id)
         intake_mileage = payload.intake_mileage
         if intake_mileage is None:
-            intake_mileage = original_order.intake_mileage if original_order else claim.reported_mileage
+            intake_mileage = (
+                original_order.intake_mileage if original_order else claim.reported_mileage
+            )
         cause_label = claim.failure_cause or claim.reported_symptom or claim.claim_type.value
         retrabajo_type = (
             await self.db.execute(
@@ -2120,7 +2076,11 @@ class ServiceOrderService:
         claim.converted_at = datetime.now(UTC)
         claim.status = WarrantyClaimStatus.CONVERTIDO_A_ODS
 
-        if claim.claim_type == WarrantyClaimType.REPUESTO_PROVEEDOR and claim.part_id is not None and original_order is not None:
+        if (
+            claim.claim_type == WarrantyClaimType.REPUESTO_PROVEEDOR
+            and claim.part_id is not None
+            and original_order is not None
+        ):
             await self._auto_claim_defective_part(original_order, claim)
 
         await self.db.commit()
@@ -2156,7 +2116,9 @@ class ServiceOrderService:
         vehicles: dict[uuid.UUID, Vehicle] = {}
         if vehicle_ids:
             result = await self.db.execute(
-                select(Vehicle).options(selectinload(Vehicle.client)).where(Vehicle.id.in_(vehicle_ids))
+                select(Vehicle)
+                .options(selectinload(Vehicle.client))
+                .where(Vehicle.id.in_(vehicle_ids))
             )
             vehicles = {v.id: v for v in result.scalars()}
         return [await self._warranty_claim_to_read(c, vehicles[c.vehicle_id]) for c in claims]
@@ -2168,7 +2130,10 @@ class ServiceOrderService:
         instead of guessing a quantity of 1."""
         result = await self.db.execute(
             select(ServiceOrderTransferLine)
-            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+            .join(
+                ServiceOrderTransfer,
+                ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+            )
             .where(
                 ServiceOrderTransfer.service_order_id == order_id,
                 ServiceOrderTransferLine.part_id == part_id,

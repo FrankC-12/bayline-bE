@@ -275,6 +275,14 @@ class ServiceOrderTransfer(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=True, index=True)
+    stock_deducted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    preparation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    preparation_started_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    picked_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pickup_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    picked_up_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    backorder_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     lines: Mapped[list["ServiceOrderTransferLine"]] = relationship(
@@ -300,6 +308,7 @@ class ServiceOrderTransferLine(Base):
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    shortfall_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     unit_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
     cost_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
     line_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)

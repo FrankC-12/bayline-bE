@@ -113,7 +113,7 @@ async def test_dispatched_odt_movement_is_included(env):
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
-        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO,
+        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO, stock_deducted=True,
         fulfilled_at=datetime.now(UTC),
     )
     session.add(transfer)
@@ -192,7 +192,7 @@ async def test_movements_from_both_sources_are_merged_newest_first(env):
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
-        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO,
+        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO, stock_deducted=True,
         fulfilled_at=datetime.now(UTC),
     )
     session.add(transfer)

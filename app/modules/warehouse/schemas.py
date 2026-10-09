@@ -14,6 +14,7 @@ class WarehouseCreate(BaseModel):
 class WarehouseUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=80)
     is_active: bool | None = None
+    is_workshop_default: bool | None = None
 
 
 class WarehouseRead(BaseModel):
@@ -23,6 +24,7 @@ class WarehouseRead(BaseModel):
     filial_id: uuid.UUID
     name: str
     is_active: bool
+    is_workshop_default: bool = False
     created_at: datetime
 
 
@@ -106,11 +108,14 @@ class ServiceOrderPartRequestLineWarehouse(BaseModel):
 
 
 class ServiceOrderPartRequestLineRead(BaseModel):
+    id: uuid.UUID
     part_id: uuid.UUID
     part_code: str
     part_name: str
     quantity: int
     warehouses: list[ServiceOrderPartRequestLineWarehouse]
+    shortfall_quantity: int = 0
+    transfer_quantity: int = 0
 
 
 class ServiceOrderPartRequestRead(BaseModel):
@@ -128,6 +133,15 @@ class ServiceOrderPartRequestRead(BaseModel):
     fulfilled_at: datetime | None
     completed_at: datetime | None
     warehouse_seen: bool
+    warehouse_id: uuid.UUID | None = None
+    warehouse_name: str | None = None
+    advisor_name: str | None = None
+    preparation_started_at: datetime | None = None
+    picked_up_at: datetime | None = None
+    pickup_photo_url: str | None = None
+    backorder_notified_at: datetime | None = None
+    created_at: datetime | None = None
+    stage: str = "pendiente"
     lines: list[ServiceOrderPartRequestLineRead]
 
 

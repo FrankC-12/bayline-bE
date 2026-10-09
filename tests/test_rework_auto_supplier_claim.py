@@ -135,6 +135,7 @@ async def test_open_claim_has_no_auto_claim_info_yet(env):
     make_lot(session, filial_id, warehouse, part, quantity=10, purchase_request_id=request.id)
     transfer = await service.add_transfer_line(order.id, part.id, 2)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     claim = await service.create_warranty_claim(claim_payload(order, part), [], [], None)
 
@@ -182,6 +183,7 @@ async def test_converting_with_a_known_po_auto_creates_the_supplier_claim(env):
 
     transfer = await service.add_transfer_line(order.id, part.id, 2)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     claim = await service.create_warranty_claim(claim_payload(order, part), [], [], None)
     converter_id = uuid.uuid4()
@@ -215,6 +217,7 @@ async def test_converting_still_tags_the_new_line_as_proveedor_despite_the_manua
 
     transfer = await service.add_transfer_line(order.id, part.id, 2)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     claim = await service.create_warranty_claim(claim_payload(order, part), [], [], None)
     converted = await _authorize_and_convert(
@@ -234,6 +237,7 @@ async def test_converting_from_a_lot_without_a_po_generates_no_claim(env):
 
     transfer = await service.add_transfer_line(order.id, part.id, 1)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     claim = await service.create_warranty_claim(
         claim_payload(order, part, failure_cause="Falló temprano"), [], [], None
@@ -278,6 +282,7 @@ async def test_multi_lot_consumption_creates_one_claim_per_supplier(env):
 
     transfer = await service.add_transfer_line(order.id, part.id, 5)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     claim = await service.create_warranty_claim(
         claim_payload(order, part, failure_cause="Defecto de fábrica"), [], [], None
@@ -304,6 +309,7 @@ async def test_comeback_claim_type_never_triggers_a_supplier_claim(env):
 
     transfer = await service.add_transfer_line(order.id, part.id, 1)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     claim = await service.create_warranty_claim(
         claim_payload(order, part, claim_type=WarrantyClaimType.COMEBACK, failure_cause="Mal ajustado"), [], [], None

@@ -60,7 +60,7 @@ def _make_dispatched_transfer(session, part, vehicle, filial_id):
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
-        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO,
+        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO, stock_deducted=True,
         fulfilled_at=datetime.now(UTC),
     )
     session.add(transfer)

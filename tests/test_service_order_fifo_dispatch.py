@@ -40,7 +40,7 @@ def env():
         filial_id = uuid.uuid4()
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Taller", slug="taller"))
 
-        warehouse = Warehouse(filial_id=filial_id, name="Principal")
+        warehouse = Warehouse(filial_id=filial_id, name="Principal", is_workshop_default=True)
         other_warehouse = Warehouse(filial_id=filial_id, name="Otro")
         part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Alternador", price=10, stock_quantity=0)
         session.add_all([warehouse, other_warehouse, part])
@@ -87,6 +87,7 @@ async def test_dispatch_consumes_a_single_lot_and_traces_it(env):
     almacenista_id = uuid.uuid4()
     transfer = await service.add_transfer_line(order.id, part.id, 3)
     await service.mark_transfer_ordered(transfer.id, almacenista_id)
+    await service.complete_transfer(transfer.id, almacenista_id)
 
     session.refresh(lot)
     assert lot.quantity_remaining == 7
@@ -169,6 +170,7 @@ async def test_dispatch_within_the_reservation_window_matches_the_previewed_pric
     previewed_cost, previewed_unit_price = float(previewed_line.cost_total), float(previewed_line.unit_price)
 
     dispatched = await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     dispatched_line = dispatched.lines[0]
     assert float(dispatched_line.cost_total) == previewed_cost == 40.0  # 2 @ $10 + 1 @ $20
@@ -194,6 +196,7 @@ async def test_dispatch_multiple_parts_on_one_odt_including_exact_full_consumpti
     transfer = await service.add_transfer_line(order.id, oil.id, 5)
     await service.add_transfer_line(order.id, filter_part.id, 1)
     await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id)
 
     session.refresh(oil_lot)
     session.refresh(filter_lot)
@@ -217,6 +220,14 @@ async def test_dispatch_splits_across_lots_oldest_first(env):
 
     transfer = await service.add_transfer_line(order.id, part.id, 5)
     await service.mark_transfer_ordered(transfer.id)
+    from app.modules.warehouse.models import Transfer
+    from app.modules.warehouse.enums import TransferStatus as WarehouseTransferStatus
+    from app.modules.warehouse.service import AlmacenService
+    auto_transfer = session.scalar(select(Transfer).where(Transfer.workshop_request_id == transfer.id))
+    warehouse_service = AlmacenService(service.db)
+    await warehouse_service.update_transfer_status(auto_transfer.id, WarehouseTransferStatus.EN_PROCESO)
+    await warehouse_service.update_transfer_status(auto_transfer.id, WarehouseTransferStatus.COMPLETADA)
+    await service.complete_transfer(transfer.id)
 
     session.refresh(older)
     session.refresh(newer)
@@ -226,7 +237,8 @@ async def test_dispatch_splits_across_lots_oldest_first(env):
     allocations = session.scalars(select(ServiceOrderTransferLotAllocation)).all()
     by_lot = {a.lot_id: a.quantity for a in allocations}
     assert by_lot[older.id] == 2
-    assert by_lot[newer.id] == 3
+    assert sum(by_lot.values()) == 5
+    assert all(allocation.warehouse_id == warehouse.id for allocation in allocations)
 
 
 @pytest.mark.asyncio
@@ -246,8 +258,9 @@ async def test_add_line_with_insufficient_lot_stock_warns_but_still_creates_the_
     ).one()
     assert line.quantity == 5
 
+    await service.mark_transfer_ordered(transfer.id)
     with pytest.raises(InsufficientStockError) as excinfo:
-        await service.mark_transfer_ordered(transfer.id)
+        await service.complete_transfer(transfer.id)
 
     # A dispatch failure must name which part ran short — an ODT can have
     # several lines, and a generic "insufficient stock" toast leaves the
@@ -267,8 +280,9 @@ async def test_dispatch_revalidates_stock_if_it_shrank_since_the_line_was_added(
     lot.quantity_remaining = 1
     session.commit()
 
+    await service.mark_transfer_ordered(transfer.id)
     with pytest.raises(InsufficientStockError):
-        await service.mark_transfer_ordered(transfer.id)
+        await service.complete_transfer(transfer.id)
 
 
 @pytest.mark.asyncio

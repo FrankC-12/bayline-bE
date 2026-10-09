@@ -249,6 +249,11 @@ class TransferRead(BaseModel):
     status: TransferStatus
     lines: list[TransferLineRead]
     subtotal: float | None
+    warehouse_id: uuid.UUID | None = None
+    preparation_started_at: datetime | None = None
+    picked_up_at: datetime | None = None
+    pickup_photo_url: str | None = None
+    stock_deducted: bool = False
     fulfilled_by_user_id: uuid.UUID | None = None
     fulfilled_at: datetime | None = None
     completed_by_user_id: uuid.UUID | None = None
