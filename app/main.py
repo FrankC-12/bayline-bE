@@ -21,6 +21,7 @@ from app.modules.roles.router import router as roles_router
 from app.modules.users.router import router as users_router
 from app.modules.clients.router import router as clients_router
 from app.modules.service_orders.router import router as service_orders_router
+from app.modules.detailed_inspections.router import router as detailed_inspections_router
 from app.modules.inspections.router import router as inspections_router
 from app.modules.parts.router import router as parts_router
 from app.modules.post_ventas.router import router as post_ventas_router
@@ -93,6 +94,7 @@ app.include_router(users_router, prefix=settings.api_v1_prefix)
 app.include_router(clients_router, prefix=settings.api_v1_prefix)
 app.include_router(service_orders_router, prefix=settings.api_v1_prefix)
 app.include_router(inspections_router, prefix=settings.api_v1_prefix)
+app.include_router(detailed_inspections_router, prefix=settings.api_v1_prefix)
 app.include_router(parts_router, prefix=settings.api_v1_prefix)
 app.include_router(post_ventas_router, prefix=settings.api_v1_prefix)
 app.include_router(ajustes_router, prefix=settings.api_v1_prefix)

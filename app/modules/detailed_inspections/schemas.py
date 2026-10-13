@@ -1,0 +1,107 @@
+import uuid
+from datetime import datetime
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Condition(StrEnum):
+    GOOD = "bien"
+    FAIR = "regular"
+    DEFECTIVE = "defectuoso"
+
+
+class BrakeCondition(StrEnum):
+    NOT_APPLICABLE = "no_aplica"
+    GOOD = "bien"
+    FAIR = "regular"
+    DEFECTIVE = "defectuoso"
+
+
+class BatteryStatus(StrEnum):
+    CHARGED = "cargada"
+    DISCHARGED = "descargada"
+
+
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class Engine(StrictModel):
+    leaks: Condition | None = None
+    accessory_belt: Condition | None = None
+    air_filter: Condition | None = None
+    battery: BatteryStatus | None = None
+    battery_voltage: float | None = Field(
+        None, ge=0, allow_inf_nan=False, description="Voltios (V)"
+    )
+
+
+class Underbody(StrictModel):
+    steering_box: Condition | None = None
+    tie_rod_ends: Condition | None = None
+    dust_boots: Condition | None = None
+    pipes: Condition | None = None
+    leaks: Condition | None = None
+    exhaust_pipe: Condition | None = None
+    suspension: Condition | None = None
+    tripod_joints: Condition | None = None
+
+
+class Tire(StrictModel):
+    tread_depth: float | None = Field(
+        None, ge=0, allow_inf_nan=False, description="Profundidad (mm)"
+    )
+    pressure: float | None = Field(None, ge=0, allow_inf_nan=False, description="Presión (psi)")
+
+
+class Tires(StrictModel):
+    front_left: Tire = Field(default_factory=Tire)
+    front_right: Tire = Field(default_factory=Tire)
+    rear_left: Tire = Field(default_factory=Tire)
+    rear_right: Tire = Field(default_factory=Tire)
+    spare: Tire = Field(default_factory=Tire)
+
+
+class Brakes(StrictModel):
+    front_pads: BrakeCondition | None = None
+    front_shoes: BrakeCondition | None = None
+    rear_pads: BrakeCondition | None = None
+    rear_shoes: BrakeCondition | None = None
+
+
+class InspectionData(StrictModel):
+    engine: Engine = Field(default_factory=Engine)
+    underbody: Underbody = Field(default_factory=Underbody)
+    tires: Tires = Field(default_factory=Tires)
+    brakes: Brakes = Field(default_factory=Brakes)
+    observations: str | None = Field(None, max_length=5000)
+
+
+class AnnexRead(BaseModel):
+    id: uuid.UUID
+    filename: str
+    url: str
+    uploaded_at: datetime
+    uploaded_by_user_id: uuid.UUID
+
+
+class DetailedInspectionRead(BaseModel):
+    id: uuid.UUID
+    service_order_id: uuid.UUID
+    vehicle_id: uuid.UUID
+    plate: str | None
+    vehicle_label: str
+    status: str
+    data: InspectionData
+    sections_complete: dict[str, bool]
+    completed_steps: int
+    total_steps: int = 5
+    missing_fields: list[str]
+    annexes: list[AnnexRead]
+    created_by_user_id: uuid.UUID
+    updated_by_user_id: uuid.UUID
+    completed_by_user_id: uuid.UUID | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime

@@ -37,3 +37,5 @@ from app.modules.compras.models import (  # noqa: F401
     VehiclePurchaseOrderReception,
     VehiclePurchaseOrderInvoice,
 )
+
+from app.modules.detailed_inspections.models import DetailedInspection  # noqa: F401
