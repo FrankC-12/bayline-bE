@@ -27,7 +27,12 @@ from app.modules.administracion.exceptions import (
     PurchaseRequestRequiresSupplierCounterpartyError,
     PurchaseRequestSupplierMismatchError,
 )
-from app.modules.administracion.models import Account, PurchaseRequest, PurchaseRequestLine, Supplier
+from app.modules.administracion.models import (
+    Account,
+    PurchaseRequest,
+    PurchaseRequestLine,
+    Supplier,
+)
 from app.modules.administracion.schemas import ExpenseEntryCreate
 from app.modules.administracion.service import AdministracionService
 from app.modules.filiales.models import Filial
@@ -41,19 +46,32 @@ def env():
     with Session(engine, expire_on_commit=False, autoflush=False) as session:
         filial_id = uuid.uuid4()
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Taller", slug="taller"))
-        account = Account(filial_id=filial_id, name="Caja USD", currency=AccountCurrency.USD, account_type=AccountType.CAJA)
+        account = Account(
+            filial_id=filial_id,
+            name="Caja USD",
+            currency=AccountCurrency.USD,
+            account_type=AccountType.CAJA,
+        )
         supplier = Supplier(
-            filial_id=filial_id, business_name="Mitsubishi Vzla", rif="J-11111111-1",
-            supplier_type=SupplierType.IMPORTADOR, status=SupplierStatus.ACTIVO,
+            filial_id=filial_id,
+            business_name="Mitsubishi Vzla",
+            rif="J-11111111-1",
+            supplier_type=SupplierType.IMPORTADOR,
+            status=SupplierStatus.ACTIVO,
         )
         other_supplier = Supplier(
-            filial_id=filial_id, business_name="Otro Proveedor", rif="J-22222222-2",
-            supplier_type=SupplierType.NACIONAL, status=SupplierStatus.ACTIVO,
+            filial_id=filial_id,
+            business_name="Otro Proveedor",
+            rif="J-22222222-2",
+            supplier_type=SupplierType.NACIONAL,
+            status=SupplierStatus.ACTIVO,
         )
         session.add_all([account, supplier, other_supplier])
         session.commit()
 
-        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro", price=10)
+        part = Part(
+            category_id=uuid.uuid4(), filial_id=filial_id, code="P-1", name="Filtro", price=10
+        )
         session.add(part)
         session.commit()
 
@@ -61,15 +79,23 @@ def env():
         yield AdministracionService(db), session, filial_id, account, supplier, other_supplier, part
 
 
-def _make_request(session, filial_id, supplier_id, part_id, sequence_number, *, quantity=1, unit_cost=120):
+def _make_request(
+    session, filial_id, supplier_id, part_id, sequence_number, *, quantity=1, unit_cost=90
+):
     request = PurchaseRequest(
-        filial_id=filial_id, sequence_number=sequence_number, supplier_id=supplier_id,
+        filial_id=filial_id,
+        sequence_number=sequence_number,
+        supplier_id=supplier_id,
         status=PurchaseRequestStatus.CONCILIADA,
+        invoice_number=f"INV-{sequence_number}",
+        invoice_total=quantity * unit_cost,
     )
     session.add(request)
     session.commit()
     session.add(
-        PurchaseRequestLine(purchase_request_id=request.id, part_id=part_id, quantity=quantity, unit_cost=unit_cost)
+        PurchaseRequestLine(
+            purchase_request_id=request.id, part_id=part_id, quantity=quantity, unit_cost=unit_cost
+        )
     )
     session.commit()
     return request
@@ -96,7 +122,9 @@ def _expense_payload(filial_id, account_id, supplier_id, purchase_request_ids, *
 @pytest.mark.asyncio
 async def test_conciliada_request_appears_as_a_payable(env):
     service, session, filial_id, _account, supplier, _other, part = env
-    request = _make_request(session, filial_id, supplier.id, part.id, sequence_number=1001, quantity=1, unit_cost=120)
+    request = _make_request(
+        session, filial_id, supplier.id, part.id, sequence_number=1001, quantity=1, unit_cost=120
+    )
 
     payables = await service.list_payables(filial_id)
 
@@ -152,8 +180,13 @@ async def test_linking_requires_a_supplier_counterparty(env):
     request = _make_request(session, filial_id, supplier.id, part.id, sequence_number=1004)
 
     payload = _expense_payload(
-        filial_id, account.id, supplier.id, [request.id],
-        counterparty_type=CounterpartyType.TERCERO, counterparty_supplier_id=None, counterparty_name="Alguien",
+        filial_id,
+        account.id,
+        supplier.id,
+        [request.id],
+        counterparty_type=CounterpartyType.TERCERO,
+        counterparty_supplier_id=None,
+        counterparty_name="Alguien",
     )
     with pytest.raises(PurchaseRequestRequiresSupplierCounterpartyError):
         await service.create_expense(payload, None, uuid.uuid4())
@@ -177,10 +210,16 @@ async def test_linked_expense_still_excluded_from_operating_expenses(env):
 @pytest.mark.asyncio
 async def test_multiple_purchase_orders_can_be_paid_in_one_expense(env):
     service, session, filial_id, account, supplier, _other, part = env
-    request_a = _make_request(session, filial_id, supplier.id, part.id, sequence_number=1006, unit_cost=40)
-    request_b = _make_request(session, filial_id, supplier.id, part.id, sequence_number=1007, unit_cost=45)
+    request_a = _make_request(
+        session, filial_id, supplier.id, part.id, sequence_number=1006, unit_cost=40
+    )
+    request_b = _make_request(
+        session, filial_id, supplier.id, part.id, sequence_number=1007, unit_cost=45
+    )
 
-    payload = _expense_payload(filial_id, account.id, supplier.id, [request_a.id, request_b.id], amount=85)
+    payload = _expense_payload(
+        filial_id, account.id, supplier.id, [request_a.id, request_b.id], amount=85
+    )
     await service.create_expense(payload, None, uuid.uuid4())
 
     assert await service.list_payables(filial_id) == []
@@ -188,3 +227,19 @@ async def test_multiple_purchase_orders_can_be_paid_in_one_expense(env):
     session.refresh(request_b)
     assert request_a.paid_at is not None
     assert request_b.paid_at is not None
+
+
+@pytest.mark.asyncio
+async def test_legacy_without_invoice_cannot_be_paid(env):
+    from app.core.exceptions import ConflictError
+
+    service, session, filial_id, account, supplier, _, part = env
+    request = _make_request(session, filial_id, supplier.id, part.id, sequence_number=1008)
+    request.invoice_number = None
+    request.invoice_total = None
+    session.commit()
+    with pytest.raises(ConflictError, match="Concilia"):
+        await service.create_expense(
+            _expense_payload(filial_id, account.id, supplier.id, [request.id]), None, None
+        )
+    assert request.paid_at is None

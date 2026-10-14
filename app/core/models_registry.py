@@ -39,3 +39,5 @@ from app.modules.compras.models import (  # noqa: F401
 )
 
 from app.modules.detailed_inspections.models import DetailedInspection  # noqa: F401
+
+from app.core.idempotency import OperationReceipt  # noqa: F401

@@ -8,6 +8,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -64,11 +65,16 @@ class ServiceOrderTypeCatalog(Base):
     is ondelete=RESTRICT) — `is_active` just hides it from the manual picker."""
 
     __tablename__ = "service_order_types"
-    __table_args__ = (UniqueConstraint("filial_id", "code", name="uq_service_order_types_filial_code"),)
+    __table_args__ = (
+        UniqueConstraint("filial_id", "code", name="uq_service_order_types_filial_code"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     code: Mapped[str] = mapped_column(String(60), nullable=False)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
@@ -89,6 +95,16 @@ class ServiceOrder(Base):
     """A work order (ODS) tracking a vehicle through the workshop."""
 
     __tablename__ = "service_orders"
+    __table_args__ = (
+        Index("ix_service_orders_filial_chronology", "filial_id", "created_at", "id"),
+        Index(
+            "ix_service_orders_technician_chronology",
+            "filial_id",
+            "technician_user_id",
+            "created_at",
+            "id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
@@ -157,6 +173,8 @@ class ServiceOrder(Base):
     # Labeled "Fecha de inicio de ODS" in the UI — a date + 30-minute time
     # slot (picked the same way as scheduled_at's "Hora" select), not just a date.
     promised_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    settings_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -194,7 +212,9 @@ class ServiceOrder(Base):
     completed_override_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
-    completed_override_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_override_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     @property
     def code(self) -> str:
@@ -236,15 +256,17 @@ class ServiceOrderTask(Base):
     # is the start of the currently-running segment (None while paused);
     # `timer_accumulated_seconds` is the sum of every previously-closed
     # segment. Live elapsed = accumulated + (now - timer_started_at) if running.
-    timer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    timer_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     timer_accumulated_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class ServiceOrderTransfer(Base):
     """An 'Orden de Transferencia' (ODT) — a batch of parts requested from the
-    warehouse for a service order. Stock is only decremented when marked as
-    'Pedido', not when a line is added, so it can still be adjusted freely."""
+    warehouse for a service order. Submission reserves stock; physical stock
+    is decremented only when warehouse staff completes dispatch."""
 
     __tablename__ = "service_order_transfers"
 
@@ -267,7 +289,9 @@ class ServiceOrderTransfer(Base):
     fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Whether almacén staff has acknowledged this dispatched request in the
     # "Órdenes de Transferencia" screen — drives the unseen-count badge there.
-    warehouse_seen: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    warehouse_seen: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Set when almacén marks the parts as physically handed over (status ->
     # COMPLETADO) — the counter running since fulfilled_at (Pedido) pauses
     # here instead of counting forever.
@@ -275,14 +299,29 @@ class ServiceOrderTransfer(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    warehouse_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=True, index=True)
-    stock_deducted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
-    preparation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    preparation_started_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    warehouse_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("warehouses.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    stock_deducted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    preparation_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    preparation_started_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     picked_up_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pickup_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    picked_up_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    backorder_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    picked_up_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    backorder_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     lines: Mapped[list["ServiceOrderTransferLine"]] = relationship(
@@ -308,7 +347,9 @@ class ServiceOrderTransferLine(Base):
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    shortfall_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    shortfall_quantity: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     unit_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False, default=0)
     cost_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
     line_total: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False, default=0)
@@ -347,7 +388,9 @@ class ServiceOrderTransferLotAllocation(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     transfer_line_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_order_transfer_lines.id", ondelete="CASCADE"), index=True
+        UUID(as_uuid=True),
+        ForeignKey("service_order_transfer_lines.id", ondelete="CASCADE"),
+        index=True,
     )
     lot_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("part_lots.id", ondelete="RESTRICT")
@@ -434,7 +477,9 @@ class Upsell(Base):
     # APROBADO/RECHAZADO and would otherwise erase the fact it was ever
     # postponed). This is what the "tasa de conversión de upsells
     # pospuestos" KPI groups by, independent of where it ends up.
-    was_postponed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    was_postponed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     postponed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     tasks: Mapped[list["UpsellTask"]] = relationship(cascade="all, delete-orphan", lazy="selectin")
@@ -512,7 +557,9 @@ class ServiceOrderInvoice(Base):
     # Only meaningful when billed_client_id differs from the vehicle's owner —
     # a simple record that the vehicle's actual owner signed off on the work,
     # not a real e-signature capture.
-    client_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    client_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     client_confirmed_note: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     # IVA/ISLR withheld by a contribuyente especial (typically an empresa
@@ -565,7 +612,10 @@ class WarrantyClaim(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     # Per-filial human-readable number — see the `code` property below.
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -573,13 +623,19 @@ class WarrantyClaim(Base):
         Enum(WarrantyClaimType, name="warranty_claim_type"), nullable=False
     )
     vehicle_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("vehicles.id", ondelete="RESTRICT"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("vehicles.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     # Mandatory (enforced in the schema, not the DB) when claim_type is
     # COMEBACK — the ODS that originated the complaint. Optional for the
     # other three types, which may be filed with no prior visit at all.
     service_order_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_orders.id", ondelete="RESTRICT"), nullable=True, index=True
+        UUID(as_uuid=True),
+        ForeignKey("service_orders.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
     )
     # Both optional and independent — a claim can point at a task, a part,
     # both, or neither (a vague "no arrancó" with no specific culprit yet).
@@ -595,7 +651,8 @@ class WarrantyClaim(Base):
     # automatic SupplierClaim when the part itself was at fault. Required to
     # authorize a COMEBACK/REPUESTO_PROVEEDOR claim, may be null until then.
     failure_category: Mapped[ReworkFailureCategory | None] = mapped_column(
-        Enum(ReworkFailureCategory, name="rework_failure_category", create_type=False), nullable=True
+        Enum(ReworkFailureCategory, name="rework_failure_category", create_type=False),
+        nullable=True,
     )
     # failure_cause is used for COMEBACK/REPUESTO_PROVEEDOR (shop-facing
     # cause taxonomy); reported_symptom is used for FABRICA/CAMPANA_RECALL
@@ -659,11 +716,15 @@ class ServiceOrderCollectionRequest(Base):
 
     request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     invoice_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_order_invoices.id", ondelete="RESTRICT"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("service_order_invoices.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     income_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("income_entries.id", ondelete="RESTRICT"), nullable=False,
+        UUID(as_uuid=True),
+        ForeignKey("income_entries.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     response: Mapped[dict] = mapped_column(JSON, nullable=False)

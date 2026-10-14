@@ -1,4 +1,8 @@
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.modules.service_orders.billing_schemas import ReceivableRead
 from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select
@@ -56,8 +60,8 @@ from app.modules.administracion.models import (
     PurchaseRequest,
     PurchaseRequestLine,
     Supplier,
-    SupplierPaymentAccount,
     SupplierClaim,
+    SupplierPaymentAccount,
     WarrantySubmission,
 )
 from app.modules.administracion.schemas import (
@@ -89,10 +93,7 @@ from app.modules.administracion.schemas import (
     WarrantySubmissionPayInput,
     WarrantySubmissionRead,
 )
-from app.modules.warehouse.enums import MovementType
-from app.modules.warehouse.models import StockMovement
-from app.modules.warehouse.schemas import LotLineInput
-from app.modules.warehouse.service import AlmacenService
+from app.modules.clients.models import Client
 from app.modules.concesionario.enums import VehicleCondition
 from app.modules.concesionario.models import DealershipVehicle, VehicleSale
 from app.modules.filiales.models import Filial
@@ -100,7 +101,6 @@ from app.modules.parts.enums import PartSaleStatus
 from app.modules.parts.models import Part, PartSale, PartSaleLine
 from app.modules.post_ventas.models import Tempario
 from app.modules.post_ventas.service import PostVentasService
-from app.modules.clients.models import Client
 from app.modules.service_orders.enums import TransferStatus, WarrantyClaimType
 from app.modules.service_orders.models import (
     ServiceOrder,
@@ -110,16 +110,33 @@ from app.modules.service_orders.models import (
     ServiceOrderTransferLotAllocation,
     WarrantyClaim,
 )
+from app.modules.warehouse.enums import MovementType
+from app.modules.warehouse.models import StockMovement
+from app.modules.warehouse.schemas import LotLineInput
+from app.modules.warehouse.service import AlmacenService
 
 # Spanish month abbreviations for the finance trend chart — not read from
 # calendar.month_abbr, which is locale-dependent and defaults to English.
 MONTH_ABBR_ES: dict[int, str] = {
-    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
-    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+    1: "Ene",
+    2: "Feb",
+    3: "Mar",
+    4: "Abr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Ago",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dic",
 }
 
 PURCHASE_TRANSITIONS: dict[PurchaseRequestStatus, set[PurchaseRequestStatus]] = {
-    PurchaseRequestStatus.ENVIADA: {PurchaseRequestStatus.COTIZADA, PurchaseRequestStatus.CANCELADA},
+    PurchaseRequestStatus.ENVIADA: {
+        PurchaseRequestStatus.COTIZADA,
+        PurchaseRequestStatus.CANCELADA,
+    },
     PurchaseRequestStatus.COTIZADA: {PurchaseRequestStatus.PAGADA, PurchaseRequestStatus.CANCELADA},
     PurchaseRequestStatus.PAGADA: {PurchaseRequestStatus.RECIBIDA, PurchaseRequestStatus.CANCELADA},
     PurchaseRequestStatus.RECIBIDA: {PurchaseRequestStatus.CONCILIADA},
@@ -133,6 +150,26 @@ def _request_to_read(request: PurchaseRequest) -> PurchaseRequestRead:
     if request.lines and all(line.unit_cost is not None for line in request.lines):
         total = sum(line.quantity * float(line.unit_cost) for line in request.lines)
     return PurchaseRequestRead(
+        invoice_number=request.invoice_number,
+        invoice_control_number=request.invoice_control_number,
+        invoice_date=request.invoice_date,
+        credit_days=request.credit_days,
+        due_date=request.due_date,
+        invoice_iva_percentage=(
+            float(request.invoice_iva_percentage)
+            if request.invoice_iva_percentage is not None
+            else None
+        ),
+        invoice_total=float(request.invoice_total) if request.invoice_total is not None else None,
+        paid_amount_usd=float(request.paid_amount_usd or 0),
+        balance_usd=(
+            max(
+                0, round(float(request.invoice_total or 0) - float(request.paid_amount_usd or 0), 2)
+            )
+            if request.invoice_total is not None
+            else None
+        ),
+        activity=list(request.activity or []),
         id=request.id,
         filial_id=request.filial_id,
         code=request.code,
@@ -140,11 +177,18 @@ def _request_to_read(request: PurchaseRequest) -> PurchaseRequestRead:
         status=request.status,
         lines=[
             PurchaseRequestLineRead(
+                received_quantity=line.received_quantity,
+                invoiced_unit_cost=(
+                    float(line.invoiced_unit_cost) if line.invoiced_unit_cost is not None else None
+                ),
+                receipts=list(line.receipts or []),
                 id=line.id,
                 part_id=line.part_id,
                 quantity=line.quantity,
                 unit_cost=float(line.unit_cost) if line.unit_cost is not None else None,
-                subtotal=line.quantity * float(line.unit_cost) if line.unit_cost is not None else None,
+                subtotal=(
+                    line.quantity * float(line.unit_cost) if line.unit_cost is not None else None
+                ),
             )
             for line in request.lines
         ],
@@ -157,12 +201,18 @@ def _request_to_read(request: PurchaseRequest) -> PurchaseRequestRead:
     )
 
 
-def _profitability_department_row(key: str, label: str, net_sales: float, direct_cost: float) -> ProfitabilityDepartmentRow:
+def _profitability_department_row(
+    key: str, label: str, net_sales: float, direct_cost: float
+) -> ProfitabilityDepartmentRow:
     gross_profit = net_sales - direct_cost
     margin = gross_profit / net_sales if net_sales else 0.0
     return ProfitabilityDepartmentRow(
-        key=key, label=label, net_sales=net_sales, direct_cost=direct_cost,
-        gross_profit=gross_profit, margin=margin,
+        key=key,
+        label=label,
+        net_sales=net_sales,
+        direct_cost=direct_cost,
+        gross_profit=gross_profit,
+        margin=margin,
     )
 
 
@@ -172,14 +222,18 @@ class AdministracionService:
 
     # Suppliers
 
-    async def list_suppliers(self, filial_id: uuid.UUID, search: str | None = None) -> list[Supplier]:
+    async def list_suppliers(
+        self, filial_id: uuid.UUID, search: str | None = None
+    ) -> list[Supplier]:
         result = await self.db.execute(
             select(Supplier).where(Supplier.filial_id == filial_id).order_by(Supplier.business_name)
         )
         suppliers = list(result.scalars().all())
         if search:
             term = search.lower()
-            suppliers = [s for s in suppliers if term in s.business_name.lower() or term in s.rif.lower()]
+            suppliers = [
+                s for s in suppliers if term in s.business_name.lower() or term in s.rif.lower()
+            ]
         return suppliers
 
     async def get_supplier(self, supplier_id: uuid.UUID) -> Supplier:
@@ -205,7 +259,9 @@ class AdministracionService:
         )
         data = SupplierRead.model_validate(supplier).model_dump()
         data["payment_accounts"] = supplier.payment_accounts
-        data["purchase_history"] = [_request_to_read(item) for item in purchases_result.scalars().all()]
+        data["purchase_history"] = [
+            _request_to_read(item) for item in purchases_result.scalars().all()
+        ]
         return SupplierDetailRead.model_validate(data)
 
     async def create_supplier(self, payload: SupplierCreate) -> Supplier:
@@ -231,12 +287,16 @@ class AdministracionService:
 
     async def _next_request_sequence(self, filial_id: uuid.UUID) -> int:
         result = await self.db.execute(
-            select(func.max(PurchaseRequest.sequence_number)).where(PurchaseRequest.filial_id == filial_id)
+            select(func.max(PurchaseRequest.sequence_number)).where(
+                PurchaseRequest.filial_id == filial_id
+            )
         )
         current_max = result.scalar()
         return (current_max or 1000) + 1
 
-    async def list_requests(self, filial_id: uuid.UUID, search: str | None = None) -> list[PurchaseRequestRead]:
+    async def list_requests(
+        self, filial_id: uuid.UUID, search: str | None = None
+    ) -> list[PurchaseRequestRead]:
         result = await self.db.execute(
             select(PurchaseRequest)
             .options(selectinload(PurchaseRequest.lines))
@@ -262,9 +322,54 @@ class AdministracionService:
         return request
 
     async def get_request(self, request_id: uuid.UUID) -> PurchaseRequestRead:
-        return _request_to_read(await self._get_request_model(request_id))
+        request = await self._get_request_model(request_id)
+        read = _request_to_read(request)
+        from app.modules.post_ventas.models import LaborSettings
 
-    async def create_request(self, payload: PurchaseRequestCreate) -> PurchaseRequestRead:
+        settings = (
+            await self.db.execute(
+                select(LaborSettings).where(LaborSettings.filial_id == request.filial_id)
+            )
+        ).scalar_one_or_none()
+        read.default_iva_percentage = float(settings.iva_percentage) if settings else 16
+        supplier = await self.get_supplier(request.supplier_id)
+        read.supplier_name = (
+            supplier.business_name
+            if supplier.filial_id == request.filial_id
+            else "Proveedor no disponible"
+        )
+        parts = (
+            (
+                await self.db.execute(
+                    select(Part).where(Part.id.in_([line.part_id for line in request.lines]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {part.id: part for part in parts if part.filial_id == request.filial_id}
+        for line in read.lines:
+            part = by_id.get(line.part_id)
+            line.part_name = part.name if part else ""
+            line.part_code = part.code if part else ""
+        return read
+
+    async def create_request(
+        self, payload: PurchaseRequestCreate, user_id=None
+    ) -> PurchaseRequestRead:
+        from app.core.exceptions import BadRequestError
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(
+            select(Filial.id).where(Filial.id == payload.filial_id).with_for_update()
+        )
+        supplier = await self.get_supplier(payload.supplier_id)
+        if supplier.filial_id != payload.filial_id:
+            raise BadRequestError("El proveedor debe pertenecer a la filial de la compra.")
+        part_ids = [line.part_id for line in payload.lines]
+        if len(set(part_ids)) != len(part_ids):
+            raise BadRequestError("No repitas un repuesto en la misma compra.")
+        await AlmacenService(self.db).ensure_inventory_scope(payload.filial_id, [], part_ids)
         sequence_number = await self._next_request_sequence(payload.filial_id)
         request = PurchaseRequest(
             filial_id=payload.filial_id,
@@ -276,9 +381,17 @@ class AdministracionService:
 
         for line in payload.lines:
             self.db.add(
-                PurchaseRequestLine(purchase_request_id=request.id, part_id=line.part_id, quantity=line.quantity)
+                PurchaseRequestLine(
+                    purchase_request_id=request.id,
+                    part_id=line.part_id,
+                    quantity=line.quantity,
+                    unit_cost=line.unit_cost,
+                )
             )
 
+        from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+        await PurchaseWorkflow(self.db).activity(request, "created", user_id)
         await self.db.commit()
         return await self.get_request(request.id)
 
@@ -291,7 +404,14 @@ class AdministracionService:
         location: str | None = None,
         responsible_user_id: uuid.UUID | None = None,
     ) -> PurchaseRequestRead:
-        request = await self._get_request_model(request_id)
+        from app.core.exceptions import ConflictError
+        from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+        request = await PurchaseWorkflow(self.db).lock(request_id)
+        if new_status == PurchaseRequestStatus.CANCELADA and any(
+            line.received_quantity for line in request.lines
+        ):
+            raise ConflictError("Esta compra tiene mercancía recibida; registra una devolución.")
         if new_status != request.status:
             if new_status not in PURCHASE_TRANSITIONS.get(request.status, set()):
                 raise InvalidPurchaseStatusTransitionError(request.status.value, new_status.value)
@@ -312,12 +432,15 @@ class AdministracionService:
                 for line in request.lines:
                     if line.unit_cost is None:
                         raise QuoteRequiredError()
-                    await almacen._create_single_lot(
+                    remaining = line.quantity - line.received_quantity
+                    if remaining <= 0:
+                        continue
+                    lot = await almacen._create_single_lot(
                         request.filial_id,
                         warehouse_id,
                         LotLineInput(
                             part_id=line.part_id,
-                            quantity=line.quantity,
+                            quantity=remaining,
                             unit_cost=float(line.unit_cost),
                             purchase_request_id=request.id,
                             location=location,
@@ -325,12 +448,41 @@ class AdministracionService:
                         note=f"Compra {request.code}",
                         responsible_user_id=responsible_user_id,
                     )
+                    line.received_quantity += remaining
+                    if lot:
+                        await self.db.flush()
+                        line.receipts = [
+                            *(line.receipts or []),
+                            dict(
+                                lot_id=str(lot.id),
+                                lot_code=lot.code,
+                                quantity=remaining,
+                                location=location,
+                            ),
+                        ]
                 request.warehouse_id = warehouse_id
 
             if new_status == PurchaseRequestStatus.CONCILIADA:
                 request.conciliated_at = datetime.now(timezone.utc)
 
             request.status = new_status
+            await PurchaseWorkflow(self.db).activity(
+                request,
+                (
+                    "quoted"
+                    if new_status == PurchaseRequestStatus.COTIZADA
+                    else (
+                        "cancelled"
+                        if new_status == PurchaseRequestStatus.CANCELADA
+                        else (
+                            "received"
+                            if new_status == PurchaseRequestStatus.RECIBIDA
+                            else "legacy_status"
+                        )
+                    )
+                ),
+                responsible_user_id,
+            )
 
         await self.db.commit()
         return await self.get_request(request_id)
@@ -349,21 +501,25 @@ class AdministracionService:
                 PurchaseRequest.status == PurchaseRequestStatus.CONCILIADA,
                 PurchaseRequest.paid_at.is_(None),
             )
-            .order_by(PurchaseRequest.conciliated_at)
+            .order_by(PurchaseRequest.due_date.asc().nulls_last(), PurchaseRequest.conciliated_at)
         )
         requests = list(result.scalars().all())
         if not requests:
             return []
 
         supplier_ids = {r.supplier_id for r in requests}
-        suppliers_result = await self.db.execute(select(Supplier).where(Supplier.id.in_(supplier_ids)))
+        suppliers_result = await self.db.execute(
+            select(Supplier).where(Supplier.id.in_(supplier_ids))
+        )
         supplier_names = {s.id: s.business_name for s in suppliers_result.scalars().all()}
 
         today = venezuela_today()
         payables = []
         for request in requests:
             total = sum(
-                line.quantity * float(line.unit_cost) for line in request.lines if line.unit_cost is not None
+                line.quantity * float(line.unit_cost)
+                for line in request.lines
+                if line.unit_cost is not None
             )
             # Falls back to updated_at for a request conciliada before this
             # column existed (never backfilled — there's no way to know the
@@ -377,7 +533,23 @@ class AdministracionService:
                     filial_id=request.filial_id,
                     supplier_id=request.supplier_id,
                     supplier_name=supplier_names.get(request.supplier_id, "—"),
-                    total_amount=total,
+                    total_amount=(
+                        float(request.invoice_total) if request.invoice_total is not None else total
+                    ),
+                    balance_usd=max(
+                        0,
+                        round(
+                            float(
+                                request.invoice_total
+                                if request.invoice_total is not None
+                                else total
+                            )
+                            - float(request.paid_amount_usd or 0),
+                            2,
+                        ),
+                    ),
+                    invoice_number=request.invoice_number,
+                    due_date=request.due_date,
                     conciliated_at=anchor,
                     days_outstanding=days_outstanding,
                     aging_bucket=aging_bucket(days_outstanding),
@@ -387,7 +559,9 @@ class AdministracionService:
 
     # Supplier claims
 
-    async def list_claims(self, filial_id: uuid.UUID, search: str | None = None) -> list[SupplierClaim]:
+    async def list_claims(
+        self, filial_id: uuid.UUID, search: str | None = None
+    ) -> list[SupplierClaim]:
         result = await self.db.execute(
             select(SupplierClaim)
             .where(SupplierClaim.filial_id == filial_id)
@@ -420,7 +594,9 @@ class AdministracionService:
         await self._attach_client_name([claim])
         return claim
 
-    async def update_claim(self, claim_id: uuid.UUID, payload: SupplierClaimUpdate) -> SupplierClaim:
+    async def update_claim(
+        self, claim_id: uuid.UUID, payload: SupplierClaimUpdate
+    ) -> SupplierClaim:
         claim = await self.get_claim(claim_id)
         if payload.status == ClaimStatus.RESUELTO:
             raise ClaimMustBeResolvedThroughResolveEndpointError()
@@ -432,7 +608,10 @@ class AdministracionService:
         return claim
 
     async def resolve_claim(
-        self, claim_id: uuid.UUID, payload: SupplierClaimResolveInput, resolved_by_user_id: uuid.UUID | None
+        self,
+        claim_id: uuid.UUID,
+        payload: SupplierClaimResolveInput,
+        resolved_by_user_id: uuid.UUID | None,
     ) -> SupplierClaim:
         claim = await self.get_claim(claim_id)
         if claim.status != ClaimStatus.RECHAZADO:
@@ -487,12 +666,18 @@ class AdministracionService:
     @staticmethod
     def _month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
         start = datetime(year, month, 1, tzinfo=timezone.utc)
-        end = datetime(year + 1, 1, 1, tzinfo=timezone.utc) if month == 12 else datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        end = (
+            datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            if month == 12
+            else datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        )
         return start, end
 
     async def _next_warranty_submission_sequence(self, filial_id: uuid.UUID) -> int:
         result = await self.db.execute(
-            select(func.max(WarrantySubmission.sequence_number)).where(WarrantySubmission.filial_id == filial_id)
+            select(func.max(WarrantySubmission.sequence_number)).where(
+                WarrantySubmission.filial_id == filial_id
+            )
         )
         current_max = result.scalar()
         return (current_max or 0) + 1
@@ -527,8 +712,16 @@ class AdministracionService:
             total_claimed_amount=total,
             submitted_at=submission.submitted_at,
             submitted_by_user_id=submission.submitted_by_user_id,
-            withholding_amount=float(submission.withholding_amount) if submission.withholding_amount is not None else None,
-            net_amount_received=float(submission.net_amount_received) if submission.net_amount_received is not None else None,
+            withholding_amount=(
+                float(submission.withholding_amount)
+                if submission.withholding_amount is not None
+                else None
+            ),
+            net_amount_received=(
+                float(submission.net_amount_received)
+                if submission.net_amount_received is not None
+                else None
+            ),
             account_id=submission.account_id,
             income_entry_id=submission.income_entry_id,
             paid_at=submission.paid_at,
@@ -567,7 +760,9 @@ class AdministracionService:
     async def get_warranty_submission(self, submission_id: uuid.UUID) -> WarrantySubmissionRead:
         return self._submission_to_read(await self._get_submission_model(submission_id))
 
-    async def create_warranty_submission(self, payload: WarrantySubmissionCreate) -> WarrantySubmissionRead:
+    async def create_warranty_submission(
+        self, payload: WarrantySubmissionCreate
+    ) -> WarrantySubmissionRead:
         existing = await self.db.execute(
             select(WarrantySubmission).where(
                 WarrantySubmission.filial_id == payload.filial_id,
@@ -605,7 +800,10 @@ class AdministracionService:
             raise WarrantySubmissionNotEditableError()
 
         claims = await self._unclaimed_costo_taller_claims(
-            submission.filial_id, submission.period_year, submission.period_month, submission.currency
+            submission.filial_id,
+            submission.period_year,
+            submission.period_month,
+            submission.currency,
         )
         for claim in claims:
             claim.warranty_submission_id = submission.id
@@ -630,7 +828,10 @@ class AdministracionService:
         return await self.get_warranty_submission(submission_id)
 
     async def mark_warranty_submission_paid(
-        self, submission_id: uuid.UUID, payload: WarrantySubmissionPayInput, paid_by_user_id: uuid.UUID | None
+        self,
+        submission_id: uuid.UUID,
+        payload: WarrantySubmissionPayInput,
+        paid_by_user_id: uuid.UUID | None,
     ) -> WarrantySubmissionRead:
         submission = await self._get_submission_model(submission_id)
         if submission.status != WarrantySubmissionStatus.PRESENTADA:
@@ -696,17 +897,21 @@ class AdministracionService:
 
         buffer = io.StringIO()
         writer = csv.writer(buffer)
-        writer.writerow(["Fecha resolución", "Proveedor", "Repuesto", "Cantidad", "Monto", "Moneda", "Nota"])
+        writer.writerow(
+            ["Fecha resolución", "Proveedor", "Repuesto", "Cantidad", "Monto", "Moneda", "Nota"]
+        )
         for claim in submission.claims:
-            writer.writerow([
-                claim.resolved_at.date().isoformat() if claim.resolved_at else "",
-                suppliers.get(claim.supplier_id, ""),
-                parts.get(claim.part_id, ""),
-                claim.quantity,
-                float(claim.claimed_amount or 0),
-                claim.currency.value if claim.currency else "",
-                claim.resolution_note or "",
-            ])
+            writer.writerow(
+                [
+                    claim.resolved_at.date().isoformat() if claim.resolved_at else "",
+                    suppliers.get(claim.supplier_id, ""),
+                    parts.get(claim.part_id, ""),
+                    claim.quantity,
+                    float(claim.claimed_amount or 0),
+                    claim.currency.value if claim.currency else "",
+                    claim.resolution_note or "",
+                ]
+            )
         return buffer.getvalue(), f"{submission.code}.csv"
 
     # Accounts
@@ -731,7 +936,11 @@ class AdministracionService:
             + float(income_result.scalar() or 0)
             - float(expense_result.scalar() or 0)
         )
-        balance_usd = balance if account.currency == AccountCurrency.USD else (balance / bcv_rate if bcv_rate else 0.0)
+        balance_usd = (
+            balance
+            if account.currency == AccountCurrency.USD
+            else (balance / bcv_rate if bcv_rate else 0.0)
+        )
         return balance, balance_usd
 
     async def _account_row(self, account: Account, bcv_rate: float) -> dict:
@@ -847,7 +1056,8 @@ class AdministracionService:
         origin_reference: str,
         source_type: MovementSourceType | None = None,
         source_id: uuid.UUID | None = None,
-        *, commit: bool = True,
+        *,
+        commit: bool = True,
     ) -> IncomeEntry | None:
         """Called by other modules (Servicios, Repuestos, Concesionario) when they
         close something billable. Posts to the filial's first active USD account.
@@ -906,7 +1116,9 @@ class AdministracionService:
 
     # Income / Expense
 
-    async def list_income(self, filial_id: uuid.UUID, search: str | None = None) -> list[IncomeEntry]:
+    async def list_income(
+        self, filial_id: uuid.UUID, search: str | None = None
+    ) -> list[IncomeEntry]:
         result = await self.db.execute(
             select(IncomeEntry)
             .where(
@@ -918,11 +1130,16 @@ class AdministracionService:
         entries = list(result.scalars().all())
         if search:
             term = search.lower()
-            entries = [e for e in entries if term in e.description.lower() or (e.origin_reference and term in e.origin_reference.lower())]
+            entries = [
+                e
+                for e in entries
+                if term in e.description.lower()
+                or (e.origin_reference and term in e.origin_reference.lower())
+            ]
         return entries
 
     def _assert_open_period(self, entry_date: date) -> None:
-        """"Open period" = the current calendar month, no future dates — no
+        """ "Open period" = the current calendar month, no future dates — no
         Período entity, no close/reopen screen; a month is "closed" purely
         by no longer being the current one."""
         today = venezuela_today()
@@ -977,7 +1194,9 @@ class AdministracionService:
             max_mb=settings_app.max_upload_mb,
         )
 
-    async def create_income(self, payload: IncomeEntryCreate, attachment, responsible_user_id: uuid.UUID | None) -> IncomeEntry:
+    async def create_income(
+        self, payload: IncomeEntryCreate, attachment, responsible_user_id: uuid.UUID | None
+    ) -> IncomeEntry:
         self._assert_open_period(payload.entry_date)
         account = await self.get_account(payload.account_id)
         if account.currency != payload.currency:
@@ -985,7 +1204,9 @@ class AdministracionService:
         exchange_rate, amount_usd, amount_bs = await self._freeze_rate(
             payload.currency, payload.entry_date, payload.amount
         )
-        attachment_url = await self._require_attachment_if_needed(payload.filial_id, amount_usd, attachment)
+        attachment_url = await self._require_attachment_if_needed(
+            payload.filial_id, amount_usd, attachment
+        )
         entry = IncomeEntry(
             **payload.model_dump(),
             source=IncomeSource.MANUAL,
@@ -1000,7 +1221,9 @@ class AdministracionService:
         await self.db.refresh(entry)
         return entry
 
-    async def reverse_income(self, entry_id: uuid.UUID, user_id: uuid.UUID | None, reason: str) -> IncomeEntry:
+    async def reverse_income(
+        self, entry_id: uuid.UUID, user_id: uuid.UUID | None, reason: str
+    ) -> IncomeEntry:
         original = await self.db.get(IncomeEntry, entry_id)
         if original is None:
             raise EntryNotFoundError(str(entry_id))
@@ -1036,7 +1259,9 @@ class AdministracionService:
         await self.db.refresh(reversal)
         return reversal
 
-    async def list_expenses(self, filial_id: uuid.UUID, search: str | None = None) -> list[ExpenseEntry]:
+    async def list_expenses(
+        self, filial_id: uuid.UUID, search: str | None = None
+    ) -> list[ExpenseEntry]:
         result = await self.db.execute(
             select(ExpenseEntry)
             .where(
@@ -1051,7 +1276,9 @@ class AdministracionService:
             entries = [
                 e
                 for e in entries
-                if term in e.description.lower() or term in e.beneficiary.lower() or term in e.category.value
+                if term in e.description.lower()
+                or term in e.beneficiary.lower()
+                or term in e.category.value
             ]
         return entries
 
@@ -1063,24 +1290,67 @@ class AdministracionService:
         if account.currency != payload.currency:
             raise AccountCurrencyMismatchError()
 
+        if payload.purchase_request_ids:
+            from app.modules.filiales.models import Filial
+
+            await self.db.execute(
+                select(Filial.id).where(Filial.id == payload.filial_id).with_for_update()
+            )
         purchase_requests: list[PurchaseRequest] = []
         if payload.purchase_request_ids:
-            if payload.counterparty_type != CounterpartyType.PROVEEDOR or payload.counterparty_supplier_id is None:
+            if (
+                payload.counterparty_type != CounterpartyType.PROVEEDOR
+                or payload.counterparty_supplier_id is None
+            ):
                 raise PurchaseRequestRequiresSupplierCounterpartyError()
             for request_id in payload.purchase_request_ids:
-                request = await self.db.get(PurchaseRequest, request_id)
+                request = (
+                    await self.db.execute(
+                        select(PurchaseRequest)
+                        .where(PurchaseRequest.id == request_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
                 if request is None:
                     raise PurchaseRequestNotFoundError(str(request_id))
+                if request.filial_id != payload.filial_id:
+                    from app.core.exceptions import ForbiddenError
+
+                    raise ForbiddenError("La compra debe pertenecer a esta filial.")
                 if request.supplier_id != payload.counterparty_supplier_id:
                     raise PurchaseRequestSupplierMismatchError(request.code)
-                if request.status != PurchaseRequestStatus.CONCILIADA or request.paid_at is not None:
+                if (
+                    request.status != PurchaseRequestStatus.CONCILIADA
+                    or request.paid_at is not None
+                ):
                     raise PurchaseRequestNotPayableError(request.code)
+                if not request.invoice_number or request.invoice_total is None:
+                    from app.core.exceptions import ConflictError
+
+                    raise ConflictError("Concilia la factura antes de registrar el pago.")
                 purchase_requests.append(request)
 
         exchange_rate, amount_usd, amount_bs = await self._freeze_rate(
             payload.currency, payload.entry_date, payload.amount
         )
-        attachment_url = await self._require_attachment_if_needed(payload.filial_id, amount_usd, attachment)
+        if purchase_requests:
+            from app.core.exceptions import ConflictError
+            from app.modules.administracion.purchase_workflow import money
+
+            balance = sum(
+                money(request.invoice_total) - money(request.paid_amount_usd or 0)
+                for request in purchase_requests
+            )
+            if len({request.id for request in purchase_requests}) != len(purchase_requests):
+                raise ConflictError("No repitas compras en el mismo pago.")
+            if money(amount_usd) != balance:
+                raise ConflictError(
+                    "El pago agrupado debe cubrir el saldo completo. Para abonos usa Cuentas por Pagar."
+                )
+        attachment_url = await self._require_attachment_if_needed(
+            payload.filial_id, amount_usd, attachment
+        )
         entry = ExpenseEntry(
             **payload.model_dump(exclude={"purchase_request_ids"}),
             exchange_rate=exchange_rate,
@@ -1089,10 +1359,25 @@ class AdministracionService:
             attachment_url=attachment_url,
             registered_by_user_id=responsible_user_id,
         )
+        if purchase_requests:
+            entry.source_type = MovementSourceType.PURCHASE_REQUEST
+            entry.source_id = purchase_requests[0].id if len(purchase_requests) == 1 else None
         self.db.add(entry)
         await self.db.flush()
 
         for request in purchase_requests:
+            from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+            paid = float(request.invoice_total) - float(request.paid_amount_usd or 0)
+            request.paid_amount_usd = request.invoice_total
+            await PurchaseWorkflow(self.db).activity(
+                request,
+                "payment",
+                responsible_user_id,
+                expense_id=str(entry.id),
+                amount_usd=round(paid, 2),
+                balance_usd=0,
+            )
             request.paid_at = datetime.now(timezone.utc)
             request.payment_account_id = payload.account_id
             request.payment_expense_entry_id = entry.id
@@ -1102,10 +1387,51 @@ class AdministracionService:
         await self.db.refresh(entry)
         return entry
 
-    async def reverse_expense(self, entry_id: uuid.UUID, user_id: uuid.UUID | None, reason: str) -> ExpenseEntry:
+    async def reverse_expense(
+        self, entry_id: uuid.UUID, user_id: uuid.UUID | None, reason: str
+    ) -> ExpenseEntry:
         original = await self.db.get(ExpenseEntry, entry_id)
         if original is None:
             raise EntryNotFoundError(str(entry_id))
+        purchases = []
+        if original.source_type == MovementSourceType.PURCHASE_REQUEST:
+            from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+            if original.source_id:
+                purchases = [await PurchaseWorkflow(self.db).lock(original.source_id)]
+            else:
+                candidates = (
+                    (
+                        await self.db.execute(
+                            select(PurchaseRequest.id).where(
+                                PurchaseRequest.payment_expense_entry_id == original.id
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                purchases = [
+                    await PurchaseWorkflow(self.db).lock(key) for key in sorted(candidates, key=str)
+                ]
+        if original.source_type is None:
+            from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+            candidates = (
+                (
+                    await self.db.execute(
+                        select(PurchaseRequest.id).where(
+                            PurchaseRequest.payment_expense_entry_id == original.id,
+                            PurchaseRequest.filial_id == original.filial_id,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            purchases = [
+                await PurchaseWorkflow(self.db).lock(key) for key in sorted(candidates, key=str)
+            ]
         existing = await self.db.execute(
             select(ExpenseEntry).where(ExpenseEntry.reverses_entry_id == entry_id)
         )
@@ -1134,6 +1460,32 @@ class AdministracionService:
             registered_by_user_id=user_id,
         )
         self.db.add(reversal)
+        for purchase in purchases:
+            from app.modules.administracion.purchase_workflow import PurchaseWorkflow, money
+
+            payment = next(
+                (
+                    event
+                    for event in reversed(purchase.activity or [])
+                    if event.get("action") == "payment"
+                    and event.get("expense_id") == str(original.id)
+                ),
+                None,
+            )
+            amount = payment["amount_usd"] if payment else original.amount_usd or 0
+            purchase.paid_amount_usd = max(
+                money(0), money(purchase.paid_amount_usd) - money(amount)
+            )
+            purchase.paid_at = None
+            if purchase.payment_expense_entry_id == original.id:
+                purchase.payment_expense_entry_id = None
+            await PurchaseWorkflow(self.db).activity(
+                purchase,
+                "payment_reversed",
+                user_id,
+                expense_id=str(original.id),
+                amount_usd=float(amount),
+            )
         await self.db.commit()
         await self.db.refresh(reversal)
         return reversal
@@ -1337,7 +1689,10 @@ class AdministracionService:
         )
         pairs = result.all()
         net_sales = sum(float(sale.final_price) for sale, _ in pairs)
-        direct_cost = sum(float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0 for _, vehicle in pairs)
+        direct_cost = sum(
+            float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0
+            for _, vehicle in pairs
+        )
         estimated_count = sum(1 for _, vehicle in pairs if vehicle.cost_is_estimated)
 
         negative_lines = []
@@ -1393,7 +1748,11 @@ class AdministracionService:
         direct_cost = 0.0
         negative_lines = []
         for line, sale in pairs:
-            cost = float(line.unit_cost) if line.unit_cost is not None else (await almacen.get_average_cost(line.part_id) or 0.0)
+            cost = (
+                float(line.unit_cost)
+                if line.unit_cost is not None
+                else (await almacen.get_average_cost(line.part_id) or 0.0)
+            )
             line_cost = line.quantity * cost
             direct_cost += line_cost
             margin = float(line.line_total) - line_cost
@@ -1412,7 +1771,10 @@ class AdministracionService:
                         margin=margin,
                     )
                 )
-        return _profitability_department_row("repuestos", "Repuestos", net_sales, direct_cost), negative_lines
+        return (
+            _profitability_department_row("repuestos", "Repuestos", net_sales, direct_cost),
+            negative_lines,
+        )
 
     async def _taller_department(
         self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
@@ -1443,13 +1805,18 @@ class AdministracionService:
             order_ids = [order.id for _, order in pairs]
             lines_result = await self.db.execute(
                 select(ServiceOrderTransferLine, ServiceOrderTransfer.service_order_id)
-                .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                .join(
+                    ServiceOrderTransfer,
+                    ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                )
                 .where(
                     ServiceOrderTransfer.service_order_id.in_(order_ids),
                     # PEDIDO or COMPLETADO — both were actually dispatched
                     # and cost the shop; COMPLETADO just confirms the same
                     # dispatch was physically handed over.
-                    ServiceOrderTransfer.status.in_([TransferStatus.PEDIDO, TransferStatus.COMPLETADO]),
+                    ServiceOrderTransfer.status.in_(
+                        [TransferStatus.PEDIDO, TransferStatus.COMPLETADO]
+                    ),
                 )
             )
             transfer_lines = lines_result.all()
@@ -1462,16 +1829,19 @@ class AdministracionService:
                     )
                 )
                 for allocation in allocation_result.scalars().all():
-                    allocation_cost_by_line[allocation.transfer_line_id] = allocation_cost_by_line.get(
-                        allocation.transfer_line_id, 0.0
-                    ) + allocation.quantity * float(allocation.unit_cost)
+                    allocation_cost_by_line[allocation.transfer_line_id] = (
+                        allocation_cost_by_line.get(allocation.transfer_line_id, 0.0)
+                        + allocation.quantity * float(allocation.unit_cost)
+                    )
             for line, service_order_id in transfer_lines:
                 line_cost = allocation_cost_by_line.get(line.id, 0.0)
                 # Dispatched before F0-01 (or otherwise never allocated to a
                 # lot) — the line's own recorded cost is the best real number
                 # available; never guess a quantity that isn't there.
                 line_cost = line_cost if line_cost > 0 else float(line.cost_total)
-                cost_by_order[service_order_id] = cost_by_order.get(service_order_id, 0.0) + line_cost
+                cost_by_order[service_order_id] = (
+                    cost_by_order.get(service_order_id, 0.0) + line_cost
+                )
 
         direct_cost = sum(cost_by_order.values())
 
@@ -1495,7 +1865,9 @@ class AdministracionService:
                 )
 
         return (
-            _profitability_department_row("taller_mano_obra", "Taller · mano de obra", net_sales, direct_cost),
+            _profitability_department_row(
+                "taller_mano_obra", "Taller · mano de obra", net_sales, direct_cost
+            ),
             negative_lines,
         )
 
@@ -1621,28 +1993,64 @@ class AdministracionService:
         today = venezuela_today()
         period_is_closed = (date_to.year, date_to.month) != (today.year, today.month)
 
-        nuevos_row, nuevos_count, nuevos_estimated, nuevos_negative = await self._vehicle_department(
-            filial_ids, date_from, date_to, VehicleCondition.NUEVO, "vehiculos_nuevos", "Vehículos nuevos"
+        nuevos_row, nuevos_count, nuevos_estimated, nuevos_negative = (
+            await self._vehicle_department(
+                filial_ids,
+                date_from,
+                date_to,
+                VehicleCondition.NUEVO,
+                "vehiculos_nuevos",
+                "Vehículos nuevos",
+            )
         )
-        usados_row, usados_count, usados_estimated, usados_negative = await self._vehicle_department(
-            filial_ids, date_from, date_to, VehicleCondition.USADO, "vehiculos_usados", "Vehículos usados"
+        usados_row, usados_count, usados_estimated, usados_negative = (
+            await self._vehicle_department(
+                filial_ids,
+                date_from,
+                date_to,
+                VehicleCondition.USADO,
+                "vehiculos_usados",
+                "Vehículos usados",
+            )
         )
-        repuestos_row, repuestos_negative = await self._parts_department(filial_ids, date_from, date_to)
+        repuestos_row, repuestos_negative = await self._parts_department(
+            filial_ids, date_from, date_to
+        )
         taller_row, taller_negative = await self._taller_department(filial_ids, date_from, date_to)
         garantia_marca_row = await self._manual_income_department(
-            filial_ids, date_from, date_to, IncomeConcept.GARANTIA_MARCA, bcv_rate,
-            "garantia_marca", "Garantía · marca",
+            filial_ids,
+            date_from,
+            date_to,
+            IncomeConcept.GARANTIA_MARCA,
+            bcv_rate,
+            "garantia_marca",
+            "Garantía · marca",
         )
         fi_row = await self._manual_income_department(
-            filial_ids, date_from, date_to, IncomeConcept.FI_INTERMEDIACION, bcv_rate,
-            "fi_intermediacion", "F&I · intermediación",
+            filial_ids,
+            date_from,
+            date_to,
+            IncomeConcept.FI_INTERMEDIACION,
+            bcv_rate,
+            "fi_intermediacion",
+            "F&I · intermediación",
         )
 
         negative_margin_lines = [
-            *nuevos_negative, *usados_negative, *repuestos_negative, *taller_negative,
+            *nuevos_negative,
+            *usados_negative,
+            *repuestos_negative,
+            *taller_negative,
         ]
 
-        departments = [nuevos_row, usados_row, repuestos_row, taller_row, garantia_marca_row, fi_row]
+        departments = [
+            nuevos_row,
+            usados_row,
+            repuestos_row,
+            taller_row,
+            garantia_marca_row,
+            fi_row,
+        ]
         net_sales_total = sum(d.net_sales for d in departments)
         direct_cost_total = sum(d.direct_cost for d in departments)
         gross_profit_total = net_sales_total - direct_cost_total
@@ -1667,7 +2075,9 @@ class AdministracionService:
             )
         )
         commissions_paid = sum(
-            self._entry_usd_amount(e, bcv_rate) for e in expenses if e.category == ExpenseCategory.NOMINA_COMISIONES
+            self._entry_usd_amount(e, bcv_rate)
+            for e in expenses
+            if e.category == ExpenseCategory.NOMINA_COMISIONES
         )
 
         movements_result = await self.db.execute(
@@ -1678,9 +2088,13 @@ class AdministracionService:
                 StockMovement.created_at <= date_to,
             )
         )
-        shrinkage_losses = sum(m.quantity * float(m.unit_cost or 0) for m in movements_result.scalars().all())
+        shrinkage_losses = sum(
+            m.quantity * float(m.unit_cost or 0) for m in movements_result.scalars().all()
+        )
 
-        fx_adjustment = await self._fx_reexpression_adjustment(filial_ids, date_from, date_to, bcv_rate)
+        fx_adjustment = await self._fx_reexpression_adjustment(
+            filial_ids, date_from, date_to, bcv_rate
+        )
 
         warranty_cost = 0.0
         for filial_id in filial_ids:
@@ -1688,24 +2102,34 @@ class AdministracionService:
 
         adjustments = [
             ProfitabilityAdjustmentRow(
-                key="gastos_operacionales", label="Gastos operacionales",
-                origin="Egresos clasificados", amount=-operating_expenses,
+                key="gastos_operacionales",
+                label="Gastos operacionales",
+                origin="Egresos clasificados",
+                amount=-operating_expenses,
             ),
             ProfitabilityAdjustmentRow(
-                key="comisiones", label="Comisiones",
-                origin="Nómina y comisiones", amount=-commissions_paid,
+                key="comisiones",
+                label="Comisiones",
+                origin="Nómina y comisiones",
+                amount=-commissions_paid,
             ),
             ProfitabilityAdjustmentRow(
-                key="mermas_inventario", label="Mermas de inventario",
-                origin="Ajustes de almacén", amount=-shrinkage_losses,
+                key="mermas_inventario",
+                label="Mermas de inventario",
+                origin="Ajustes de almacén",
+                amount=-shrinkage_losses,
             ),
             ProfitabilityAdjustmentRow(
-                key="diferencia_cambio", label="Diferencia en cambio",
-                origin="Reexpresión de saldos", amount=fx_adjustment,
+                key="diferencia_cambio",
+                label="Diferencia en cambio",
+                origin="Reexpresión de saldos",
+                amount=fx_adjustment,
             ),
             ProfitabilityAdjustmentRow(
-                key="costo_garantia_taller", label="Costo de garantía (taller)",
-                origin="Retrabajos cubiertos por el taller", amount=-warranty_cost,
+                key="costo_garantia_taller",
+                label="Costo de garantía (taller)",
+                origin="Retrabajos cubiertos por el taller",
+                amount=-warranty_cost,
             ),
         ]
         net_profit = gross_profit_total + sum(a.amount for a in adjustments)
@@ -1770,7 +2194,9 @@ class AdministracionService:
         claims_result = await self.db.execute(
             select(WarrantyClaim).where(
                 WarrantyClaim.filial_id == filial_id,
-                WarrantyClaim.claim_type.in_([WarrantyClaimType.COMEBACK, WarrantyClaimType.REPUESTO_PROVEEDOR]),
+                WarrantyClaim.claim_type.in_(
+                    [WarrantyClaimType.COMEBACK, WarrantyClaimType.REPUESTO_PROVEEDOR]
+                ),
                 WarrantyClaim.claimed_at >= date_from,
                 WarrantyClaim.claimed_at <= date_to,
             )
@@ -1787,7 +2213,10 @@ class AdministracionService:
             if claim.part_id is not None:
                 line_result = await self.db.execute(
                     select(ServiceOrderTransferLine)
-                    .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+                    .join(
+                        ServiceOrderTransfer,
+                        ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                    )
                     .where(
                         ServiceOrderTransfer.service_order_id == claim.service_order_id,
                         ServiceOrderTransferLine.part_id == claim.part_id,

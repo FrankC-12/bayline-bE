@@ -114,6 +114,7 @@ class MovementSourceType(str, enum.Enum):
     VEHICLE_SALE = "vehicle_sale"
     PART_SALE = "part_sale"
     SERVICE_ORDER = "service_order"
+    PURCHASE_REQUEST = "purchase_request"
     SUPPLIER_CLAIM = "supplier_claim"
     WARRANTY_SUBMISSION = "warranty_submission"
     # A transfer between two of the filial's own accounts — the pair of rows

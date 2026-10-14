@@ -33,6 +33,7 @@ class StockInReasonCreate(BaseModel):
 
 
 class StockInReasonUpdate(BaseModel):
+    is_active: bool | None = None
     name: str | None = Field(default=None, min_length=1, max_length=80)
 
 
@@ -54,6 +55,7 @@ class LotLineInput(BaseModel):
 
 
 class StockInCreate(BaseModel):
+    request_id: uuid.UUID | None = None
     filial_id: uuid.UUID
     warehouse_id: uuid.UUID
     reason: str = Field(default="Compra directa", max_length=80)
@@ -74,6 +76,8 @@ class PartLotRead(BaseModel):
 
 
 class LotOutboundMovementRead(BaseModel):
+    destination_lot_id: uuid.UUID | None = None
+    destination_lot_code: str | None = None
     """One dispatched consumption of this lot — a counter sale line or a
     workshop ODT line. Only real, dispatched consumption is included (never
     a pending/preview allocation)."""
@@ -91,6 +95,7 @@ class LotOutboundMovementRead(BaseModel):
 
 
 class PartLotDetailRead(PartLotRead):
+    origin: dict = Field(default_factory=dict)
     part_code: str
     part_name: str
     warehouse_name: str
@@ -200,6 +205,8 @@ class BulkLotReview(BaseModel):
 
 
 class StockOutCreate(BaseModel):
+    reason_id: uuid.UUID | None = None
+    request_id: uuid.UUID | None = None
     filial_id: uuid.UUID
     warehouse_id: uuid.UUID
     part_id: uuid.UUID
@@ -234,6 +241,7 @@ class TransferLineRead(BaseModel):
 
 
 class TransferRead(BaseModel):
+    workshop_request_id: uuid.UUID | None = None
     id: uuid.UUID
     code: str
     origin_warehouse_id: uuid.UUID
@@ -260,6 +268,21 @@ class StockMovementRead(BaseModel):
     note: str | None
     responsible_user_id: uuid.UUID | None
     created_at: datetime
+
+
+class StockMovementPageItem(StockMovementRead):
+    part_name: str
+    part_code: str
+    warehouse_name: str
+    responsible_name: str | None
+
+
+class StockMovementPage(BaseModel):
+    items: list[StockMovementPageItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
 
 
 class InventoryRow(BaseModel):

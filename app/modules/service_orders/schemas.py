@@ -131,6 +131,7 @@ class ServiceOrderCancelInput(BaseModel):
 
 
 class ServiceOrderCloseInput(BaseModel):
+    exit_mileage: int | None = Field(default=None, ge=0)
     # Optional "next visit suggested" date for the vehicle, entered by the
     # advisor at close time — feeds the "mantenimiento por vencer" list.
     next_maintenance_due_at: date | None = None
@@ -140,6 +141,7 @@ class ServiceOrderCloseInput(BaseModel):
 
 
 class ServiceOrderRead(BaseModel):
+    exit_mileage: int | None = None
     discount_label: DiscountLabel
     model_config = ConfigDict(from_attributes=True)
 
@@ -174,6 +176,13 @@ class ServiceOrderRead(BaseModel):
     completed_with_pending_items: bool
     completed_override_by_user_id: uuid.UUID | None
     completed_override_at: datetime | None
+
+
+class ServiceOrderPageItem(ServiceOrderRead):
+    client_name: str
+    vehicle_label: str
+    vehicle_plate: str | None
+    technician_name: str | None
 
 
 def _reject_manual_proveedor_payer(cls, value: ServiceOrderPayer) -> ServiceOrderPayer:
@@ -269,6 +278,9 @@ class PayerBreakdown(BaseModel):
 
 
 class OrderSummary(BaseModel):
+    hourly_rate: float | None = None
+    commission_percentage: float | None = None
+    technician_commission: float | None = None
     payer_breakdown: list[PayerBreakdown] | None = None
     igtf_percentage: float = 0
     igtf_amount: float = 0
@@ -413,7 +425,9 @@ class WarrantyClaimCreate(BaseModel):
     @model_validator(mode="after")
     def _check_fields_for_claim_type(self) -> "WarrantyClaimCreate":
         if self.claim_type == WarrantyClaimType.COMEBACK and self.service_order_id is None:
-            raise ValueError("Un reclamo de tipo comeback debe referenciar la orden de servicio de origen.")
+            raise ValueError(
+                "Un reclamo de tipo comeback debe referenciar la orden de servicio de origen."
+            )
         if self.claim_type in (WarrantyClaimType.COMEBACK, WarrantyClaimType.REPUESTO_PROVEEDOR):
             if not self.failure_cause or len(self.failure_cause.strip()) < 3:
                 raise ValueError("Describe la causa de la falla.")

@@ -75,6 +75,11 @@ def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) ->
     total_with_iva = labor_cost + parts_price + iva_amount
 
     return TemparioRead(
+        warranty_mode=t.warranty_mode,
+        warranty_days=t.warranty_days,
+        warranty_km=t.warranty_km,
+        is_active=t.is_active,
+        updated_by_user_id=t.updated_by_user_id,
         id=t.id,
         filial_id=t.filial_id,
         code=t.code,
@@ -180,8 +185,12 @@ class PostVentasService:
 
     # Labor settings
 
-    async def get_labor_settings(self, filial_id: uuid.UUID, *, commit: bool = True) -> LaborSettings:
-        result = await self.db.execute(select(LaborSettings).where(LaborSettings.filial_id == filial_id))
+    async def get_labor_settings(
+        self, filial_id: uuid.UUID, *, commit: bool = True
+    ) -> LaborSettings:
+        result = await self.db.execute(
+            select(LaborSettings).where(LaborSettings.filial_id == filial_id)
+        )
         settings = result.scalar_one_or_none()
         changed = False
         if settings is None:
@@ -196,8 +205,10 @@ class PostVentasService:
             .limit(1)
         )
         rate_row = latest_usd.scalar_one_or_none()
-        if rate_row is not None and (
-            settings.bcv_rate_date is None or rate_row.value_date > settings.bcv_rate_date
+        if (
+            settings.bcv_rate_mode != "manual"
+            and rate_row is not None
+            and (settings.bcv_rate_date is None or rate_row.value_date > settings.bcv_rate_date)
         ):
             settings.bcv_rate = rate_row.rate_ves
             settings.bcv_rate_date = rate_row.value_date
@@ -215,6 +226,8 @@ class PostVentasService:
         self, filial_id: uuid.UUID, payload: LaborSettingsUpdate
     ) -> LaborSettings:
         settings = await self.get_labor_settings(filial_id)
+        if payload.bcv_rate is not None:
+            settings.bcv_rate_mode = "manual"
         settings.hourly_rate = payload.hourly_rate
         settings.commission_percentage = payload.commission_percentage
         settings.igtf_percentage = payload.igtf_percentage
@@ -225,7 +238,9 @@ class PostVentasService:
         settings.workshop_warranty_km = payload.workshop_warranty_km
         settings.workshop_parts_warranty_days = payload.workshop_parts_warranty_days
         settings.workshop_parts_warranty_km = payload.workshop_parts_warranty_km
-        settings.manual_movement_attachment_threshold_usd = payload.manual_movement_attachment_threshold_usd
+        settings.manual_movement_attachment_threshold_usd = (
+            payload.manual_movement_attachment_threshold_usd
+        )
         settings.iva_retention_default_percentage = payload.iva_retention_default_percentage
         settings.islr_retention_default_percentage = payload.islr_retention_default_percentage
         if payload.bcv_rate is not None:
@@ -238,20 +253,73 @@ class PostVentasService:
     # Temparios
 
     async def _get_tempario_model(self, tempario_id: uuid.UUID) -> Tempario:
-        query = select(Tempario).options(selectinload(Tempario.parts)).where(Tempario.id == tempario_id)
+        query = (
+            select(Tempario).options(selectinload(Tempario.parts)).where(Tempario.id == tempario_id)
+        )
         result = await self.db.execute(query)
         tempario = result.scalar_one_or_none()
         if tempario is None:
             raise TemparioNotFoundError(str(tempario_id))
         return tempario
 
-    async def list_temparios(self, filial_id: uuid.UUID, search: str | None = None) -> list[TemparioRead]:
+    async def _attach_legacy_warranty_labels(self, reads):
+        ids = {
+            value
+            for read in reads
+            for value in (read.labor_warranty_policy_id, read.parts_warranty_policy_id)
+            if value and read.warranty_mode == "standard"
+        }
+        if not ids:
+            return
+        policies = (
+            (await self.db.execute(select(WarrantyPolicy).where(WarrantyPolicy.id.in_(ids))))
+            .scalars()
+            .all()
+        )
+        by_id = {policy.id: policy for policy in policies}
+        for read in reads:
+            terms = []
+            for label, key in [
+                ("Mano de obra", read.labor_warranty_policy_id),
+                ("Repuestos", read.parts_warranty_policy_id),
+            ]:
+                policy = by_id.get(key)
+                if policy and policy.filial_id == read.filial_id:
+                    duration = (
+                        "Sin vencimiento"
+                        if policy.no_expiration
+                        else " / ".join(
+                            value
+                            for value in [
+                                (
+                                    f"{policy.duration_days} días"
+                                    if policy.duration_days is not None
+                                    else ""
+                                ),
+                                (
+                                    f"{policy.duration_km} km"
+                                    if policy.duration_km is not None
+                                    else ""
+                                ),
+                            ]
+                            if value
+                        )
+                    )
+                    terms.append(f"{label}: {duration}")
+            if terms:
+                read.legacy_warranty_label = " · ".join(terms)
+
+    async def list_temparios(
+        self, filial_id: uuid.UUID, search: str | None = None, include_inactive: bool = False
+    ) -> list[TemparioRead]:
         query = (
             select(Tempario)
             .options(selectinload(Tempario.parts))
             .where(Tempario.filial_id == filial_id)
             .order_by(Tempario.category, Tempario.sequence_number)
         )
+        if not include_inactive:
+            query = query.where(Tempario.is_active.is_(True))
         result = await self.db.execute(query)
         temparios = list(result.scalars().all())
 
@@ -262,12 +330,60 @@ class PostVentasService:
         settings = await self.get_labor_settings(filial_id)
         rate = float(settings.hourly_rate)
         iva_percentage = float(settings.iva_percentage)
-        return [_tempario_to_read(t, rate, iva_percentage) for t in temparios]
+        from app.modules.users.models import User
+
+        users = (
+            (
+                await self.db.execute(
+                    select(User).where(
+                        User.id.in_(
+                            [t.updated_by_user_id for t in temparios if t.updated_by_user_id]
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        names = {user.id: user.full_name for user in users}
+        reads = [_tempario_to_read(t, rate, iva_percentage) for t in temparios]
+        for read in reads:
+            read.updated_by_name = names.get(read.updated_by_user_id)
+        await self._attach_legacy_warranty_labels(reads)
+        return reads
 
     async def get_tempario(self, tempario_id: uuid.UUID) -> TemparioRead:
         t = await self._get_tempario_model(tempario_id)
         settings = await self.get_labor_settings(t.filial_id)
-        return _tempario_to_read(t, float(settings.hourly_rate), float(settings.iva_percentage))
+        from app.modules.users.models import User
+
+        user = await self.db.get(User, t.updated_by_user_id) if t.updated_by_user_id else None
+        read = _tempario_to_read(t, float(settings.hourly_rate), float(settings.iva_percentage))
+        read.updated_by_name = user.full_name if user else None
+        await self._attach_legacy_warranty_labels([read])
+        return read
+
+    def _validate_single_warranty(self, payload, existing=None):
+        mode = (
+            payload.warranty_mode if payload.warranty_mode is not None else existing.warranty_mode
+        )
+
+        def value(field):
+            return (
+                getattr(payload, field)
+                if field in payload.model_fields_set or existing is None
+                else getattr(existing, field)
+            )
+
+        if mode == "custom" and not (
+            (value("warranty_days") or 0) > 0 or (value("warranty_km") or 0) > 0
+        ):
+            raise BadRequestError(
+                "La garantía personalizada necesita días o kilómetros mayores a cero."
+            )
+        start, end = value("year_from"), value("year_to")
+        if start and end and start > end:
+            raise BadRequestError("El año inicial no puede ser mayor al final.")
 
     async def _validate_tempario_warranties(self, payload, filial_id, existing=None):
         for field, coverage in (
@@ -277,7 +393,9 @@ class PostVentasService:
             if field not in payload.model_fields_set:
                 continue
             policy_id = getattr(payload, field)
-            if policy_id is None or (existing is not None and policy_id == getattr(existing, field)):
+            if policy_id is None or (
+                existing is not None and policy_id == getattr(existing, field)
+            ):
                 continue
             policy = await self.db.get(WarrantyPolicy, policy_id)
             if policy is None or policy.filial_id != filial_id:
@@ -287,7 +405,18 @@ class PostVentasService:
             if policy.applies_to not in (coverage, WarrantyPolicyAppliesTo.AMBAS):
                 raise BadRequestError("La garantía no corresponde a esta cobertura.")
 
-    async def create_tempario(self, payload: TemparioCreate) -> TemparioRead:
+    async def create_tempario(self, payload: TemparioCreate, user_id=None) -> TemparioRead:
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(
+            select(Filial.id).where(Filial.id == payload.filial_id).with_for_update()
+        )
+        from app.modules.warehouse.service import AlmacenService
+
+        await AlmacenService(self.db).ensure_inventory_scope(
+            payload.filial_id, [], [part.part_id for part in payload.parts if part.part_id]
+        )
+        self._validate_single_warranty(payload)
         await self._validate_tempario_warranties(payload, payload.filial_id)
         sequence_number = payload.sequence_number or await self._next_sequence(
             payload.filial_id, payload.category
@@ -297,8 +426,12 @@ class PostVentasService:
         t = Tempario(
             filial_id=payload.filial_id,
             category=payload.category,
+            updated_by_user_id=user_id,
             sequence_number=sequence_number,
             name=payload.name,
+            warranty_mode=payload.warranty_mode,
+            warranty_days=payload.warranty_days or None,
+            warranty_km=payload.warranty_km or None,
             estimated_hours=payload.estimated_hours,
             year_from=payload.year_from,
             year_to=payload.year_to,
@@ -325,8 +458,33 @@ class PostVentasService:
         await self.db.commit()
         return await self.get_tempario(t.id)
 
-    async def update_tempario(self, tempario_id: uuid.UUID, payload: TemparioUpdate) -> TemparioRead:
+    async def update_tempario(
+        self, tempario_id: uuid.UUID, payload: TemparioUpdate, user_id=None
+    ) -> TemparioRead:
         t = await self._get_tempario_model(tempario_id)
+        if payload.parts is not None:
+            from app.modules.warehouse.service import AlmacenService
+
+            await AlmacenService(self.db).ensure_inventory_scope(
+                t.filial_id, [], [part.part_id for part in payload.parts if part.part_id]
+            )
+        t.updated_by_user_id = user_id
+        self._validate_single_warranty(payload, t)
+        for field in (
+            "warranty_mode",
+            "warranty_days",
+            "warranty_km",
+            "is_active",
+            "year_from",
+            "year_to",
+        ):
+            if field in payload.model_fields_set:
+                value = getattr(payload, field)
+                if field in {"warranty_mode", "is_active"} and value is None:
+                    raise BadRequestError("El modo de garantía y el estado no pueden ser nulos.")
+                setattr(
+                    t, field, value or None if field in {"warranty_days", "warranty_km"} else value
+                )
         await self._validate_tempario_warranties(payload, t.filial_id, t)
         for field in ("labor_warranty_policy_id", "parts_warranty_policy_id"):
             if field in payload.model_fields_set:
@@ -398,7 +556,9 @@ class PostVentasService:
         # refreshing it from the rows just committed.
         query = (
             select(MaintenancePlan)
-            .options(selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario))
+            .options(
+                selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario)
+            )
             .where(MaintenancePlan.id == plan_id)
             .execution_options(populate_existing=True)
         )
@@ -426,7 +586,9 @@ class PostVentasService:
     ) -> list[MaintenancePlanRead]:
         query = (
             select(MaintenancePlan)
-            .options(selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario))
+            .options(
+                selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario)
+            )
             .where(MaintenancePlan.filial_id == filial_id)
             .order_by(MaintenancePlan.brand, MaintenancePlan.name)
         )
@@ -499,8 +661,12 @@ class PostVentasService:
 
     # Vehicle warranties (garantía de fábrica)
 
-    def warranty_to_read(self, w: VehicleWarranty, current_mileage: int | None = None) -> VehicleWarrantyRead:
-        status = "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
+    def warranty_to_read(
+        self, w: VehicleWarranty, current_mileage: int | None = None
+    ) -> VehicleWarrantyRead:
+        status = (
+            "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
+        )
         days_remaining = max((w.expires_at - date.today()).days, 0) if w.expires_at else None
         km_remaining = (
             max(w.duration_km - current_mileage, 0)
@@ -508,6 +674,7 @@ class PostVentasService:
             else None
         )
         return VehicleWarrantyRead(
+            certificate_photo_url=w.certificate_photo_url,
             id=w.id,
             filial_id=w.filial_id,
             vin=w.vin,
@@ -550,11 +717,45 @@ class PostVentasService:
             warranties = [
                 w
                 for w in warranties
-                if term in w.vin.lower() or term in w.brand.lower() or (w.model and term in w.model.lower())
+                if term in w.vin.lower()
+                or term in w.brand.lower()
+                or (w.model and term in w.model.lower())
             ]
         return [self.warranty_to_read(w) for w in warranties]
 
-    async def get_vehicle_warranty_by_vin(self, filial_id: uuid.UUID, vin: str) -> VehicleWarrantyRead:
+    async def _current_mileage_by_vin(self, filial_id, vin):
+        from app.modules.clients.models import Client, Vehicle
+        from app.modules.inspections.models import PreliminaryInspection
+        from app.modules.service_orders.models import ServiceOrder
+
+        saved = (
+            await self.db.execute(
+                select(func.max(Vehicle.mileage))
+                .join(Client, Client.id == Vehicle.client_id)
+                .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
+            )
+        ).scalar()
+        inspected = (
+            await self.db.execute(
+                select(func.max(PreliminaryInspection.mileage))
+                .join(Vehicle, Vehicle.id == PreliminaryInspection.vehicle_id)
+                .join(Client, Client.id == Vehicle.client_id)
+                .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
+            )
+        ).scalar()
+        departure = (
+            await self.db.execute(
+                select(func.max(ServiceOrder.exit_mileage))
+                .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
+                .where(ServiceOrder.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
+            )
+        ).scalar()
+        values = [value for value in (saved, inspected, departure) if value is not None]
+        return max(values) if values else None
+
+    async def get_vehicle_warranty_by_vin(
+        self, filial_id: uuid.UUID, vin: str
+    ) -> VehicleWarrantyRead:
         result = await self.db.execute(
             select(VehicleWarranty).where(
                 VehicleWarranty.filial_id == filial_id, VehicleWarranty.vin == vin.strip().upper()
@@ -563,7 +764,9 @@ class PostVentasService:
         warranty = result.scalar_one_or_none()
         if warranty is None:
             raise VehicleWarrantyNotFoundError(vin)
-        return self.warranty_to_read(warranty)
+        return self.warranty_to_read(
+            warranty, current_mileage=await self._current_mileage_by_vin(filial_id, vin)
+        )
 
     async def list_vigente_warranties_by_vin(
         self, filial_id: uuid.UUID, vin: str, current_mileage: int | None
@@ -573,7 +776,9 @@ class PostVentasService:
                 VehicleWarranty.filial_id == filial_id, VehicleWarranty.vin == vin.strip().upper()
             )
         )
-        reads = [self.warranty_to_read(w, current_mileage=current_mileage) for w in result.scalars()]
+        reads = [
+            self.warranty_to_read(w, current_mileage=current_mileage) for w in result.scalars()
+        ]
         return [r for r in reads if r.status == "vigente"]
 
     async def create_vehicle_warranty(
@@ -606,7 +811,10 @@ class PostVentasService:
         return self.warranty_to_read(warranty)
 
     async def bulk_create_vehicle_warranties(
-        self, filial_id: uuid.UUID, items: list[VehicleWarrantyBulkItem], created_by_user_id: uuid.UUID | None
+        self,
+        filial_id: uuid.UUID,
+        items: list[VehicleWarrantyBulkItem],
+        created_by_user_id: uuid.UUID | None,
     ) -> tuple[list[VehicleWarranty], list[str]]:
         """Mirrors PartsService.bulk_create_parts: duplicates (against the
         database or repeated within the same batch) are skipped, not
@@ -655,7 +863,8 @@ class PostVentasService:
         model: str | None,
         sale_date: date,
         dealership_vehicle_id: uuid.UUID,
-        *, commit: bool = True,
+        *,
+        commit: bool = True,
     ) -> VehicleWarranty:
         """Called from ConcesionarioService when a DealershipVehicle sale
         closes. A fresh sale means the factory-warranty clock restarts from
@@ -666,7 +875,9 @@ class PostVentasService:
         default_months = settings.vehicle_warranty_default_months
 
         result = await self.db.execute(
-            select(VehicleWarranty).where(VehicleWarranty.filial_id == filial_id, VehicleWarranty.vin == vin)
+            select(VehicleWarranty).where(
+                VehicleWarranty.filial_id == filial_id, VehicleWarranty.vin == vin
+            )
         )
         warranty = result.scalar_one_or_none()
         if warranty is None:
@@ -690,10 +901,22 @@ class PostVentasService:
         await self.db.refresh(warranty)
         return warranty
 
-    def workshop_warranty_to_read(self, w: WorkshopWarranty) -> WorkshopWarrantyRead:
+    def workshop_warranty_to_read(
+        self, w: WorkshopWarranty, current_mileage=None
+    ) -> WorkshopWarrantyRead:
         # expires_at is null for a "sin vencimiento" policy — never expires.
-        status = "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
-        days_remaining = max((w.expires_at - date.today()).days, 0) if w.expires_at is not None else None
+        status = (
+            "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
+        )
+        if (
+            current_mileage is not None
+            and w.expiration_mileage is not None
+            and current_mileage >= w.expiration_mileage
+        ):
+            status = "vencida"
+        days_remaining = (
+            max((w.expires_at - date.today()).days, 0) if w.expires_at is not None else None
+        )
         return WorkshopWarrantyRead(
             id=w.id,
             filial_id=w.filial_id,
@@ -717,13 +940,20 @@ class PostVentasService:
             created_at=w.created_at,
         )
 
-    async def list_workshop_warranties_by_vin(self, filial_id: uuid.UUID, vin: str) -> list[WorkshopWarrantyRead]:
+    async def list_workshop_warranties_by_vin(
+        self, filial_id: uuid.UUID, vin: str
+    ) -> list[WorkshopWarrantyRead]:
         result = await self.db.execute(
             select(WorkshopWarranty)
-            .where(WorkshopWarranty.filial_id == filial_id, WorkshopWarranty.vin == vin.strip().upper())
+            .where(
+                WorkshopWarranty.filial_id == filial_id, WorkshopWarranty.vin == vin.strip().upper()
+            )
             .order_by(WorkshopWarranty.created_at.desc())
         )
-        return [self.workshop_warranty_to_read(w) for w in result.scalars()]
+        mileage = await self._current_mileage_by_vin(filial_id, vin)
+        return [
+            self.workshop_warranty_to_read(w, current_mileage=mileage) for w in result.scalars()
+        ]
 
     # Warranty policies
 
@@ -733,7 +963,9 @@ class PostVentasService:
         query = (
             select(WarrantyPolicy)
             .options(
-                selectinload(WarrantyPolicy.temparios).selectinload(WarrantyPolicyTempario.tempario),
+                selectinload(WarrantyPolicy.temparios).selectinload(
+                    WarrantyPolicyTempario.tempario
+                ),
                 selectinload(WarrantyPolicy.parts).selectinload(WarrantyPolicyPart.part),
             )
             .where(WarrantyPolicy.id == policy_id)
@@ -749,7 +981,9 @@ class PostVentasService:
         if not part_ids:
             return
         result = await self.db.execute(
-            select(func.count()).select_from(Part).where(Part.id.in_(part_ids), Part.filial_id == filial_id)
+            select(func.count())
+            .select_from(Part)
+            .where(Part.id.in_(part_ids), Part.filial_id == filial_id)
         )
         if result.scalar_one() != len(part_ids):
             raise BadRequestError("Uno o más repuestos no pertenecen a esta filial.")
@@ -765,7 +999,9 @@ class PostVentasService:
         query = (
             select(WarrantyPolicy)
             .options(
-                selectinload(WarrantyPolicy.temparios).selectinload(WarrantyPolicyTempario.tempario),
+                selectinload(WarrantyPolicy.temparios).selectinload(
+                    WarrantyPolicyTempario.tempario
+                ),
                 selectinload(WarrantyPolicy.parts).selectinload(WarrantyPolicyPart.part),
             )
             .where(WarrantyPolicy.filial_id == filial_id)
@@ -847,7 +1083,9 @@ class PostVentasService:
         if payload.status is not None:
             policy.status = payload.status
 
-        if policy.no_expiration and (policy.duration_days is not None or policy.duration_km is not None):
+        if policy.no_expiration and (
+            policy.duration_days is not None or policy.duration_km is not None
+        ):
             raise BadRequestError(
                 "Una política sin vencimiento no debe tener días ni kilómetros de vigencia."
             )

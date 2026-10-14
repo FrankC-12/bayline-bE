@@ -3,7 +3,6 @@ MODULE_CATALOG: list[str] = [
     "tecnico-servicio",
     "administracion",
     "usuarios-accesos",
-    "post-ventas",
     "kpis",
     "clientes-vehiculos",
     "repuestos",

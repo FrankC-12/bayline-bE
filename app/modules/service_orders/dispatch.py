@@ -61,6 +61,53 @@ class WorkshopDispatchService:
             raise TransferNotFoundError(str(request_id))
         return request
 
+    async def delete(self, request_id, *, order_id=None):
+        """Release unconsumed reservations; retain receipts of actual transfers."""
+        from app.core.exceptions import ConflictError
+        from app.modules.service_orders.guards import require_editable_order
+
+        try:
+            request = await self.request(request_id, lock=True)
+            if order_id is not None and request.service_order_id != order_id:
+                raise TransferNotFoundError(str(request_id))
+            await require_editable_order(self.db, request.service_order_id)
+            if request.stock_deducted or request.status == TransferStatus.COMPLETADO:
+                raise ConflictError(
+                    "La ODT ya fue despachada. Registra una devolución para corregir el inventario.",
+                    error_code="transfer_already_dispatched",
+                )
+            linked = list(
+                (
+                    await self.db.execute(
+                        select(Transfer)
+                        .where(Transfer.workshop_request_id == request_id)
+                        .options(selectinload(Transfer.lines))
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalars()
+            )
+            for transfer in linked:
+                if transfer.status == WarehouseTransferStatus.COMPLETADA:
+                    transfer.workshop_request_id = None
+                    for line in transfer.lines:
+                        line.workshop_request_line_id = None
+                else:
+                    await self.db.delete(transfer)
+            await self.db.delete(request)
+            await self.db.commit()
+            from app.core.audit_logging import audit_logger, record_event
+
+            record_event(
+                audit_logger,
+                "transfer_deleted",
+                resource="service_order_transfer",
+                transfer_id=str(request_id),
+            )
+        except Exception:
+            await self.db.rollback()
+            raise
+
     async def preview(self, request_id, *, lock=False):
         request = await self.request(request_id, lock=lock)
         order = await self.db.get(ServiceOrder, request.service_order_id)

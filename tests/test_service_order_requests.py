@@ -39,10 +39,21 @@ def env():
     with Session(engine, expire_on_commit=False, autoflush=False) as session:
         filial_id = uuid.uuid4()
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Taller", slug="taller"))
-        part = Part(category_id=uuid.uuid4(), filial_id=filial_id, code="QA-002", name="Aceite 15W40", price=0)
+        part = Part(
+            category_id=uuid.uuid4(),
+            filial_id=filial_id,
+            code="QA-002",
+            name="Aceite 15W40",
+            price=0,
+        )
         client = Client(
-            filial_id=filial_id, full_name="Cliente", client_type=ClientType.PARTICULAR,
-            document_type=DocumentType.V, document_number="12345678", phone_primary="04121234567", address="Caracas",
+            filial_id=filial_id,
+            full_name="Cliente",
+            client_type=ClientType.PARTICULAR,
+            document_type=DocumentType.V,
+            document_number="12345678",
+            phone_primary="04121234567",
+            address="Caracas",
         )
         session.add_all([part, client])
         session.commit()
@@ -54,13 +65,18 @@ def env():
 
 def _make_dispatched_transfer(session, part, vehicle, filial_id):
     order = ServiceOrder(
-        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+        filial_id=filial_id,
+        sequence_number=1,
+        vehicle_id=vehicle.id,
         order_type_id=get_or_make_order_type(session, filial_id),
     )
     session.add(order)
     session.commit()
     transfer = ServiceOrderTransfer(
-        service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO, stock_deducted=True,
+        service_order_id=order.id,
+        sequence_number=1,
+        status=TransferStatus.PEDIDO,
+        stock_deducted=True,
         fulfilled_at=datetime.now(UTC),
     )
     session.add(transfer)
@@ -105,10 +121,18 @@ async def test_request_shows_which_warehouse_each_line_was_dispatched_from(env):
     session.add_all(
         [
             ServiceOrderTransferLotAllocation(
-                transfer_line_id=line.id, lot_id=uuid.uuid4(), warehouse_id=warehouse_a.id, quantity=1, unit_cost=10
+                transfer_line_id=line.id,
+                lot_id=uuid.uuid4(),
+                warehouse_id=warehouse_a.id,
+                quantity=1,
+                unit_cost=10,
             ),
             ServiceOrderTransferLotAllocation(
-                transfer_line_id=line.id, lot_id=uuid.uuid4(), warehouse_id=warehouse_b.id, quantity=1, unit_cost=12
+                transfer_line_id=line.id,
+                lot_id=uuid.uuid4(),
+                warehouse_id=warehouse_b.id,
+                quantity=1,
+                unit_cost=12,
             ),
         ]
     )
@@ -156,12 +180,16 @@ async def test_completing_a_request_updates_its_status_and_stays_listed(env):
 async def test_pending_transfer_is_excluded(env):
     service, session, filial_id, part, vehicle = env
     order = ServiceOrder(
-        filial_id=filial_id, sequence_number=1, vehicle_id=vehicle.id,
+        filial_id=filial_id,
+        sequence_number=1,
+        vehicle_id=vehicle.id,
         order_type_id=get_or_make_order_type(session, filial_id),
     )
     session.add(order)
     session.commit()
-    transfer = ServiceOrderTransfer(service_order_id=order.id, sequence_number=1, status=TransferStatus.PENDIENTE)
+    transfer = ServiceOrderTransfer(
+        service_order_id=order.id, sequence_number=1, status=TransferStatus.PENDIENTE
+    )
     session.add(transfer)
     session.commit()
 
@@ -193,3 +221,46 @@ async def test_acknowledge_raises_when_not_found(env):
 
     with pytest.raises(TransferNotFoundError):
         await service.acknowledge_service_order_request(uuid.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_request_feed_batches_part_lookups_as_item_count_grows(env):
+    from sqlalchemy import event
+
+    service, session, filial_id, part, vehicle = env
+    _, transfer = _make_dispatched_transfer(session, part, vehicle, filial_id)
+    statements = []
+
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    engine = session.get_bind()
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        session.expunge_all()
+        assert len((await service.list_service_order_requests(filial_id))[0].lines) == 1
+        baseline = len(statements)
+        for number in range(10):
+            extra = Part(
+                category_id=part.category_id,
+                filial_id=filial_id,
+                code=f"BATCH-{number}",
+                name=f"Repuesto {number}",
+                price=0,
+            )
+            session.add(extra)
+            session.flush()
+            session.add(
+                ServiceOrderTransferLine(transfer_id=transfer.id, part_id=extra.id, quantity=1)
+            )
+        session.commit()
+        session.expunge_all()
+        statements.clear()
+        result = await service.list_service_order_requests(filial_id)
+        assert len(result[0].lines) == 11
+        assert result[0].lines[-1].part_name.startswith("Repuesto ")
+        assert len(statements) == baseline
+        assert sum("FROM parts" in statement for statement in statements) == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)

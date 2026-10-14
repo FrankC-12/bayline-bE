@@ -13,6 +13,7 @@ from app.modules.inspections.schemas import InspectionCreate, InspectionRead, In
 from app.modules.inspections.service import InspectionService
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
+from app.modules.service_orders.service import ServiceOrderService
 
 MODULE_ID = "asesor-servicios"
 
@@ -49,6 +50,8 @@ async def get_inspection_for_order(
     current_user: CurrentUser = Depends(get_current_user),
     service: InspectionService = Depends(get_service),
 ) -> InspectionRead | None:
+    order = await ServiceOrderService(service.db).get_order(service_order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
     inspection = await service.get_for_order(service_order_id)
     if inspection is not None:
         await _ensure_access(current_user, inspection.filial_id, service.db)

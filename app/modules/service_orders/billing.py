@@ -17,7 +17,7 @@ from app.modules.clients.models import Client, Vehicle
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
-from app.modules.post_ventas.enums import WorkshopWarrantyCoverage, WarrantyPolicyCoveredBy
+from app.modules.post_ventas.enums import WarrantyPolicyCoveredBy, WorkshopWarrantyCoverage
 from app.modules.post_ventas.models import LaborSettings, WarrantyPolicy, WorkshopWarranty
 from app.modules.service_orders.billing_schemas import (
     BillingInput,
@@ -36,9 +36,10 @@ from app.modules.service_orders.exceptions import (
 from app.modules.service_orders.guards import require_editable_order
 from app.modules.service_orders.models import (
     ServiceOrder,
-    ServiceOrderInvoice,
     ServiceOrderCollectionRequest,
+    ServiceOrderInvoice,
     ServiceOrderTask,
+    ServiceOrderTransfer,
     ServiceOrderTransferLine,
 )
 from app.modules.service_orders.service import ServiceOrderService
@@ -99,6 +100,10 @@ class BillingService:
                 select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
             )
         ).scalar_one_or_none()
+        live_settings = settings
+        from app.modules.ajustes.snapshots import order_settings
+
+        settings = order_settings(order, settings)
         rate = (
             await self.db.execute(
                 select(ExchangeRate).where(
@@ -124,10 +129,24 @@ class BillingService:
         return dict(
             summary=(await self.orders.get_order_summary(order_id)).model_dump(mode="json"),
             igtf_percentage=float(settings.igtf_percentage) if settings else 3.0,
-            iva_retention_default_percentage=float(settings.iva_retention_default_percentage) if settings else 0.0,
-            islr_retention_default_percentage=float(settings.islr_retention_default_percentage) if settings else 0.0,
-            bcv_rate=float(rate.rate_ves) if rate else None,
-            bcv_date=rate.value_date.isoformat() if rate else None,
+            iva_retention_default_percentage=(
+                float(settings.iva_retention_default_percentage) if settings else 0.0
+            ),
+            islr_retention_default_percentage=(
+                float(settings.islr_retention_default_percentage) if settings else 0.0
+            ),
+            bcv_rate=(
+                float(live_settings.bcv_rate)
+                if live_settings and live_settings.bcv_rate_mode == "manual"
+                else (float(rate.rate_ves) if rate else None)
+            ),
+            bcv_date=(
+                live_settings.bcv_rate_date.isoformat()
+                if live_settings
+                and live_settings.bcv_rate_mode == "manual"
+                and live_settings.bcv_rate_date
+                else (rate.value_date.isoformat() if rate else None)
+            ),
             accounts=[dict(id=str(a.id), name=a.name, currency=a.currency.value) for a in accounts],
         )
 
@@ -154,7 +173,9 @@ class BillingService:
         order = await self.orders.get_order(order_id)
         if order.status != ServiceOrderStatus.COMPLETADO or order.invoiced_at is not None:
             raise ConflictError("La orden debe estar completada y sin facturar.")
-        await self._resolve_billed_client(order, payload.billed_client_id, payload.billed_supplier_id)
+        await self._resolve_billed_client(
+            order, payload.billed_client_id, payload.billed_supplier_id
+        )
         context = await self.context(order_id)
         summary = context["summary"]
         result = dict(
@@ -178,15 +199,23 @@ class BillingService:
         # of the pre-tax (IVA-exclusive) subtotal — the standard bases for
         # each, per Venezuelan withholding practice. Both default to 0 for a
         # client that isn't a withholding agent.
-        iva_retention_amount = money(Decimal(str(summary["iva_amount"])) * payload.iva_retention_percentage / 100)
-        pretax_base = Decimal(str(summary["parts_subtotal"])) + Decimal(str(summary["labor_subtotal"]))
+        iva_retention_amount = money(
+            Decimal(str(summary["iva_amount"])) * payload.iva_retention_percentage / 100
+        )
+        pretax_base = Decimal(str(summary["parts_subtotal"])) + Decimal(
+            str(summary["labor_subtotal"])
+        )
         islr_retention_amount = money(pretax_base * payload.islr_retention_percentage / 100)
         result.update(
             iva_retention_percentage=float(payload.iva_retention_percentage),
             iva_retention_amount=float(iva_retention_amount),
             islr_retention_percentage=float(payload.islr_retention_percentage),
             islr_retention_amount=float(islr_retention_amount),
-            net_expected=float(money(Decimal(str(result["total_usd"])) - iva_retention_amount - islr_retention_amount)),
+            net_expected=float(
+                money(
+                    Decimal(str(result["total_usd"])) - iva_retention_amount - islr_retention_amount
+                )
+            ),
         )
         result["quote_hash"] = digest(result)
         return BillingQuote.model_validate(result)
@@ -278,7 +307,9 @@ class BillingService:
             code = f"FAC-{order.code}"
             vehicle = await self.db.get(Vehicle, order.vehicle_id)
             filial = await self.db.get(Filial, order.filial_id)
-            client = await self._resolve_billed_client(order, payload.billed_client_id, payload.billed_supplier_id)
+            client = await self._resolve_billed_client(
+                order, payload.billed_client_id, payload.billed_supplier_id
+            )
             if client is None:
                 client = await self.db.get(Client, vehicle.client_id) if vehicle else None
             if vehicle is None or client is None or filial is None:
@@ -296,21 +327,34 @@ class BillingService:
             )
             # Freeze any tempario guarantee in the invoice as well as the task.
             document["warranties"] = []
-            warranty_tasks = (await self.db.execute(select(ServiceOrderTask).where(
-                ServiceOrderTask.service_order_id == order.id
-            ))).scalars().all()
+            warranty_tasks = (
+                (
+                    await self.db.execute(
+                        select(ServiceOrderTask).where(
+                            ServiceOrderTask.service_order_id == order.id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
             for coverage in ("labor", "parts"):
                 policy_id = getattr(order, f"{coverage}_warranty_policy_id")
                 selected = await self.db.get(WarrantyPolicy, policy_id) if policy_id else None
                 for task in warranty_tasks:
                     terms = (task.warranty_snapshot or {}).get(coverage)
                     if selected:
-                        terms = {"name": selected.name,
-                                 "duration_days": None if selected.no_expiration else selected.duration_days,
-                                 "duration_km": None if selected.no_expiration else selected.duration_km}
+                        terms = {
+                            "name": selected.name,
+                            "duration_days": (
+                                None if selected.no_expiration else selected.duration_days
+                            ),
+                            "duration_km": None if selected.no_expiration else selected.duration_km,
+                        }
                     if terms:
-                        document["warranties"].append({"task": task.code_snapshot,
-                            "coverage": coverage, **terms})
+                        document["warranties"].append(
+                            {"task": task.code_snapshot, "coverage": coverage, **terms}
+                        )
             document.update(
                 id=str(invoice_id),
                 code=code,
@@ -349,12 +393,20 @@ class BillingService:
                 total_usd=total_usd,
                 document=document,
                 billed_client_id=client.id,
-                client_confirmed_at=now if (billed_someone_else and payload.client_confirmed) else None,
-                client_confirmed_note=payload.client_confirmed_note if billed_someone_else else None,
+                client_confirmed_at=(
+                    now if (billed_someone_else and payload.client_confirmed) else None
+                ),
+                client_confirmed_note=(
+                    payload.client_confirmed_note if billed_someone_else else None
+                ),
                 iva_retention_percentage=quote.iva_retention_percentage or None,
-                iva_retention_amount=money(quote.iva_retention_amount) if quote.iva_retention_amount else None,
+                iva_retention_amount=(
+                    money(quote.iva_retention_amount) if quote.iva_retention_amount else None
+                ),
                 islr_retention_percentage=quote.islr_retention_percentage or None,
-                islr_retention_amount=money(quote.islr_retention_amount) if quote.islr_retention_amount else None,
+                islr_retention_amount=(
+                    money(quote.islr_retention_amount) if quote.islr_retention_amount else None
+                ),
                 amount_paid_at_issuance=amount_paid_at_issuance,
                 collected_at=now if fully_paid else None,
             )
@@ -390,104 +442,8 @@ class BillingService:
             # wears out slowly — each runs on its own configured term.
             # Skipped entirely (not blocking) when the vehicle has no VIN,
             # same convention used elsewhere for VIN-dependent warranties.
-            if vehicle is not None and vehicle.vin:
-                settings_result = await self.db.execute(
-                    select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
-                )
-                settings = settings_result.scalar_one_or_none()
-                fallback_labor_days = settings.workshop_warranty_days if settings else 90
-                fallback_labor_km = settings.workshop_warranty_km if settings else 5000
-                fallback_parts_days = settings.workshop_parts_warranty_days if settings else 90
-                fallback_parts_km = settings.workshop_parts_warranty_km if settings else 5000
-
-                # A WarrantyPolicy selected on the ODS (see ServiceOrder.
-                # labor_warranty_policy_id/parts_warranty_policy_id) takes
-                # precedence over the filial-wide LaborSettings fallback —
-                # orders that never picked one keep today's behavior exactly.
-                labor_policy = parts_policy = None
-                if order.labor_warranty_policy_id is not None:
-                    labor_policy = (
-                        await self.db.execute(
-                            select(WarrantyPolicy).where(WarrantyPolicy.id == order.labor_warranty_policy_id)
-                        )
-                    ).scalar_one_or_none()
-                if order.parts_warranty_policy_id is not None:
-                    parts_policy = (
-                        await self.db.execute(
-                            select(WarrantyPolicy).where(WarrantyPolicy.id == order.parts_warranty_policy_id)
-                        )
-                    ).scalar_one_or_none()
-
-                if labor_policy is not None:
-                    labor_days = None if labor_policy.no_expiration else labor_policy.duration_days
-                    labor_km = None if labor_policy.no_expiration else labor_policy.duration_km
-                else:
-                    labor_days, labor_km = fallback_labor_days, fallback_labor_km
-
-                if parts_policy is not None:
-                    parts_days = None if parts_policy.no_expiration else parts_policy.duration_days
-                    parts_km = None if parts_policy.no_expiration else parts_policy.duration_km
-                else:
-                    parts_days, parts_km = fallback_parts_days, fallback_parts_km
-
-                tasks = list(
-                    (
-                        await self.db.execute(
-                            select(ServiceOrderTask).where(ServiceOrderTask.service_order_id == order.id)
-                        )
-                    ).scalars()
-                )
-                task_ids_with_parts: set[uuid.UUID] = set()
-                if tasks:
-                    rows = await self.db.execute(
-                        select(ServiceOrderTransferLine.service_order_task_id)
-                        .where(ServiceOrderTransferLine.service_order_task_id.in_([t.id for t in tasks]))
-                        .distinct()
-                    )
-                    task_ids_with_parts = {row[0] for row in rows if row[0] is not None}
-
-                starts_at = now.date()
-
-                def _workshop_warranty(task, coverage, days, km, policy):
-                    key = "labor" if coverage == WorkshopWarrantyCoverage.MANO_DE_OBRA else "parts"
-                    snapshot = (task.warranty_snapshot or {}).get(key) if policy is None else None
-                    if snapshot:
-                        days, km = snapshot["duration_days"], snapshot["duration_km"]
-                    return WorkshopWarranty(
-                        filial_id=order.filial_id,
-                        vin=vehicle.vin,
-                        service_order_id=order.id,
-                        service_order_task_id=task.id,
-                        coverage_type=coverage,
-                        tempario_code_snapshot=task.code_snapshot,
-                        tempario_name_snapshot=task.name_snapshot,
-                        technician_user_id=order.technician_user_id,
-                        starts_at=starts_at,
-                        duration_days=days,
-                        duration_km=km,
-                        expires_at=starts_at + timedelta(days=days) if days is not None else None,
-                        expiration_mileage=(
-                            order.intake_mileage + km
-                            if order.intake_mileage is not None and km is not None
-                            else None
-                        ),
-                        warranty_policy_id=policy.id if policy is not None else (uuid.UUID(snapshot["id"]) if snapshot else None),
-                        warranty_policy_name_snapshot=policy.name if policy is not None else (snapshot["name"] if snapshot else None),
-                        covered_by_snapshot=policy.covered_by if policy is not None else (WarrantyPolicyCoveredBy(snapshot["covered_by"]) if snapshot else None),
-                    )
-
-                for task in tasks:
-                    self.db.add(
-                        _workshop_warranty(
-                            task, WorkshopWarrantyCoverage.MANO_DE_OBRA, labor_days, labor_km, labor_policy
-                        )
-                    )
-                    if task.id in task_ids_with_parts:
-                        self.db.add(
-                            _workshop_warranty(
-                                task, WorkshopWarrantyCoverage.REPUESTO, parts_days, parts_km, parts_policy
-                            )
-                        )
+            if not order.settings_snapshot:
+                await self.ensure_workshop_warranties(order)
 
             await self.db.commit()
             return invoice
@@ -497,6 +453,166 @@ class BillingService:
         except Exception:
             await self.db.rollback()
             raise
+
+    async def ensure_workshop_warranties(self, order):
+        """Copy coverage at closing for new ODS; never modify existing warranty rows."""
+        existing = (
+            await self.db.execute(
+                select(WorkshopWarranty.id)
+                .where(WorkshopWarranty.service_order_id == order.id)
+                .limit(1)
+            )
+        ).first()
+        if existing:
+            return
+        vehicle = await self.db.get(Vehicle, order.vehicle_id)
+        if vehicle is not None and vehicle.vin:
+            settings_result = await self.db.execute(
+                select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
+            )
+            settings = settings_result.scalar_one_or_none()
+            from app.modules.ajustes.snapshots import order_settings
+
+            settings = order_settings(order, settings)
+            fallback_labor_days = settings.workshop_warranty_days if settings else 90
+            fallback_labor_km = settings.workshop_warranty_km if settings else 5000
+            fallback_parts_days = settings.workshop_parts_warranty_days if settings else 90
+            fallback_parts_km = settings.workshop_parts_warranty_km if settings else 5000
+
+            # A WarrantyPolicy selected on the ODS (see ServiceOrder.
+            # labor_warranty_policy_id/parts_warranty_policy_id) takes
+            # precedence over the filial-wide LaborSettings fallback —
+            # orders that never picked one keep today's behavior exactly.
+            labor_policy = parts_policy = None
+            if order.labor_warranty_policy_id is not None:
+                labor_policy = (
+                    await self.db.execute(
+                        select(WarrantyPolicy).where(
+                            WarrantyPolicy.id == order.labor_warranty_policy_id
+                        )
+                    )
+                ).scalar_one_or_none()
+            if order.parts_warranty_policy_id is not None:
+                parts_policy = (
+                    await self.db.execute(
+                        select(WarrantyPolicy).where(
+                            WarrantyPolicy.id == order.parts_warranty_policy_id
+                        )
+                    )
+                ).scalar_one_or_none()
+
+            if labor_policy is not None:
+                labor_days = None if labor_policy.no_expiration else labor_policy.duration_days
+                labor_km = None if labor_policy.no_expiration else labor_policy.duration_km
+            else:
+                labor_days, labor_km = fallback_labor_days, fallback_labor_km
+
+            if parts_policy is not None:
+                parts_days = None if parts_policy.no_expiration else parts_policy.duration_days
+                parts_km = None if parts_policy.no_expiration else parts_policy.duration_km
+            else:
+                parts_days, parts_km = fallback_parts_days, fallback_parts_km
+
+            tasks = list(
+                (
+                    await self.db.execute(
+                        select(ServiceOrderTask).where(
+                            ServiceOrderTask.service_order_id == order.id
+                        )
+                    )
+                ).scalars()
+            )
+            task_ids_with_parts: set[uuid.UUID] = set()
+            if tasks:
+                parts_query = (
+                    select(ServiceOrderTransferLine.service_order_task_id)
+                    .where(
+                        ServiceOrderTransferLine.service_order_task_id.in_([t.id for t in tasks])
+                    )
+                    .distinct()
+                )
+                if order.settings_snapshot:
+                    parts_query = parts_query.join(
+                        ServiceOrderTransfer,
+                        ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                    ).where(ServiceOrderTransfer.stock_deducted.is_(True))
+                rows = await self.db.execute(parts_query)
+                task_ids_with_parts = {row[0] for row in rows if row[0] is not None}
+
+            starts_at = billing_day()
+
+            def _workshop_warranty(task, coverage, days, km, policy):
+                key = "labor" if coverage == WorkshopWarrantyCoverage.MANO_DE_OBRA else "parts"
+                snapshot = (task.warranty_snapshot or {}).get(key) if policy is None else None
+                if snapshot:
+                    days, km = snapshot["duration_days"], snapshot["duration_km"]
+                days = int(days) if days is not None else None
+                km = int(km) if km is not None else None
+                return WorkshopWarranty(
+                    filial_id=order.filial_id,
+                    vin=vehicle.vin,
+                    service_order_id=order.id,
+                    service_order_task_id=task.id,
+                    coverage_type=coverage,
+                    tempario_code_snapshot=task.code_snapshot,
+                    tempario_name_snapshot=task.name_snapshot,
+                    technician_user_id=order.technician_user_id,
+                    starts_at=starts_at,
+                    duration_days=days,
+                    duration_km=km,
+                    expires_at=starts_at + timedelta(days=days) if days is not None else None,
+                    expiration_mileage=(
+                        (
+                            order.exit_mileage
+                            if order.exit_mileage is not None
+                            else order.intake_mileage
+                        )
+                        + int(km)
+                        if (order.exit_mileage is not None or order.intake_mileage is not None)
+                        and km is not None
+                        else None
+                    ),
+                    warranty_policy_id=(
+                        policy.id
+                        if policy is not None
+                        else (
+                            uuid.UUID(snapshot["id"]) if snapshot and snapshot.get("id") else None
+                        )
+                    ),
+                    warranty_policy_name_snapshot=(
+                        policy.name
+                        if policy is not None
+                        else (snapshot["name"] if snapshot else None)
+                    ),
+                    covered_by_snapshot=(
+                        policy.covered_by
+                        if policy is not None
+                        else (WarrantyPolicyCoveredBy(snapshot["covered_by"]) if snapshot else None)
+                    ),
+                )
+
+            for task in tasks:
+                if (task.warranty_snapshot or {}).get("none"):
+                    continue
+                self.db.add(
+                    _workshop_warranty(
+                        task,
+                        WorkshopWarrantyCoverage.MANO_DE_OBRA,
+                        labor_days,
+                        labor_km,
+                        labor_policy,
+                    )
+                )
+                if task.id in task_ids_with_parts:
+                    self.db.add(
+                        _workshop_warranty(
+                            task,
+                            WorkshopWarrantyCoverage.REPUESTO,
+                            parts_days,
+                            parts_km,
+                            parts_policy,
+                        )
+                    )
 
     # Cuentas por cobrar
 
@@ -512,11 +628,20 @@ class BillingService:
         )
 
     def _pending_amount(self, invoice: ServiceOrderInvoice) -> float:
-        return max(0.0, round(self._net_expected(invoice) - float(invoice.amount_paid_at_issuance)
-                              - float(invoice.net_collected_amount or 0)
-                              - float(invoice.withholding_amount or 0), 2))
+        return max(
+            0.0,
+            round(
+                self._net_expected(invoice)
+                - float(invoice.amount_paid_at_issuance)
+                - float(invoice.net_collected_amount or 0)
+                - float(invoice.withholding_amount or 0),
+                2,
+            ),
+        )
 
-    def _receivable_to_read(self, invoice: ServiceOrderInvoice, order: ServiceOrder, client: Client) -> ReceivableRead:
+    def _receivable_to_read(
+        self, invoice: ServiceOrderInvoice, order: ServiceOrder, client: Client
+    ) -> ReceivableRead:
         net_expected = self._net_expected(invoice)
         days_outstanding = (venezuela_today() - invoice.issued_at.date()).days
         return ReceivableRead(
@@ -553,7 +678,10 @@ class BillingService:
             .where(ServiceOrder.filial_id == filial_id, ServiceOrderInvoice.collected_at.is_(None))
             .order_by(ServiceOrderInvoice.issued_at)
         )
-        return [self._receivable_to_read(invoice, order, client) for invoice, order, client in result.all()]
+        return [
+            self._receivable_to_read(invoice, order, client)
+            for invoice, order, client in result.all()
+        ]
 
     async def collect_invoice(
         self,
@@ -566,7 +694,8 @@ class BillingService:
         except IntegrityError as exc:
             await self.db.rollback()
             raise ConflictError(
-                "El identificador de cobro ya fue utilizado.", error_code="collection_request_conflict"
+                "El identificador de cobro ya fue utilizado.",
+                error_code="collection_request_conflict",
             ) from exc
         except Exception:
             await self.db.rollback()
@@ -659,7 +788,9 @@ class BillingService:
         self.db.add(income)
         await self.db.flush()
 
-        invoice.withholding_amount = money(invoice.withholding_amount or 0) + payload.withholding_amount
+        invoice.withholding_amount = (
+            money(invoice.withholding_amount or 0) + payload.withholding_amount
+        )
         invoice.net_collected_amount = money(invoice.net_collected_amount or 0) + amount_usd
         invoice.collection_account_id = account.id
         invoice.collection_income_entry_id = income.id
@@ -681,7 +812,9 @@ class BillingService:
         await self.db.commit()
         return response
 
-    async def get_holding_warranty_receivables(self, holding_id: uuid.UUID) -> HoldingWarrantyReceivablesReport:
+    async def get_holding_warranty_receivables(
+        self, holding_id: uuid.UUID
+    ) -> HoldingWarrantyReceivablesReport:
         filiales = (
             (await self.db.execute(select(Filial).where(Filial.holding_id == holding_id)))
             .scalars()
@@ -697,12 +830,15 @@ class BillingService:
             )
             invoices = result.scalars().all()
             total_invoiced = sum(float(i.total_usd) for i in invoices)
-            total_pending = sum(
-                self._pending_amount(i) for i in invoices if i.collected_at is None
+            total_pending = sum(self._pending_amount(i) for i in invoices if i.collected_at is None)
+            total_collected = sum(
+                float(i.amount_paid_at_issuance) + float(i.net_collected_amount or 0)
+                for i in invoices
             )
-            total_collected = sum(float(i.amount_paid_at_issuance) + float(i.net_collected_amount or 0) for i in invoices)
             total_withheld = sum(
-                float(i.iva_retention_amount or 0) + float(i.islr_retention_amount or 0) + float(i.withholding_amount or 0)
+                float(i.iva_retention_amount or 0)
+                + float(i.islr_retention_amount or 0)
+                + float(i.withholding_amount or 0)
                 for i in invoices
             )
             rows.append(

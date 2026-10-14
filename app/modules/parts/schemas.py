@@ -265,11 +265,7 @@ class PartSalePaymentQuote(BaseModel):
 
 
 class PartSalePaymentCreate(PartSalePaymentQuoteInput):
-    # No quote_hash/request_id round-trip like ODS's InvoiceCreate — simpler
-    # on purpose (see plan notes): collect_sale_payment always re-reads
-    # pending_amount fresh under a row lock on the sale, so it never trusts
-    # a stale client-side quote, and a genuine concurrent double-collection
-    # is blocked by that same lock rather than an idempotency key.
+    request_id: uuid.UUID | None = None
     paid_usd: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
     paid_bs: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
     usd_account_id: uuid.UUID | None = None

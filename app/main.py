@@ -9,7 +9,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from scalar_fastapi import get_scalar_api_reference
 
+from app.core.audit_logging import AuditLogRuntime, audit_logger, record_event, register_database_audit
 from app.core.config import get_settings
+from app.core.telemetry import router as telemetry_router
 from app.core.database import AsyncSessionLocal
 from app.core.http_security import HttpSecurityMiddleware
 from app.core.request_tracking import RequestTrackingMiddleware
@@ -56,6 +58,9 @@ async def _refresh_bcv_rate_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log_runtime = AuditLogRuntime(settings.logs_dir, settings.logs_timezone).start()
+    register_database_audit()
+    record_event(audit_logger, "application_started")
     task = asyncio.create_task(_refresh_bcv_rate_loop())
     try:
         yield
@@ -63,6 +68,8 @@ async def lifespan(app: FastAPI):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        record_event(audit_logger, "application_stopped")
+        log_runtime.stop()
 
 
 app = FastAPI(
@@ -87,6 +94,7 @@ app.add_middleware(RequestTrackingMiddleware)
 register_exception_handlers(app)
 
 app.include_router(auth_router, prefix=settings.api_v1_prefix)
+app.include_router(telemetry_router, prefix=settings.api_v1_prefix)
 app.include_router(holdings_router, prefix=settings.api_v1_prefix)
 app.include_router(filiales_router, prefix=settings.api_v1_prefix)
 app.include_router(roles_router, prefix=settings.api_v1_prefix)

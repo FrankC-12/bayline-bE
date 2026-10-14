@@ -174,6 +174,7 @@ class ClientCreate(ClientBase):
 
 
 class ClientUpdate(BaseModel):
+    expected_updated_at: datetime | None = None
     full_name: str | None = Field(default=None, min_length=2, max_length=150)
     client_type: ClientType | None = None
     document_type: DocumentType | None = None
@@ -237,3 +238,21 @@ class ClientRead(BaseModel):
     vehicles: list[VehicleRead]
     created_at: datetime
     updated_at: datetime
+
+
+class VehicleServiceHistoryItem(BaseModel):
+    id: uuid.UUID
+    code: str
+    created_at: datetime
+    status: str
+    type: str
+    services: list[str]
+    mileage: int | None
+    total: float
+
+
+class VehicleServiceHistoryRead(BaseModel):
+    items: list[VehicleServiceHistoryItem]
+    total: int
+    page: int
+    size: int

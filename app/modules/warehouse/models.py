@@ -1,7 +1,19 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,7 +30,10 @@ class StockInReason(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     holding_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("holdings.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("holdings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -35,11 +50,16 @@ class Warehouse(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(80), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    is_workshop_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_workshop_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -51,11 +71,17 @@ class PartLot(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     lot_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     warehouse_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("warehouses.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="CASCADE"), nullable=False, index=True
@@ -71,7 +97,15 @@ class PartLot(Base):
     purchase_request_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("purchase_requests.id", ondelete="SET NULL"), nullable=True
     )
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    origin_lot_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_lots.id", ondelete="RESTRICT"), nullable=True
+    )
+    origin_transfer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("warehouse_transfers.id", ondelete="RESTRICT"), nullable=True
+    )
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
     @property
     def code(self) -> str:
@@ -83,10 +117,23 @@ class StockMovement(Base):
     stock-outs, transfers between warehouses, or returns to a supplier."""
 
     __tablename__ = "stock_movements"
+    __table_args__ = (
+        Index("ix_stock_movements_filial_chronology", "filial_id", "created_at", "id"),
+        Index(
+            "ix_stock_movements_warehouse_chronology",
+            "filial_id",
+            "warehouse_id",
+            "created_at",
+            "id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     warehouse_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=False
@@ -116,7 +163,10 @@ class Transfer(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     origin_warehouse_id: Mapped[uuid.UUID] = mapped_column(
@@ -125,7 +175,12 @@ class Transfer(Base):
     destination_warehouse_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("warehouses.id", ondelete="RESTRICT"), nullable=False
     )
-    workshop_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("service_order_transfers.id", ondelete="SET NULL"), nullable=True, index=True)
+    workshop_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("service_order_transfers.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     status: Mapped[TransferStatus] = mapped_column(
         Enum(TransferStatus, name="warehouse_transfer_status"),
         nullable=False,
@@ -152,13 +207,72 @@ class TransferLine(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     transfer_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("warehouse_transfers.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("warehouse_transfers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="CASCADE"), nullable=False
     )
-    workshop_request_line_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("service_order_transfer_lines.id", ondelete="SET NULL"), nullable=True)
+    workshop_request_line_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("service_order_transfer_lines.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, default=0)
 
     transfer: Mapped["Transfer"] = relationship(back_populates="lines")
+
+
+class TransferLotAllocation(Base):
+    """Physical FIFO lineage: one destination lot for each consumed origin lot."""
+
+    __tablename__ = "warehouse_transfer_lot_allocations"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transfer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("warehouse_transfers.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    origin_lot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("part_lots.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    destination_lot_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("part_lots.id", ondelete="RESTRICT"), nullable=False
+    )
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+
+
+class StockOutReason(Base):
+    """A reason an inbound stock movement (entrada de repuestos) can be
+    tagged with — e.g. "Compra directa", "Ajuste de inventario". Shared by
+    every filial in a Holding, managed from Ajustes."""
+
+    __tablename__ = "stock_out_reasons"
+    __table_args__ = (
+        Index("uq_stock_out_reasons_holding_name", "holding_id", text("lower(name)"), unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    movement_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="salida", server_default="salida"
+    )
+    holding_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("holdings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(80), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

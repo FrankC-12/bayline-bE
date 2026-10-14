@@ -4,7 +4,7 @@ system rows are seeded per filial (regular/mpt/retrabajo/garantia_fabrica/
 comeback/campana); an admin can add more from Postventas, but those never
 carry claim_type/is_selectable — they always behave like "regular". Listing
 is gated by asesor-servicios VER (anyone creating an ODS needs the picker);
-creating/editing the catalog is gated by post-ventas EDITAR."""
+creating/editing the catalog is gated by ajustes EDITAR."""
 
 import uuid
 
@@ -168,7 +168,7 @@ async def test_create_order_rejects_an_inactive_or_foreign_order_type(env):
         await service.create_order(payload)
 
 
-# Permission gating — list (VER on asesor-servicios) vs. create/update (EDITAR on post-ventas).
+# Permission gating — list (VER on asesor-servicios) vs. create/update (EDITAR on ajustes).
 
 
 @pytest.mark.asyncio
@@ -185,13 +185,13 @@ async def test_asesor_servicios_alone_cannot_create_an_order_type(make_user):
 
 
 @pytest.mark.asyncio
-async def test_post_ventas_editar_can_create_an_order_type(make_user):
-    db, user, filial_id = make_user("post-ventas", AccessLevel.EDITAR)
+async def test_ajustes_editar_can_create_an_order_type(make_user):
+    db, user, filial_id = make_user("ajustes", AccessLevel.EDITAR)
     await _ensure_order_types_access(user, filial_id, db, AccessLevel.EDITAR)
 
 
 @pytest.mark.asyncio
 async def test_post_ventas_ver_cannot_create_an_order_type(make_user):
-    db, user, filial_id = make_user("post-ventas", AccessLevel.VER)
+    db, user, filial_id = make_user("ajustes", AccessLevel.VER)
     with pytest.raises(InsufficientPermissionsError):
         await _ensure_order_types_access(user, filial_id, db, AccessLevel.EDITAR)

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
+from app.core.idempotency import remember_operation, replay_operation
 from app.modules.parts.enums import PartSaleStatus, ReturnCondition
 from app.modules.parts.exceptions import (
     DispatchQuantityMismatchError,
@@ -44,6 +45,7 @@ from app.modules.parts.schemas import (
     PartRead,
     PartReturnCreate,
     PartSaleCreate,
+    PartSaleRead,
     PartSaleLineDispatch,
     PartSalePaymentCreate,
     PartSalePaymentQuote,
@@ -167,13 +169,13 @@ class PartsService:
                 category_id=part.category_id,
                 category_name=categories.get(part.category_id, ""),
                 vehicle_brand_id=part.vehicle_brand_id,
-                vehicle_brand_name=brands.get(part.vehicle_brand_id)
-                if part.vehicle_brand_id
-                else None,
+                vehicle_brand_name=(
+                    brands.get(part.vehicle_brand_id) if part.vehicle_brand_id else None
+                ),
                 vehicle_model_id=part.vehicle_model_id,
-                vehicle_model_name=models.get(part.vehicle_model_id)
-                if part.vehicle_model_id
-                else None,
+                vehicle_model_name=(
+                    models.get(part.vehicle_model_id) if part.vehicle_model_id else None
+                ),
                 year_from=part.year_from,
                 year_to=part.year_to,
                 measure_id=part.measure_id,
@@ -685,7 +687,12 @@ class PartsService:
             if part.filial_id != payload.filial_id:
                 raise BadRequestError("El repuesto no pertenece a la filial.")
             if consume:
-                await self.db.execute(select(Part).where(Part.id == part_id).with_for_update().execution_options(populate_existing=True))
+                await self.db.execute(
+                    select(Part)
+                    .where(Part.id == part_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
             query = (
                 select(PartLot)
                 .where(
@@ -700,8 +707,11 @@ class PartsService:
                 query = query.with_for_update().execution_options(populate_existing=True)
             lots = list((await self.db.execute(query)).scalars().all())
             from app.modules.warehouse.reservations import available_lots, reserved_by_lot
+
             reserved = await reserved_by_lot(self.db, part.id)
-            picked = allocate_fifo(available_lots(lots, reserved), quantity, part_id=part.id, part_name=part.name)
+            picked = allocate_fifo(
+                available_lots(lots, reserved), quantity, part_id=part.id, part_name=part.name
+            )
             by_id = {lot.id: lot for lot in lots}
             allocations = [(by_id[lot.id], take) for lot, take in picked]
             cost, price, total = price_allocations(
@@ -871,9 +881,7 @@ class PartsService:
                 raise InvalidSaleStatusTransitionError(sale.status.value, new_status.value)
 
             if new_status == PartSaleStatus.CANCELADO and sale.amount_collected > 0:
-                raise BadRequestError(
-                    "No se puede cancelar una venta con cobros registrados."
-                )
+                raise BadRequestError("No se puede cancelar una venta con cobros registrados.")
 
             if new_status == PartSaleStatus.PEDIDO:
                 self._apply_dispatch(sale, dispatched_lines)
@@ -991,6 +999,24 @@ class PartsService:
     async def collect_sale_payment(
         self, sale_id: uuid.UUID, payload: PartSalePaymentCreate, user_id: uuid.UUID | None
     ) -> PartSale:
+        try:
+            return await self._collect_sale_payment(sale_id, payload, user_id)
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    async def _collect_sale_payment(self, sale_id, payload, user_id):
+        initial = await self.get_sale(sale_id)
+        replay = await replay_operation(
+            self.db,
+            payload,
+            initial.filial_id,
+            "part_sale_collection",
+            user_id,
+            resource_id=sale_id,
+        )
+        if replay is not None:
+            return PartSaleRead.model_validate(replay)
         from app.modules.administracion.enums import (
             AccountCurrency,
             IncomeSource,
@@ -1064,11 +1090,11 @@ class PartsService:
                     origin_reference=sale.code,
                     exchange_rate=float(rate) if rate else None,
                     amount_usd=float(amount_usd),
-                    amount_bs=float(money(amount * rate))
-                    if currency == AccountCurrency.USD and rate
-                    else float(amount)
-                    if currency == AccountCurrency.BS
-                    else None,
+                    amount_bs=(
+                        float(money(amount * rate))
+                        if currency == AccountCurrency.USD and rate
+                        else float(amount) if currency == AccountCurrency.BS else None
+                    ),
                     description=f"Cobro {sale.code} · {sale.client_name}",
                     amount=float(amount),
                     currency=currency,
@@ -1080,6 +1106,17 @@ class PartsService:
                 )
             )
 
+        await self.db.flush()
+        response = await self.get_sale(sale_id)
+        remember_operation(
+            self.db,
+            payload,
+            sale.filial_id,
+            "part_sale_collection",
+            user_id,
+            PartSaleRead.model_validate(response).model_dump(mode="json"),
+            resource_id=sale_id,
+        )
         await self.db.commit()
         return await self.get_sale(sale_id)
 

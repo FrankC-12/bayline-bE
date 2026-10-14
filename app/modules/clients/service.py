@@ -1,15 +1,15 @@
 import calendar
 import re
-import unicodedata
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import BadRequestError
+from app.core.exceptions import BadRequestError, ConflictError
+from app.core.search import fold_search
 from app.modules.administracion.exceptions import SupplierNotFoundError
 from app.modules.administracion.models import Supplier
 from app.modules.clients.enums import ClientType, DocumentType, MaintenancePlanEntryStatus
@@ -51,8 +51,7 @@ def _document_from_rif(rif: str) -> tuple[DocumentType, str]:
 def _fold(value: str) -> str:
     """Lowercase and strip accents/diacritics, so search matches regardless
     of how the user types them (e.g. "jose"/"JOSÉ" both match "José")."""
-    decomposed = unicodedata.normalize("NFKD", value)
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
+    return fold_search(value)
 
 
 def _add_months(base: date, months: int) -> date:
@@ -95,6 +94,42 @@ class ClientService:
         await self._attach_next_maintenance_plan(clients)
         return clients
 
+    async def page_clients(self, filial_id, *, search=None, page=1, page_size=30):
+        from sqlalchemy import func, or_
+
+        from app.core.pagination import Page, page_query
+        from app.core.search import fold_search
+        from app.modules.clients.schemas import ClientRead
+
+        query = (
+            select(Client)
+            .options(selectinload(Client.vehicles))
+            .where(Client.filial_id == filial_id)
+            .order_by(Client.full_name, Client.id)
+        )
+        if search and search.strip():
+            term = fold_search(search.strip())
+            vehicle_match = Client.vehicles.any(
+                or_(
+                    func.lower(Vehicle.plate).contains(term, autoescape=True),
+                    func.lower(Vehicle.vin).contains(term, autoescape=True),
+                )
+            )
+            query = query.where(
+                or_(
+                    Client.normalized_name.contains(term, autoescape=True),
+                    func.lower(Client.document_number).contains(term, autoescape=True),
+                    vehicle_match,
+                )
+            )
+        rows, metadata = await page_query(self.db, query, page, page_size)
+        clients = list(rows.scalars())
+        await self._attach_current_mileage(clients)
+        await self._attach_next_maintenance_plan(clients)
+        return Page[ClientRead](
+            items=[ClientRead.model_validate(client) for client in clients], **metadata
+        )
+
     async def get_client(self, client_id: uuid.UUID) -> Client:
         query = select(Client).options(selectinload(Client.vehicles)).where(Client.id == client_id)
         result = await self.db.execute(query)
@@ -133,6 +168,35 @@ class ClientService:
             )
             orders_by_id = {row.id: row.sequence_number for row in rows}
 
+        from datetime import UTC
+        from zoneinfo import ZoneInfo
+
+        from app.modules.service_orders.enums import ServiceOrderStatus
+        from app.modules.service_orders.models import ServiceOrder
+
+        def utc(value):
+            return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+        closed_rows = (
+            await self.db.execute(
+                select(
+                    ServiceOrder.id,
+                    ServiceOrder.vehicle_id,
+                    ServiceOrder.exit_mileage,
+                    ServiceOrder.closed_at,
+                    ServiceOrder.sequence_number,
+                )
+                .where(
+                    ServiceOrder.vehicle_id.in_(vehicle_ids),
+                    ServiceOrder.status == ServiceOrderStatus.ORDEN_CERRADA,
+                    ServiceOrder.exit_mileage.is_not(None),
+                )
+                .order_by(ServiceOrder.closed_at.desc(), ServiceOrder.id)
+            )
+        ).all()
+        closed_by_vehicle = {}
+        for row in closed_rows:
+            closed_by_vehicle.setdefault(row.vehicle_id, row)
         for client in clients:
             for vehicle in client.vehicles:
                 inspection = latest.get(vehicle.id)
@@ -143,10 +207,26 @@ class ClientService:
                 vehicle.current_mileage_service_order_id = (
                     inspection.service_order_id if inspection else None
                 )
-                sequence_number = orders_by_id.get(inspection.service_order_id) if inspection else None
+                sequence_number = (
+                    orders_by_id.get(inspection.service_order_id) if inspection else None
+                )
                 vehicle.current_mileage_service_order_code = (
                     f"ODS-{sequence_number}" if sequence_number is not None else None
                 )
+                departure = closed_by_vehicle.get(vehicle.id)
+                if (
+                    departure
+                    and departure.closed_at
+                    and (
+                        inspection is None or utc(departure.closed_at) >= utc(inspection.created_at)
+                    )
+                ):
+                    vehicle.current_mileage = departure.exit_mileage
+                    vehicle.current_mileage_visit_date = (
+                        utc(departure.closed_at).astimezone(ZoneInfo("America/Caracas")).date()
+                    )
+                    vehicle.current_mileage_service_order_id = departure.id
+                    vehicle.current_mileage_service_order_code = f"ODS-{departure.sequence_number}"
 
     async def _attach_next_maintenance_plan(self, clients: list[Client]) -> None:
         """Denormalizes the advisor-suggested next-visit tempario (set at ODS
@@ -267,7 +347,9 @@ class ClientService:
             for i in inspections
         ]
 
-    async def get_or_create_supplier_billing_client(self, filial_id: uuid.UUID, supplier_id: uuid.UUID) -> Client:
+    async def get_or_create_supplier_billing_client(
+        self, filial_id: uuid.UUID, supplier_id: uuid.UUID
+    ) -> Client:
         """Resolves the Client that stands in for a Supplier when an ODS is
         billed to it (e.g. the manufacturer or a parts supplier covering a
         warranty claim) — same idea as is_holding_billing, generalized to
@@ -346,6 +428,33 @@ class ClientService:
         return await self.get_client(client.id)
 
     async def update_client(self, client_id: uuid.UUID, payload: ClientUpdate) -> Client:
+        # Serialize updates and compare the version before changing any fields.
+        locked = (
+            await self.db.execute(
+                select(Client)
+                .where(Client.id == client_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if locked is None:
+            raise ClientNotFoundError(str(client_id))
+        if payload.expected_updated_at is not None:
+            current = locked.updated_at
+            current = (
+                current.replace(tzinfo=UTC) if current.tzinfo is None else current.astimezone(UTC)
+            )
+            expected = payload.expected_updated_at
+            expected = (
+                expected.replace(tzinfo=UTC)
+                if expected.tzinfo is None
+                else expected.astimezone(UTC)
+            )
+            if current != expected:
+                raise ConflictError(
+                    "Otro usuario modificó este cliente. Recarga su ficha antes de guardar.",
+                    error_code="client_version_conflict",
+                )
         client = await self.get_client(client_id)
 
         if payload.document_number and payload.document_number != client.document_number:
@@ -370,6 +479,8 @@ class ClientService:
 
         if payload.vehicles is not None:
             await self._reconcile_vehicles(client, payload.vehicles)
+        # Vehicle-only changes also advance the parent version.
+        client.updated_at = datetime.now(UTC)
 
         try:
             await self.db.commit()
@@ -428,7 +539,9 @@ class ClientService:
             transmission=v.transmission,
         )
 
-    async def _ensure_document_is_available(self, filial_id: uuid.UUID, document_number: str) -> None:
+    async def _ensure_document_is_available(
+        self, filial_id: uuid.UUID, document_number: str
+    ) -> None:
         result = await self.db.execute(
             select(Client).where(
                 Client.filial_id == filial_id, Client.document_number == document_number
@@ -490,7 +603,9 @@ class ClientService:
         plan = await self.db.get(
             MaintenancePlan,
             vehicle.maintenance_plan_id,
-            options=[selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario)],
+            options=[
+                selectinload(MaintenancePlan.entries).selectinload(MaintenancePlanEntry.tempario)
+            ],
         )
         if plan is None:
             return VehiclePlanStatusRead(
@@ -561,9 +676,7 @@ class ClientService:
                     interval_months=entry.interval_months,
                     status=status,
                     completed_at=completion[1] if completion else None,
-                    completed_service_order_code=(
-                        f"ODS-{completion[0]}" if completion else None
-                    ),
+                    completed_service_order_code=(f"ODS-{completion[0]}" if completion else None),
                 )
             )
 

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
+from app.modules.administracion.models import PurchaseRequest, SupplierClaim
 from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.models import Vehicle
 from app.modules.parts.models import Part
@@ -17,14 +18,14 @@ from app.modules.parts.pricing import PARTS_MULTIPLIERS, price_parts_cost
 from app.modules.post_ventas.enums import WarrantyPolicyAppliesTo, WarrantyPolicyStatus
 from app.modules.post_ventas.models import LaborSettings, Tempario, WarrantyPolicy
 from app.modules.service_orders.enums import (
-    ServiceOrderPayer,
-    ServiceOrderStatus,
     SYSTEM_ORDER_TYPE_CAMPANA,
     SYSTEM_ORDER_TYPE_COMEBACK,
     SYSTEM_ORDER_TYPE_GARANTIA_FABRICA,
     SYSTEM_ORDER_TYPE_MPT,
     SYSTEM_ORDER_TYPE_REGULAR,
     SYSTEM_ORDER_TYPE_RETRABAJO,
+    ServiceOrderPayer,
+    ServiceOrderStatus,
     TaskStatus,
     TransferStatus,
     UpsellStatus,
@@ -97,7 +98,6 @@ from app.modules.service_orders.schemas import (
 )
 from app.modules.warehouse.fifo import allocate_fifo_preview
 from app.modules.warehouse.models import PartLot
-from app.modules.administracion.models import PurchaseRequest, SupplierClaim
 
 # How long an ODT line's FIFO preview also acts as a soft reservation on the
 # specific lot units it drew from — long enough to cover the normal
@@ -325,6 +325,80 @@ class ServiceOrderService:
         result = await self.db.execute(query)
         return list(result.scalars().all())
 
+    async def page_orders(
+        self,
+        filial_id,
+        *,
+        view="active",
+        status=None,
+        search=None,
+        date_from=None,
+        date_to=None,
+        technician_user_id=None,
+        page=1,
+        page_size=30,
+    ):
+        from sqlalchemy import String, cast, or_
+
+        from app.core.pagination import Page, date_range, page_query
+        from app.core.search import fold_search
+        from app.modules.clients.models import Client
+        from app.modules.service_orders.schemas import ServiceOrderPageItem, ServiceOrderRead
+        from app.modules.users.models import User
+
+        query = (
+            select(
+                ServiceOrder,
+                Client.full_name,
+                Vehicle.brand,
+                Vehicle.model,
+                Vehicle.plate,
+                User.full_name,
+            )
+            .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
+            .join(Client, Client.id == Vehicle.client_id)
+            .outerjoin(User, User.id == ServiceOrder.technician_user_id)
+            .where(ServiceOrder.filial_id == filial_id)
+        )
+        statuses = (
+            ACTIVE_STATUSES if view == "active" else HISTORY_STATUSES if view == "history" else None
+        )
+        if statuses:
+            query = query.where(ServiceOrder.status.in_(statuses))
+        if status:
+            query = query.where(ServiceOrder.status == status)
+        if technician_user_id is not None:
+            query = query.where(ServiceOrder.technician_user_id == technician_user_id)
+        if search and search.strip():
+            term = search.strip().lower()
+            query = query.where(
+                or_(
+                    Client.normalized_name.contains(fold_search(term), autoescape=True),
+                    func.lower(Vehicle.plate).contains(term, autoescape=True),
+                    func.lower(Vehicle.brand + " " + Vehicle.model).contains(term, autoescape=True),
+                    func.lower(User.full_name).contains(term, autoescape=True),
+                    ("ods-" + cast(ServiceOrder.sequence_number, String)).contains(
+                        term, autoescape=True
+                    ),
+                )
+            )
+        query = date_range(query, ServiceOrder.created_at, date_from, date_to)
+        query = query.order_by(ServiceOrder.created_at.desc(), ServiceOrder.id.desc())
+        rows, metadata = await page_query(self.db, query, page, page_size)
+        return Page[ServiceOrderPageItem](
+            items=[
+                ServiceOrderPageItem(
+                    **ServiceOrderRead.model_validate(order).model_dump(),
+                    client_name=client_name,
+                    vehicle_label=f"{brand} {model}",
+                    vehicle_plate=plate,
+                    technician_name=technician_name,
+                )
+                for order, client_name, brand, model, plate, technician_name in rows
+            ],
+            **metadata,
+        )
+
     async def count_transfers_by_status(self, filial_id: uuid.UUID) -> dict[TransferStatus, int]:
         """ServiceOrderTransfer (an "ODT") has no filial_id of its own —
         it's scoped to a filial only through the ServiceOrder it belongs
@@ -380,7 +454,28 @@ class ServiceOrderService:
                 error_code="customer_reason_required",
             )
 
-        order_type = await self._resolve_order_type(payload.filial_id, payload.order_type_id)
+        if payload.warranty_claim_id is not None and payload.order_type_id is None:
+            origin_claim = await self.db.get(WarrantyClaim, payload.warranty_claim_id)
+            if origin_claim is None:
+                raise WarrantyClaimNotFoundError(str(payload.warranty_claim_id))
+            kind = (
+                (
+                    await self.db.execute(
+                        select(ServiceOrderTypeCatalog).where(
+                            ServiceOrderTypeCatalog.filial_id == payload.filial_id,
+                            ServiceOrderTypeCatalog.claim_type == origin_claim.claim_type,
+                            ServiceOrderTypeCatalog.is_active.is_(True),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if kind is None:
+                raise BadRequestError("No existe el tipo de ODS para este reclamo.")
+            order_type = kind
+        else:
+            order_type = await self._resolve_order_type(payload.filial_id, payload.order_type_id)
 
         # A type whose catalog row carries a claim_type (garantia_fabrica/
         # comeback/campana, by default) must reference an existing, authorized
@@ -424,6 +519,12 @@ class ServiceOrderService:
             customer_reason=customer_reason,
             promised_at=payload.promised_at,
             sequence_number=next_seq,
+        )
+        from app.modules.ajustes.snapshots import settings_snapshot
+        from app.modules.post_ventas.service import PostVentasService
+
+        order.settings_snapshot = settings_snapshot(
+            await PostVentasService(self.db).get_labor_settings(payload.filial_id, commit=False)
         )
         self.db.add(order)
         await self.db.flush()
@@ -577,6 +678,7 @@ class ServiceOrderService:
         order_id: uuid.UUID,
         next_maintenance_due_at: date | None = None,
         next_maintenance_tempario_id: uuid.UUID | None = None,
+        exit_mileage: int | None = None,
     ) -> ServiceOrder:
         order = await require_editable_order(self.db, order_id, allow_invoiced=True)
         if order.invoiced_at is None:
@@ -589,6 +691,19 @@ class ServiceOrderService:
             tempario = await self.db.get(Tempario, next_maintenance_tempario_id)
             if tempario is None or tempario.filial_id != order.filial_id:
                 raise BadRequestError("El tempario del plan no pertenece a esta filial.")
+        if exit_mileage is not None:
+            if order.intake_mileage is not None and exit_mileage < order.intake_mileage:
+                raise BadRequestError("El kilometraje de salida no puede ser menor al de ingreso.")
+            order.exit_mileage = exit_mileage
+        if (
+            order.settings_snapshot
+            and order.intake_mileage is not None
+            and order.exit_mileage is None
+        ):
+            raise BadRequestError("Indica el kilometraje de salida para cerrar la ODS.")
+        from app.modules.service_orders.billing import BillingService
+
+        await BillingService(self.db).ensure_workshop_warranties(order)
         order.status = ServiceOrderStatus.ORDEN_CERRADA
         order.closed_at = datetime.now(UTC)
         if next_maintenance_due_at is not None or next_maintenance_tempario_id is not None:
@@ -751,7 +866,19 @@ class ServiceOrderService:
 
         if tempario.filial_id != order.filial_id:
             raise BadRequestError("El tempario debe pertenecer a la filial de la orden.")
+        if not tempario.is_active:
+            raise BadRequestError("El tempario está inactivo.")
         warranty_snapshot = {}
+        from app.modules.ajustes.snapshots import order_settings
+
+        defaults = order_settings(
+            order,
+            (
+                await self.db.execute(
+                    select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
+                )
+            ).scalar_one_or_none(),
+        )
         for coverage in ("labor", "parts"):
             policy_id = getattr(tempario, f"{coverage}_warranty_policy_id")
             policy = await self.db.get(WarrantyPolicy, policy_id) if policy_id else None
@@ -763,6 +890,32 @@ class ServiceOrderService:
                     "duration_km": None if policy.no_expiration else policy.duration_km,
                     "covered_by": policy.covered_by.value,
                 }
+
+        if tempario.warranty_mode == "none":
+            warranty_snapshot = {"none": True}
+        elif tempario.warranty_mode == "custom" or not warranty_snapshot:
+            term = {
+                "name": (
+                    "Personalizada" if tempario.warranty_mode == "custom" else "Estándar del taller"
+                ),
+                "duration_days": (
+                    tempario.warranty_days
+                    if tempario.warranty_mode == "custom"
+                    else int(defaults.workshop_warranty_days)
+                ),
+                "duration_km": (
+                    tempario.warranty_km
+                    if tempario.warranty_mode == "custom"
+                    else int(defaults.workshop_warranty_km)
+                ),
+                "covered_by": "la_casa",
+            }
+            warranty_snapshot = {"labor": dict(term), "parts": dict(term)}
+            if not order.settings_snapshot and tempario.warranty_mode == "standard":
+                warranty_snapshot["parts"].update(
+                    duration_days=int(defaults.workshop_parts_warranty_days),
+                    duration_km=int(defaults.workshop_parts_warranty_km),
+                )
 
         task = ServiceOrderTask(
             warranty_snapshot=warranty_snapshot,
@@ -1256,6 +1409,9 @@ class ServiceOrderService:
             select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
         )
         settings = settings_result.scalar_one_or_none()
+        from app.modules.ajustes.snapshots import order_settings
+
+        settings = order_settings(order, settings)
         hourly_rate = float(settings.hourly_rate) if settings else 25.0
         iva_percentage = float(settings.iva_percentage) if settings else 16.0
 
@@ -1293,6 +1449,11 @@ class ServiceOrderService:
             )
 
         return OrderSummary(
+            hourly_rate=hourly_rate,
+            commission_percentage=float(settings.commission_percentage),
+            technician_commission=(labor_subtotal + non_client_labor)
+            * float(settings.commission_percentage)
+            / 100,
             payer_breakdown=payer_breakdown,
             discount_label=order.discount_label,
             tasks=[
@@ -1354,7 +1515,9 @@ class ServiceOrderService:
             raise UpsellNotFoundError(str(upsell_id))
         return upsell
 
-    async def _hourly_rate(self, filial_id: uuid.UUID) -> float:
+    async def _hourly_rate(self, filial_id: uuid.UUID, order=None) -> float:
+        if order and order.settings_snapshot:
+            return float(order.settings_snapshot.get("hourly_rate",25))
         result = await self.db.execute(
             select(LaborSettings).where(LaborSettings.filial_id == filial_id)
         )
@@ -1420,7 +1583,7 @@ class ServiceOrderService:
         """All upsells across every order in the filial — this is a filial-wide
         list, not scoped to a single ODS."""
         result = await self.db.execute(
-            select(Upsell, ServiceOrder.discount_label)
+            select(Upsell, ServiceOrder.discount_label, ServiceOrder.settings_snapshot)
             .join(ServiceOrder, ServiceOrder.id == Upsell.service_order_id)
             .where(ServiceOrder.filial_id == filial_id)
             .order_by(Upsell.created_at.desc())
@@ -1428,14 +1591,14 @@ class ServiceOrderService:
         rows = result.all()
         hourly_rate = await self._hourly_rate(filial_id)
         return [
-            self._upsell_to_read(upsell, hourly_rate, discount_label)
-            for upsell, discount_label in rows
+            self._upsell_to_read(upsell, float(snapshot["hourly_rate"]) if snapshot else hourly_rate, discount_label)
+            for upsell, discount_label, snapshot in rows
         ]
 
     async def get_upsell(self, upsell_id: uuid.UUID) -> UpsellRead:
         upsell = await self._get_upsell_model(upsell_id)
         order = await self.get_order(upsell.service_order_id)
-        hourly_rate = await self._hourly_rate(order.filial_id)
+        hourly_rate = await self._hourly_rate(order.filial_id,order)
         return self._upsell_to_read(upsell, hourly_rate, order.discount_label)
 
     async def list_pending_upsells_for_vehicle(
@@ -1477,7 +1640,7 @@ class ServiceOrderService:
         self, service_order_id: uuid.UUID, payload: UpsellCreate, photo_urls: list[str]
     ) -> UpsellRead:
         order = await require_editable_order(self.db, service_order_id)
-        hourly_rate = await self._hourly_rate(order.filial_id)
+        hourly_rate = await self._hourly_rate(order.filial_id,order)
         multiplier = float(PARTS_MULTIPLIERS[order.discount_label])
         labor_cost = 0.0
         parts_cost = 0.0
@@ -2046,7 +2209,7 @@ class ServiceOrderService:
             await self.db.execute(
                 select(ServiceOrderTypeCatalog).where(
                     ServiceOrderTypeCatalog.filial_id == claim.filial_id,
-                    ServiceOrderTypeCatalog.code == SYSTEM_ORDER_TYPE_RETRABAJO,
+                    ServiceOrderTypeCatalog.code == (SYSTEM_ORDER_TYPE_GARANTIA_FABRICA if claim.claim_type == WarrantyClaimType.FABRICA else SYSTEM_ORDER_TYPE_CAMPANA if claim.claim_type == WarrantyClaimType.CAMPANA_RECALL else SYSTEM_ORDER_TYPE_RETRABAJO),
                 )
             )
         ).scalar_one()
@@ -2054,11 +2217,18 @@ class ServiceOrderService:
             filial_id=claim.filial_id,
             vehicle_id=claim.vehicle_id,
             order_type_id=retrabajo_type.id,
+            warranty_claim_id=claim.id,
             advisor_user_id=original_order.advisor_user_id if original_order else None,
             intake_mileage=intake_mileage,
             customer_reason=f"Retrabajo de garantía — {cause_label}",
             promised_at=payload.promised_at or datetime.now(UTC),
             sequence_number=next_seq,
+        )
+        from app.modules.ajustes.snapshots import settings_snapshot
+        from app.modules.post_ventas.service import PostVentasService
+
+        new_order.settings_snapshot = settings_snapshot(
+            await PostVentasService(self.db).get_labor_settings(claim.filial_id, commit=False)
         )
         self.db.add(new_order)
         await self.db.flush()

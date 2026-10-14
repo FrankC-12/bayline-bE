@@ -236,3 +236,33 @@ async def test_legacy_request_is_not_deducted_a_second_time(billing_db):
                 .where(StockMovement.part_id == part_id)
             )
         ).scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_submitted_request_cascades_and_releases_remote_reservations(billing_db):
+    from app.modules.service_orders.models import ServiceOrderTransfer
+
+    ctx = billing_db
+    part_id, _, _ = await inventory(ctx, local=0, remote=5)
+    async with ctx.sessions() as db:
+        request = await ServiceOrderService(db).add_transfer_line(ctx.order_id, part_id, 3)
+        request_id = request.id
+        await WorkshopDispatchService(db).submit(request_id)
+        assert sum((await reserved_by_lot(db, part_id)).values()) == 3
+        await WorkshopDispatchService(db).delete(request_id, order_id=ctx.order_id)
+    async with ctx.sessions() as db:
+        assert await db.get(ServiceOrderTransfer, request_id) is None
+        assert (
+            not (
+                await db.execute(select(Transfer).where(Transfer.workshop_request_id == request_id))
+            )
+            .scalars()
+            .all()
+        )
+        assert not await reserved_by_lot(db, part_id)
+        assert (await db.get(Part, part_id)).stock_quantity == 5
+        assert (
+            await db.execute(
+                select(func.sum(PartLot.quantity_remaining)).where(PartLot.part_id == part_id)
+            )
+        ).scalar() == 5

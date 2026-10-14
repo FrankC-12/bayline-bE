@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     platform_admin_email: str
     platform_admin_password: str
 
+    logs_dir: str = "logs"
+    logs_timezone: str = "America/Caracas"
+
     uploads_dir: str = "uploads"
     max_upload_mb: int = 8
 

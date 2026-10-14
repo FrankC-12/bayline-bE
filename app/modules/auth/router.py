@@ -7,6 +7,7 @@ from app.core.database import get_db
 from app.core.exceptions import DomainError
 from app.modules.auth.cookies import REFRESH_COOKIE, clear_session_cookies, set_session_cookies
 from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.exceptions import InvalidTokenError
 from app.modules.auth.schemas import AccessMapResponse, CurrentUser, LoginRequest, RefreshRequest, TokenResponse
 from app.modules.auth.service import AuthService
 from app.modules.roles.models import RoleModulePermission
@@ -58,7 +59,12 @@ async def refresh(
 
 
 @router.post("/logout", status_code=204)
-async def logout():
+async def logout(request: Request):
+    # Identify authenticated logouts without breaking expired-session cleanup.
+    try:
+        get_current_user(request)
+    except InvalidTokenError:
+        pass
     response = Response(status_code=204)
     clear_session_cookies(response)
     return response

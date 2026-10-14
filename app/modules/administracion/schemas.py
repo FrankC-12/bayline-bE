@@ -15,8 +15,8 @@ from app.modules.administracion.enums import (
     IncomeSource,
     MovementSourceType,
     PurchaseRequestStatus,
-    SupplierStatus,
     SupplierPaymentMethod,
+    SupplierStatus,
     SupplierType,
     WarrantySubmissionStatus,
 )
@@ -44,6 +44,7 @@ def _validate_counterparty(self):
         self.counterparty_client_id = None
         self.counterparty_supplier_id = None
     return self
+
 
 # Suppliers
 
@@ -119,6 +120,7 @@ class SupplierDetailRead(SupplierRead):
 
 
 class PurchaseRequestLineInput(BaseModel):
+    unit_cost: float | None = Field(default=None, ge=0)
     part_id: uuid.UUID
     quantity: int = Field(ge=1)
 
@@ -144,6 +146,11 @@ class PurchaseRequestStatusUpdate(BaseModel):
 
 
 class PurchaseRequestLineRead(BaseModel):
+    part_name: str = ""
+    part_code: str = ""
+    received_quantity: int = 0
+    invoiced_unit_cost: float | None = None
+    receipts: list[dict] = Field(default_factory=list)
     id: uuid.UUID
     part_id: uuid.UUID
     quantity: int
@@ -152,6 +159,18 @@ class PurchaseRequestLineRead(BaseModel):
 
 
 class PurchaseRequestRead(BaseModel):
+    default_iva_percentage: float = 16
+    supplier_name: str = ""
+    invoice_number: str | None = None
+    invoice_control_number: str | None = None
+    invoice_date: date | None = None
+    credit_days: int | None = None
+    due_date: date | None = None
+    invoice_iva_percentage: float | None = None
+    invoice_total: float | None = None
+    paid_amount_usd: float = 0
+    balance_usd: float | None = None
+    activity: list[dict] = Field(default_factory=list)
     id: uuid.UUID
     filial_id: uuid.UUID
     code: str
@@ -173,6 +192,9 @@ class PayableRead(BaseModel):
     shape, computed the same way (no persisted "payable" row, see
     AdministracionService.list_payables)."""
 
+    invoice_number: str | None = None
+    due_date: date | None = None
+    balance_usd: float | None = None
     purchase_request_id: uuid.UUID
     code: str
     filial_id: uuid.UUID
@@ -566,3 +588,42 @@ class ProfitabilityReport(BaseModel):
     manual_movements_rate: float
     manual_movements_count: int
     manual_movements_total_count: int
+
+
+class PurchaseReceiptLine(BaseModel):
+    line_id: uuid.UUID
+    quantity: int = Field(ge=0)
+    location: str | None = Field(default=None, max_length=30)
+
+
+class PurchaseReceive(BaseModel):
+    request_id: uuid.UUID
+    warehouse_id: uuid.UUID
+    lines: list[PurchaseReceiptLine] = Field(min_length=1)
+
+
+class PurchaseInvoiceLine(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+    line_id: uuid.UUID
+    unit_cost: float = Field(ge=0)
+
+
+class PurchaseReconcile(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+    invoice_number: str = Field(min_length=1, max_length=80)
+    invoice_control_number: str = Field(min_length=1, max_length=80)
+    invoice_date: date
+    credit_days: int = Field(ge=0, le=3650)
+    iva_percentage: float = Field(ge=0, le=100)
+    lines: list[PurchaseInvoiceLine] = Field(min_length=1)
+
+
+class PurchasePayment(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False, extra="forbid")
+    request_id: uuid.UUID
+    account_id: uuid.UUID
+    currency: Literal["usd", "bs"]
+    amount: float = Field(gt=0)
+    exchange_rate: float | None = Field(default=None, gt=0)
+    entry_date: date
+    reference: str | None = Field(default=None, max_length=60)

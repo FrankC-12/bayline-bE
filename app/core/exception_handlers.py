@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.core.audit_logging import record_error
 from app.core.exceptions import DomainError
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,8 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(DomainError)
     async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
+        record_error("domain_error", status=exc.status_code, error_code=exc.error_code,
+                     route=getattr(request.scope.get("route"), "path", "unmatched"))
         return _build_error_response(
             exc.status_code, exc.error_code, exc.message, request.url.path, details=exc.details,
             request_id=getattr(request.state, "request_id", None)
@@ -109,6 +112,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def handle_validation_error(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
+        record_error("validation_error", status=422, error_code="validation_error",
+                     route=getattr(request.scope.get("route"), "path", "unmatched"))
         field_errors = [
             {"field": _field_path(error.get("loc", ())), "message": _translate_pydantic_error(error)}
             for error in exc.errors()
@@ -130,6 +135,12 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
         request_id = getattr(request.state, "request_id", None)
+        if not getattr(request.state, "error_logged", False):
+            record_error("unexpected_error", request_id=request_id, status=500,
+                         exception_type=type(exc).__name__,
+                         route=getattr(request.scope.get("route"), "path", "unmatched"),
+                         stack=[{"file": frame.filename, "line": frame.lineno, "function": frame.name}
+                                for frame in traceback.extract_tb(exc.__traceback__)])
         # Exception messages from SQL drivers can contain bound customer data.
         # Keep the stack locations and exception type, without locals or message.
         frames = "\n".join(

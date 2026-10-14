@@ -1,11 +1,25 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.search import fold_search
 from app.modules.clients.enums import (
     AddressType,
     ClientType,
@@ -23,14 +37,23 @@ class Client(Base):
     __tablename__ = "clients"
     __table_args__ = (
         UniqueConstraint("filial_id", "document_number", name="uq_clients_filial_document"),
+        Index("ix_clients_filial_name_id", "filial_id", "full_name", "id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    normalized_name: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=""
     )
     full_name: Mapped[str] = mapped_column(String(150), nullable=False)
-    client_type: Mapped[ClientType] = mapped_column(Enum(ClientType, name="client_type"), nullable=False)
+    client_type: Mapped[ClientType] = mapped_column(
+        Enum(ClientType, name="client_type"), nullable=False
+    )
     document_type: Mapped[DocumentType] = mapped_column(
         Enum(DocumentType, name="document_type"), nullable=False
     )
@@ -50,7 +73,9 @@ class Client(Base):
     # the holding-scoped consolidated report find the right invoices per
     # filial. At most one such client is expected per filial, but this isn't
     # enforced at the DB level (same as everything else about this client).
-    is_holding_billing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_holding_billing: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Same idea, generalized to a Supplier: a client record that stands in
     # for a Supplier so an ODS can be billed to it (e.g. the manufacturer or
     # a parts supplier covering a warranty claim) using the Supplier's own
@@ -59,7 +84,10 @@ class Client(Base):
     # deletion — the invoice's frozen document already has its own copy of
     # the name/RIF at issuance time.
     linked_supplier_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True, unique=True
+        UUID(as_uuid=True),
+        ForeignKey("suppliers.id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -90,7 +118,9 @@ class Vehicle(Base):
     plate: Mapped[str | None] = mapped_column(String(8), nullable=True)
     color: Mapped[str | None] = mapped_column(String(40), nullable=True)
     upholstery: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    fuel_type: Mapped[FuelType | None] = mapped_column(Enum(FuelType, name="fuel_type"), nullable=True)
+    fuel_type: Mapped[FuelType | None] = mapped_column(
+        Enum(FuelType, name="fuel_type"), nullable=True
+    )
     transmission: Mapped[TransmissionType | None] = mapped_column(
         Enum(TransmissionType, name="transmission_type"), nullable=True
     )
@@ -121,3 +151,9 @@ class Vehicle(Base):
     )
 
     client: Mapped["Client"] = relationship(back_populates="vehicles")
+
+
+@event.listens_for(Client, "before_insert")
+@event.listens_for(Client, "before_update")
+def normalize_client_name(mapper, connection, client):
+    client.normalized_name = fold_search(client.full_name)

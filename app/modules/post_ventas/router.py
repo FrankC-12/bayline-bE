@@ -27,9 +27,9 @@ from app.modules.post_ventas.service import PostVentasService
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 
-MODULE_ID = "post-ventas"
+MODULE_ID = "ajustes"
 
-router = APIRouter(tags=["Post Ventas"])
+router = APIRouter(tags=["Ajustes"])
 
 
 def get_service(db: AsyncSession = Depends(get_db)) -> PostVentasService:
@@ -53,20 +53,19 @@ async def _ensure_tempario_read_access(
     try:
         await _ensure_access(current_user, filial_id, db)
     except InsufficientPermissionsError:
-        await ensure_module_access(
-            db, current_user, filial_id, "asesor-servicios", AccessLevel.VER
-        )
+        await ensure_module_access(db, current_user, filial_id, "asesor-servicios", AccessLevel.VER)
 
 
 @router.get("/temparios", response_model=list[TemparioRead])
 async def list_temparios(
     filial_id: uuid.UUID = Query(...),
     search: str | None = Query(default=None),
+    include_inactive: bool = False,
     current_user: CurrentUser = Depends(get_current_user),
     service: PostVentasService = Depends(get_service),
 ) -> list[TemparioRead]:
     await _ensure_tempario_read_access(current_user, filial_id, service.db)
-    return await service.list_temparios(filial_id, search)
+    return await service.list_temparios(filial_id, search, include_inactive)
 
 
 @router.get("/temparios/{tempario_id}", response_model=TemparioRead)
@@ -87,7 +86,7 @@ async def create_tempario(
     service: PostVentasService = Depends(get_service),
 ) -> TemparioRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_tempario(payload)
+    return await service.create_tempario(payload, current_user.user_id)
 
 
 @router.patch("/temparios/{tempario_id}", response_model=TemparioRead)
@@ -99,10 +98,15 @@ async def update_tempario(
 ) -> TemparioRead:
     existing = await service.get_tempario(tempario_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.update_tempario(tempario_id, payload)
+    return await service.update_tempario(tempario_id, payload, current_user.user_id)
 
 
-@router.get("/maintenance-plans", response_model=list[MaintenancePlanRead])
+@router.get(
+    "/maintenance-plans",
+    response_model=list[MaintenancePlanRead],
+    deprecated=True,
+    include_in_schema=False,
+)
 async def list_maintenance_plans(
     filial_id: uuid.UUID = Query(...),
     search: str | None = Query(default=None),
@@ -113,7 +117,12 @@ async def list_maintenance_plans(
     return await service.list_plans(filial_id, search)
 
 
-@router.get("/maintenance-plans/{plan_id}", response_model=MaintenancePlanRead)
+@router.get(
+    "/maintenance-plans/{plan_id}",
+    response_model=MaintenancePlanRead,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def get_maintenance_plan(
     plan_id: uuid.UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -124,7 +133,13 @@ async def get_maintenance_plan(
     return plan
 
 
-@router.post("/maintenance-plans", response_model=MaintenancePlanRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/maintenance-plans",
+    response_model=MaintenancePlanRead,
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def create_maintenance_plan(
     payload: MaintenancePlanCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -134,7 +149,12 @@ async def create_maintenance_plan(
     return await service.create_plan(payload)
 
 
-@router.patch("/maintenance-plans/{plan_id}", response_model=MaintenancePlanRead)
+@router.patch(
+    "/maintenance-plans/{plan_id}",
+    response_model=MaintenancePlanRead,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def update_maintenance_plan(
     plan_id: uuid.UUID,
     payload: MaintenancePlanUpdate,
@@ -147,6 +167,15 @@ async def update_maintenance_plan(
 
 
 # Vehicle warranties (garantía de fábrica)
+
+
+async def _ensure_vehicle_read_access(current_user, filial_id, db):
+    try:
+        await _ensure_access(current_user, filial_id, db)
+    except InsufficientPermissionsError:
+        await ensure_module_access(
+            db, current_user, filial_id, "clientes-vehiculos", AccessLevel.VER
+        )
 
 
 @router.get("/vehicle-warranties", response_model=list[VehicleWarrantyRead])
@@ -167,7 +196,7 @@ async def get_vehicle_warranty_by_vin(
     current_user: CurrentUser = Depends(get_current_user),
     service: PostVentasService = Depends(get_service),
 ) -> VehicleWarrantyRead:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_vehicle_read_access(current_user, filial_id, service.db)
     return await service.get_vehicle_warranty_by_vin(filial_id, vin)
 
 
@@ -213,7 +242,7 @@ async def list_workshop_warranties_by_vin(
     current_user: CurrentUser = Depends(get_current_user),
     service: PostVentasService = Depends(get_service),
 ) -> list[WorkshopWarrantyRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_vehicle_read_access(current_user, filial_id, service.db)
     return await service.list_workshop_warranties_by_vin(filial_id, vin)
 
 
@@ -221,7 +250,12 @@ async def list_workshop_warranties_by_vin(
 # labor_warranty_policy_id/parts_warranty_policy_id), never hard-deleted.
 
 
-@router.get("/warranty-policies", response_model=list[WarrantyPolicyRead])
+@router.get(
+    "/warranty-policies",
+    response_model=list[WarrantyPolicyRead],
+    deprecated=True,
+    include_in_schema=False,
+)
 async def list_warranty_policies(
     filial_id: uuid.UUID = Query(...),
     search: str | None = Query(default=None),
@@ -232,10 +266,17 @@ async def list_warranty_policies(
     service: PostVentasService = Depends(get_service),
 ) -> list[WarrantyPolicyRead]:
     await _ensure_access(current_user, filial_id, service.db)
-    return await service.list_warranty_policies(filial_id, search, policy_status, applies_to, covered_by)
+    return await service.list_warranty_policies(
+        filial_id, search, policy_status, applies_to, covered_by
+    )
 
 
-@router.get("/warranty-policies/{policy_id}", response_model=WarrantyPolicyRead)
+@router.get(
+    "/warranty-policies/{policy_id}",
+    response_model=WarrantyPolicyRead,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def get_warranty_policy(
     policy_id: uuid.UUID,
     current_user: CurrentUser = Depends(get_current_user),
@@ -246,7 +287,13 @@ async def get_warranty_policy(
     return policy
 
 
-@router.post("/warranty-policies", response_model=WarrantyPolicyRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/warranty-policies",
+    response_model=WarrantyPolicyRead,
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def create_warranty_policy(
     payload: WarrantyPolicyCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -256,7 +303,12 @@ async def create_warranty_policy(
     return await service.create_warranty_policy(payload)
 
 
-@router.patch("/warranty-policies/{policy_id}", response_model=WarrantyPolicyRead)
+@router.patch(
+    "/warranty-policies/{policy_id}",
+    response_model=WarrantyPolicyRead,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def update_warranty_policy(
     policy_id: uuid.UUID,
     payload: WarrantyPolicyUpdate,
@@ -266,3 +318,34 @@ async def update_warranty_policy(
     existing = await service.get_warranty_policy(policy_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_warranty_policy(policy_id, payload)
+
+
+@router.post("/temparios/{tempario_id}/duplicate", response_model=TemparioRead, status_code=201)
+async def duplicate_tempario(
+    tempario_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PostVentasService = Depends(get_service),
+) -> TemparioRead:
+    """Duplica el servicio con un código nuevo; mantiene compatibilidad y garantía."""
+    original = await service.get_tempario(tempario_id)
+    await _ensure_access(current_user, original.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.create_tempario(
+        TemparioCreate(
+            filial_id=original.filial_id,
+            category=original.category,
+            name=original.name,
+            estimated_hours=original.estimated_hours,
+            year_from=original.year_from,
+            year_to=original.year_to,
+            compatible_vehicles=original.compatible_vehicles,
+            tools=original.tools,
+            requires_parts=original.requires_parts,
+            labor_warranty_policy_id=original.labor_warranty_policy_id,
+            parts_warranty_policy_id=original.parts_warranty_policy_id,
+            warranty_mode=original.warranty_mode,
+            warranty_days=original.warranty_days,
+            warranty_km=original.warranty_km,
+            parts=[p.model_dump(exclude={"id", "subtotal"}) for p in original.parts],
+        ),
+        current_user.user_id,
+    )

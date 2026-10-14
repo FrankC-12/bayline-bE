@@ -262,6 +262,6 @@ async def test_converting_fabrica_claim_with_no_prior_order_uses_reported_mileag
     converted = await service.convert_warranty_claim_to_order(claim.id, WarrantyClaimConvertInput(), None)
 
     new_order = session.get(ServiceOrder, converted.resulting_service_order_id)
-    assert new_order.order_type.code == "retrabajo"
+    assert new_order.order_type.code == "garantia_fabrica"
     assert new_order.intake_mileage == 12345
     assert new_order.vehicle_id == vehicle.id

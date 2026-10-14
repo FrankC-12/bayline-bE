@@ -8,7 +8,7 @@ from app.modules.roles.models import Role, RoleModulePermission
 
 ALL_MODULES = [
     "asesor-servicios", "tecnico-servicio", "administracion", "usuarios-accesos",
-    "post-ventas", "kpis", "clientes-vehiculos", "repuestos", "almacen",
+    "kpis", "clientes-vehiculos", "repuestos", "almacen",
     "concesionario", "ventas", "ajustes", "movimientos-manuales", "compras",
     "finanzas-cobrar", "finanzas-egreso", "finanzas-reversar", "finanzas-rentabilidad",
     "finanzas-transferir",
@@ -65,7 +65,7 @@ ROLES_SEED = [
         "permissions": [
             {"module_id": "administracion", "access": AccessLevel.EDITAR},
             {"module_id": "compras", "access": AccessLevel.EDITAR},
-            {"module_id": "post-ventas", "access": AccessLevel.EDITAR},
+            {"module_id": "access": AccessLevel.EDITAR},
             {"module_id": "ajustes", "access": AccessLevel.EDITAR},
             {"module_id": "kpis", "access": AccessLevel.VER},
         ],

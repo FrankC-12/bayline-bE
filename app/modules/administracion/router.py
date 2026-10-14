@@ -7,7 +7,12 @@ from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.modules.administracion.enums import AccountCurrency, CounterpartyType, ExpenseCategory, IncomeConcept
+from app.modules.administracion.enums import (
+    AccountCurrency,
+    CounterpartyType,
+    ExpenseCategory,
+    IncomeConcept,
+)
 from app.modules.administracion.exceptions import EntryNotFoundError
 from app.modules.administracion.models import ExpenseEntry, IncomeEntry
 from app.modules.administracion.schemas import (
@@ -22,6 +27,9 @@ from app.modules.administracion.schemas import (
     IncomeEntryRead,
     PayableRead,
     ProfitabilityReport,
+    PurchasePayment,
+    PurchaseReceive,
+    PurchaseReconcile,
     PurchaseRequestCreate,
     PurchaseRequestRead,
     PurchaseRequestStatusUpdate,
@@ -130,6 +138,18 @@ async def update_supplier(
 # Purchase requests
 
 
+async def _ensure_purchase_read(current_user, filial_id, db):
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    for module in ("compras", "almacen", "administracion"):
+        try:
+            await ensure_module_access(db, current_user, filial_id, module, AccessLevel.VER)
+            return
+        except InsufficientPermissionsError:
+            pass
+    raise InsufficientPermissionsError()
+
+
 @router.get("/purchase-requests", response_model=list[PurchaseRequestRead])
 async def list_purchase_requests(
     filial_id: uuid.UUID = Query(...),
@@ -137,7 +157,7 @@ async def list_purchase_requests(
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> list[PurchaseRequestRead]:
-    await _ensure_compras_access(current_user, filial_id, service.db)
+    await _ensure_purchase_read(current_user, filial_id, service.db)
     return await service.list_requests(filial_id, search)
 
 
@@ -148,18 +168,20 @@ async def get_purchase_request(
     service: AdministracionService = Depends(get_service),
 ) -> PurchaseRequestRead:
     request = await service.get_request(request_id)
-    await _ensure_compras_access(current_user, request.filial_id, service.db)
+    await _ensure_purchase_read(current_user, request.filial_id, service.db)
     return request
 
 
-@router.post("/purchase-requests", response_model=PurchaseRequestRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/purchase-requests", response_model=PurchaseRequestRead, status_code=status.HTTP_201_CREATED
+)
 async def create_purchase_request(
     payload: PurchaseRequestCreate,
     current_user: CurrentUser = Depends(get_current_user),
     service: AdministracionService = Depends(get_service),
 ) -> PurchaseRequestRead:
     await _ensure_compras_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_request(payload)
+    return await service.create_request(payload, current_user.user_id)
 
 
 @router.patch("/purchase-requests/{request_id}", response_model=PurchaseRequestRead)
@@ -170,9 +192,30 @@ async def update_purchase_request_status(
     service: AdministracionService = Depends(get_service),
 ) -> PurchaseRequestRead:
     existing = await service.get_request(request_id)
-    await _ensure_compras_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    from app.core.exceptions import ConflictError
+    from app.modules.administracion.enums import PurchaseRequestStatus
+
+    if payload.status in {PurchaseRequestStatus.PAGADA, PurchaseRequestStatus.CONCILIADA}:
+        await _ensure_compras_access(
+            current_user, existing.filial_id, service.db, AccessLevel.EDITAR
+        )
+        raise ConflictError(
+            "Concilia con la factura o registra el pago desde el flujo de Finanzas; no cambies este estado a mano."
+        )
+    if payload.status == PurchaseRequestStatus.RECIBIDA:
+        await ensure_module_access(
+            service.db, current_user, existing.filial_id, "almacen", AccessLevel.EDITAR
+        )
+    else:
+        await _ensure_compras_access(
+            current_user, existing.filial_id, service.db, AccessLevel.EDITAR
+        )
     return await service.update_request_status(
-        request_id, payload.status, payload.quotes, payload.warehouse_id, payload.location,
+        request_id,
+        payload.status,
+        payload.quotes,
+        payload.warehouse_id,
+        payload.location,
         current_user.user_id,
     )
 
@@ -184,7 +227,7 @@ async def list_payables(
     service: AdministracionService = Depends(get_service),
 ) -> list[PayableRead]:
     """Cuentas por Pagar — órdenes de compra conciliadas y aún no pagadas."""
-    await _ensure_compras_access(current_user, filial_id, service.db)
+    await _ensure_access(current_user, filial_id, service.db)
     return await service.list_payables(filial_id)
 
 
@@ -201,7 +244,9 @@ async def list_supplier_claims(
     return await service.list_claims(filial_id)
 
 
-@router.post("/supplier-claims", response_model=SupplierClaimRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/supplier-claims", response_model=SupplierClaimRead, status_code=status.HTTP_201_CREATED
+)
 async def create_supplier_claim(
     payload: SupplierClaimCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -248,7 +293,11 @@ async def list_warranty_submissions(
     return await service.list_warranty_submissions(filial_id)
 
 
-@router.post("/warranty-submissions", response_model=WarrantySubmissionRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/warranty-submissions",
+    response_model=WarrantySubmissionRead,
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_warranty_submission(
     payload: WarrantySubmissionCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -497,12 +546,22 @@ async def create_income_entry(
     service: AdministracionService = Depends(get_service),
 ) -> IncomeEntryRead:
     payload = IncomeEntryCreate(
-        filial_id=filial_id, entry_date=entry_date, concept=concept, description=description,
-        amount=amount, currency=currency, account_id=account_id, counterparty_type=counterparty_type,
-        counterparty_client_id=counterparty_client_id, counterparty_supplier_id=counterparty_supplier_id,
-        counterparty_name=counterparty_name, reference=reference,
+        filial_id=filial_id,
+        entry_date=entry_date,
+        concept=concept,
+        description=description,
+        amount=amount,
+        currency=currency,
+        account_id=account_id,
+        counterparty_type=counterparty_type,
+        counterparty_client_id=counterparty_client_id,
+        counterparty_supplier_id=counterparty_supplier_id,
+        counterparty_name=counterparty_name,
+        reference=reference,
     )
-    await _ensure_manual_movement_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_manual_movement_access(
+        current_user, payload.filial_id, service.db, AccessLevel.EDITAR
+    )
     return await service.create_income(payload, attachment, current_user.user_id)
 
 
@@ -531,7 +590,9 @@ async def list_expense_entries(
     return await service.list_expenses(filial_id, search)
 
 
-@router.post("/expense-entries", response_model=ExpenseEntryRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/expense-entries", response_model=ExpenseEntryRead, status_code=status.HTTP_201_CREATED
+)
 async def create_expense_entry(
     filial_id: uuid.UUID = Form(...),
     entry_date: date = Form(...),
@@ -553,12 +614,22 @@ async def create_expense_entry(
     service: AdministracionService = Depends(get_service),
 ) -> ExpenseEntryRead:
     payload = ExpenseEntryCreate(
-        filial_id=filial_id, entry_date=entry_date, category=category, beneficiary=beneficiary,
-        description=description, amount=amount, currency=currency, account_id=account_id,
-        counterparty_type=counterparty_type, counterparty_client_id=counterparty_client_id,
-        counterparty_supplier_id=counterparty_supplier_id, counterparty_name=counterparty_name,
+        filial_id=filial_id,
+        entry_date=entry_date,
+        category=category,
+        beneficiary=beneficiary,
+        description=description,
+        amount=amount,
+        currency=currency,
+        account_id=account_id,
+        counterparty_type=counterparty_type,
+        counterparty_client_id=counterparty_client_id,
+        counterparty_supplier_id=counterparty_supplier_id,
+        counterparty_name=counterparty_name,
         reference=reference,
-        purchase_request_ids=TypeAdapter(list[uuid.UUID]).validate_python(json.loads(purchase_request_ids_json)),
+        purchase_request_ids=TypeAdapter(list[uuid.UUID]).validate_python(
+            json.loads(purchase_request_ids_json)
+        ),
     )
     await _ensure_egreso_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
     return await service.create_expense(payload, attachment, current_user.user_id)
@@ -601,3 +672,60 @@ async def get_profitability(
 ) -> ProfitabilityReport:
     await _ensure_rentabilidad_access(current_user, filial_id, service.db)
     return await service.get_profitability(filial_id, date_from, date_to)
+
+
+@router.post(
+    "/purchase-requests/{request_id}/receive", response_model=PurchaseRequestRead, tags=["Compras"]
+)
+async def receive_purchase(
+    request_id: uuid.UUID,
+    payload: PurchaseReceive,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+) -> PurchaseRequestRead:
+    """Almacenista: recepción parcial por línea, ubicación y lotes FIFO."""
+    from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+    existing = await service.get_request(request_id)
+    await ensure_module_access(
+        service.db, current_user, existing.filial_id, "almacen", AccessLevel.EDITAR
+    )
+    return await PurchaseWorkflow(service.db).receive(request_id, payload, current_user.user_id)
+
+
+@router.post(
+    "/purchase-requests/{request_id}/reconcile",
+    response_model=PurchaseRequestRead,
+    tags=["Compras"],
+)
+async def reconcile_purchase(
+    request_id: uuid.UUID,
+    payload: PurchaseReconcile,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+) -> PurchaseRequestRead:
+    """Administración: registra factura, corrige costos de lotes y crea saldo por pagar."""
+    from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+    existing = await service.get_request(request_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await PurchaseWorkflow(service.db).reconcile(request_id, payload, current_user.user_id)
+
+
+@router.post(
+    "/purchase-requests/{request_id}/payments",
+    response_model=PurchaseRequestRead,
+    tags=["Finanzas"],
+)
+async def pay_purchase(
+    request_id: uuid.UUID,
+    payload: PurchasePayment,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+) -> PurchaseRequestRead:
+    """Registra abonos USD/Bs, crea el egreso y actualiza el saldo; admite reintentos."""
+    from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+
+    existing = await service.get_request(request_id)
+    await _ensure_egreso_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await PurchaseWorkflow(service.db).pay(request_id, payload, current_user.user_id)

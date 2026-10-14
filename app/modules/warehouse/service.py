@@ -5,6 +5,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.idempotency import remember_operation, replay_operation
+from app.modules.parts.models import Part
+from app.modules.parts.service import _sync_availability
 from app.modules.warehouse.enums import MovementReason, MovementType, TransferStatus
 from app.modules.warehouse.exceptions import (
     InsufficientStockError,
@@ -47,8 +50,6 @@ from app.modules.warehouse.schemas import (
     TransferLineRead,
     TransferRead,
 )
-from app.modules.parts.models import Part
-from app.modules.parts.service import _sync_availability
 
 REASON_TO_MOVEMENT_TYPE: dict[MovementReason, MovementType] = {
     MovementReason.CONSUMO_ODS: MovementType.SALIDA,
@@ -97,6 +98,33 @@ class AlmacenService:
 
     # Warehouses
 
+    async def ensure_inventory_scope(self, filial_id, warehouse_ids, part_ids):
+        from app.core.exceptions import ForbiddenError
+        from app.modules.parts.exceptions import PartNotFoundError
+
+        warehouse_ids, part_ids = set(warehouse_ids), set(part_ids)
+        warehouses = {
+            row.id: row
+            for row in (
+                await self.db.execute(select(Warehouse).where(Warehouse.id.in_(warehouse_ids)))
+            ).scalars()
+        }
+        parts = {
+            row.id: row
+            for row in (await self.db.execute(select(Part).where(Part.id.in_(part_ids)))).scalars()
+        }
+        for identifier in warehouse_ids:
+            if identifier not in warehouses:
+                raise WarehouseNotFoundError(str(identifier))
+        for identifier in part_ids:
+            if identifier not in parts:
+                raise PartNotFoundError(str(identifier))
+        if any(row.filial_id != filial_id for row in [*warehouses.values(), *parts.values()]):
+            raise ForbiddenError(
+                "Los recursos deben pertenecer a la filial autorizada.",
+                error_code="resource_filial_mismatch",
+            )
+
     async def list_warehouses(self, filial_id: uuid.UUID) -> list[Warehouse]:
         result = await self.db.execute(
             select(Warehouse).where(Warehouse.filial_id == filial_id).order_by(Warehouse.created_at)
@@ -136,8 +164,9 @@ class AlmacenService:
         warehouse = await self.get_warehouse(warehouse_id)
         if is_workshop_default is not None:
             from sqlalchemy import update
-            from app.modules.filiales.models import Filial
+
             from app.core.exceptions import BadRequestError
+            from app.modules.filiales.models import Filial
 
             await self.db.execute(
                 select(Filial.id).where(Filial.id == warehouse.filial_id).with_for_update()
@@ -243,6 +272,22 @@ class AlmacenService:
             raise StockInReasonNameAlreadyExistsError(name)
 
     async def seed_default_stock_in_reasons(self, holding_id: uuid.UUID) -> None:
+        from app.modules.warehouse.models import StockOutReason
+
+        for name in [
+            "Ajuste de inventario",
+            "Consumo interno",
+            "Daño o pérdida",
+            "Devolución a proveedor",
+            "Otro",
+        ]:
+            self.db.add(
+                StockOutReason(
+                    holding_id=holding_id,
+                    name=name,
+                    movement_type="devolucion" if name == "Devolución a proveedor" else "salida",
+                )
+            )
         for name in DEFAULT_STOCK_IN_REASONS:
             self.db.add(StockInReason(holding_id=holding_id, name=name))
         await self.db.commit()
@@ -303,17 +348,57 @@ class AlmacenService:
     async def create_stock_in(
         self, payload: StockInCreate, responsible_user_id: uuid.UUID | None = None
     ) -> list[PartLot]:
-        lots: list[PartLot] = []
-        for line in payload.lines:
-            lot = await self._create_single_lot(
-                payload.filial_id, payload.warehouse_id, line, payload.reason, responsible_user_id
+        from app.modules.filiales.models import Filial
+
+        try:
+            replay = await replay_operation(
+                self.db, payload, payload.filial_id, "stock_in", responsible_user_id
             )
-            if lot is not None:
-                lots.append(lot)
-        await self.db.commit()
-        for lot in lots:
-            await self.db.refresh(lot)
-        return lots
+            if replay is not None:
+                return [PartLotRead.model_validate(item) for item in replay]
+            await self.db.execute(
+                select(Filial.id).where(Filial.id == payload.filial_id).with_for_update()
+            )
+            lots = []
+            for line in sorted(payload.lines, key=lambda item: str(item.part_id)):
+                await self.db.execute(
+                    select(Part)
+                    .where(Part.id == line.part_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                lot = await self._create_single_lot(
+                    payload.filial_id,
+                    payload.warehouse_id,
+                    line,
+                    payload.reason,
+                    responsible_user_id,
+                )
+                if lot is not None:
+                    lots.append(lot)
+                await self.db.flush()
+            # Preserve the input order in the response even though locking is sorted.
+            by_part = {}
+            for lot in lots:
+                by_part.setdefault(lot.part_id, []).append(lot)
+            lots = [
+                by_part[line.part_id].pop(0) for line in payload.lines if by_part.get(line.part_id)
+            ]
+            remember_operation(
+                self.db,
+                payload,
+                payload.filial_id,
+                "stock_in",
+                responsible_user_id,
+                [_lot_to_read(lot).model_dump(mode="json") for lot in lots],
+            )
+            await self.db.commit()
+            for lot in lots:
+                await self.db.refresh(lot)
+            return lots
+        except Exception:
+            await self.db.rollback()
+            raise
 
     async def bulk_create_lots(
         self,
@@ -410,6 +495,35 @@ class AlmacenService:
     async def create_stock_out(
         self, payload: StockOutCreate, responsible_user_id: uuid.UUID | None = None
     ) -> None:
+        try:
+            return await self._create_stock_out(payload, responsible_user_id)
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    async def _create_stock_out(self, payload, responsible_user_id):
+        replay = await replay_operation(
+            self.db, payload, payload.filial_id, "stock_out", responsible_user_id
+        )
+        if replay is not None:
+            return
+        reason_name = None
+        movement_type = REASON_TO_MOVEMENT_TYPE[payload.reason]
+        if payload.reason_id:
+            from app.core.exceptions import BadRequestError
+            from app.modules.filiales.models import Filial
+            from app.modules.warehouse.models import StockOutReason
+
+            reason_row = await self.db.get(StockOutReason, payload.reason_id)
+            filial = await self.db.get(Filial, payload.filial_id)
+            if (
+                reason_row is None
+                or not reason_row.is_active
+                or reason_row.holding_id != filial.holding_id
+            ):
+                raise BadRequestError("El motivo de salida no está activo en este holding.")
+            reason_name = reason_row.name
+            movement_type = MovementType(reason_row.movement_type)
         consumed_cost = await self._consume_fifo(
             payload.warehouse_id, payload.part_id, payload.quantity
         )
@@ -424,17 +538,27 @@ class AlmacenService:
                 filial_id=payload.filial_id,
                 warehouse_id=payload.warehouse_id,
                 part_id=payload.part_id,
-                movement_type=REASON_TO_MOVEMENT_TYPE[payload.reason],
+                movement_type=movement_type,
+                note=reason_name,
                 quantity=payload.quantity,
                 unit_cost=consumed_cost,
                 reference=payload.reference,
                 responsible_user_id=responsible_user_id,
             )
         )
+        remember_operation(
+            self.db, payload, payload.filial_id, "stock_out", responsible_user_id, {"status": "ok"}
+        )
         await self.db.commit()
 
     async def _consume_fifo(
-        self, warehouse_id: uuid.UUID, part_id: uuid.UUID, quantity: int, *, exclude_request_id=None
+        self,
+        warehouse_id: uuid.UUID,
+        part_id: uuid.UUID,
+        quantity: int,
+        *,
+        exclude_request_id=None,
+        consumed_lots=None,
     ) -> float:
         """Consumes `quantity` units from the oldest lots first. Returns the
         weighted average unit cost of what was consumed. Raises if there isn't
@@ -472,6 +596,8 @@ class AlmacenService:
             if remaining <= 0:
                 break
             take = min(max(0, lot.quantity_remaining - reserved.get(lot.id, 0)), remaining)
+            if take and consumed_lots is not None:
+                consumed_lots.append((lot, take))
             lot.quantity_remaining -= take
             consumed_cost_total += take * float(lot.unit_cost)
             remaining -= take
@@ -549,6 +675,50 @@ class AlmacenService:
             await self.db.rollback()
             raise
 
+    async def delete_transfer(self, transfer_id: uuid.UUID) -> None:
+        from app.core.exceptions import ConflictError
+        from app.modules.filiales.models import Filial
+
+        try:
+            snapshot = await self.get_transfer(transfer_id)
+            await self.db.execute(
+                select(Filial.id).where(Filial.id == snapshot.filial_id).with_for_update()
+            )
+            transfer = (
+                await self.db.execute(
+                    select(Transfer)
+                    .where(Transfer.id == transfer_id)
+                    .options(selectinload(Transfer.lines))
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if transfer is None:
+                raise TransferNotFoundError(str(transfer_id))
+            if transfer.status == TransferStatus.COMPLETADA:
+                raise ConflictError(
+                    "El traslado ya fue recibido. Registra un traslado inverso para corregirlo.",
+                    error_code="transfer_already_received",
+                )
+            if transfer.workshop_request_id:
+                raise ConflictError(
+                    "Elimina la ODT de la orden de servicio para liberar esta solicitud completa.",
+                    error_code="transfer_linked_to_order",
+                )
+            await self.db.delete(transfer)
+            await self.db.commit()
+            from app.core.audit_logging import audit_logger, record_event
+
+            record_event(
+                audit_logger,
+                "transfer_deleted",
+                resource="warehouse_transfer",
+                transfer_id=str(transfer_id),
+            )
+        except Exception:
+            await self.db.rollback()
+            raise
+
     async def _update_transfer_status(
         self,
         transfer_id: uuid.UUID,
@@ -579,25 +749,44 @@ class AlmacenService:
 
         if new_status == TransferStatus.COMPLETADA:
             for line in sorted(transfer.lines, key=lambda item: (str(item.part_id), str(item.id))):
+                consumed = []
                 weighted_cost = await self._consume_fifo(
                     transfer.origin_warehouse_id,
                     line.part_id,
                     line.quantity,
                     exclude_request_id=transfer.workshop_request_id,
+                    consumed_lots=consumed,
                 )
-                lot_number = await self._next_lot_number(transfer.filial_id)
-                received_lot = PartLot(
-                    filial_id=transfer.filial_id,
-                    lot_number=lot_number,
-                    warehouse_id=transfer.destination_warehouse_id,
-                    part_id=line.part_id,
-                    quantity_received=line.quantity,
-                    quantity_remaining=line.quantity,
-                    unit_cost=weighted_cost,
-                    note=f"Transferencia {transfer.code}",
-                )
-                self.db.add(received_lot)
-                await self.db.flush()
+                line.unit_cost = weighted_cost
+                received_lots = []
+                from app.modules.warehouse.models import TransferLotAllocation
+
+                for origin, quantity in consumed:
+                    received_lot = PartLot(
+                        filial_id=transfer.filial_id,
+                        lot_number=await self._next_lot_number(transfer.filial_id),
+                        warehouse_id=transfer.destination_warehouse_id,
+                        part_id=line.part_id,
+                        quantity_received=quantity,
+                        quantity_remaining=quantity,
+                        unit_cost=origin.unit_cost,
+                        purchase_request_id=origin.purchase_request_id,
+                        origin_lot_id=origin.id,
+                        origin_transfer_id=transfer.id,
+                        note=f"Transferencia {transfer.code}",
+                    )
+                    self.db.add(received_lot)
+                    await self.db.flush()
+                    received_lots.append(received_lot)
+                    self.db.add(
+                        TransferLotAllocation(
+                            transfer_id=transfer.id,
+                            origin_lot_id=origin.id,
+                            destination_lot_id=received_lot.id,
+                            quantity=quantity,
+                            unit_cost=origin.unit_cost,
+                        )
+                    )
                 if line.workshop_request_line_id:
                     from app.modules.service_orders.models import (
                         ServiceOrderTransferLine,
@@ -611,7 +800,6 @@ class AlmacenService:
                             .where(ServiceOrderTransferLine.id == line.workshop_request_line_id)
                         )
                     ).scalar_one()
-                    # Move this request's reservation to the received lot.
                     remaining = line.quantity
                     for allocation in list(request_line.allocations):
                         if allocation.warehouse_id == transfer.origin_warehouse_id and remaining:
@@ -620,14 +808,15 @@ class AlmacenService:
                             remaining -= take
                             if not allocation.quantity:
                                 request_line.allocations.remove(allocation)
-                    request_line.allocations.append(
-                        ServiceOrderTransferLotAllocation(
-                            lot_id=received_lot.id,
-                            warehouse_id=received_lot.warehouse_id,
-                            quantity=line.quantity,
-                            unit_cost=weighted_cost,
+                    for received_lot in received_lots:
+                        request_line.allocations.append(
+                            ServiceOrderTransferLotAllocation(
+                                lot_id=received_lot.id,
+                                warehouse_id=received_lot.warehouse_id,
+                                quantity=received_lot.quantity_received,
+                                unit_cost=received_lot.unit_cost,
+                            )
                         )
-                    )
                     await self.db.flush()
                 self.db.add(
                     StockMovement(
@@ -826,7 +1015,7 @@ class AlmacenService:
             select(PartSaleLotAllocation, PartSale)
             .join(PartSaleLine, PartSaleLine.id == PartSaleLotAllocation.part_sale_line_id)
             .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
-            .where(PartSaleLotAllocation.lot_id == lot.id)
+            .where(PartSaleLotAllocation.lot_id == lot.id, PartSale.filial_id == lot.filial_id)
         )
         for allocation, sale in sale_rows.all():
             movements.append(
@@ -862,6 +1051,7 @@ class AlmacenService:
             .join(ServiceOrder, ServiceOrder.id == ServiceOrderTransfer.service_order_id)
             .where(
                 ServiceOrderTransferLotAllocation.lot_id == lot.id,
+                ServiceOrder.filial_id == lot.filial_id,
                 # Only real, dispatched consumption — a line just added but
                 # not yet "pedida a almacén" only carries a preview
                 # allocation. PEDIDO or COMPLETADO both mean it shipped;
@@ -883,9 +1073,73 @@ class AlmacenService:
                 )
             )
 
+        from app.modules.warehouse.models import TransferLotAllocation
+
+        rows = (
+            await self.db.execute(
+                select(TransferLotAllocation, Transfer, PartLot, Warehouse)
+                .join(Transfer, Transfer.id == TransferLotAllocation.transfer_id)
+                .join(PartLot, PartLot.id == TransferLotAllocation.destination_lot_id)
+                .join(Warehouse, Warehouse.id == PartLot.warehouse_id)
+                .where(
+                    TransferLotAllocation.origin_lot_id == lot.id,
+                    Transfer.filial_id == lot.filial_id,
+                )
+            )
+        ).all()
+        for allocation, transfer, destination, destination_warehouse in rows:
+            movements.append(
+                LotOutboundMovementRead(
+                    id=allocation.id,
+                    source="transferencia",
+                    quantity=allocation.quantity,
+                    unit_cost=float(allocation.unit_cost),
+                    occurred_at=transfer.completed_at or transfer.created_at,
+                    reference_code=transfer.code,
+                    description=f"Transferencia a {destination_warehouse.name}",
+                    link_id=transfer.id,
+                    destination_lot_id=destination.id,
+                    destination_lot_code=destination.code,
+                )
+            )
+        origin = {
+            "type": "manual",
+            "description": lot.note or "Entrada manual / inventario inicial",
+        }
+        if lot.purchase_request_id:
+            from app.modules.administracion.models import PurchaseRequest, Supplier
+
+            purchase = await self.db.get(PurchaseRequest, lot.purchase_request_id)
+            supplier = (
+                await self.db.get(Supplier, purchase.supplier_id)
+                if purchase and purchase.filial_id == lot.filial_id
+                else None
+            )
+            if supplier and supplier.filial_id != lot.filial_id:
+                supplier = None
+            if purchase and purchase.filial_id == lot.filial_id:
+                origin = dict(
+                    type="purchase",
+                    description=f"Compra a {supplier.business_name if supplier else 'proveedor'}",
+                    purchase_request_id=str(purchase.id),
+                    purchase_code=purchase.code,
+                    invoice_number=purchase.invoice_number,
+                    reconciled=bool(purchase.invoice_number),
+                )
+        if lot.origin_lot_id:
+            source = await self.db.get(PartLot, lot.origin_lot_id)
+            origin = dict(
+                type="transfer",
+                description="Transferencia entre almacenes",
+                origin_lot_id=str(lot.origin_lot_id),
+                origin_lot_code=source.code if source else None,
+                transfer_id=str(lot.origin_transfer_id),
+            )
+
         movements.sort(key=lambda m: m.occurred_at, reverse=True)
 
         return PartLotDetailRead(
+            origin=origin,
             id=lot.id,
             code=lot.code,
             warehouse_id=lot.warehouse_id,
@@ -934,6 +1188,34 @@ class AlmacenService:
             .order_by(ServiceOrderTransfer.fulfilled_at.desc())
         )
 
+        request_rows = rows.all()
+        if not request_rows:
+            return []
+        part_ids = {line.part_id for transfer, _, _ in request_rows for line in transfer.lines}
+        parts = {
+            part.id: part
+            for part in (
+                await self.db.execute(
+                    select(Part).where(Part.filial_id == filial_id, Part.id.in_(part_ids))
+                )
+            ).scalars()
+        }
+        from app.modules.users.models import User
+
+        advisor_ids = {
+            order.advisor_user_id for _, order, _ in request_rows if order.advisor_user_id
+        }
+        advisors = (
+            {
+                user.id: user
+                for user in (
+                    await self.db.execute(select(User).where(User.id.in_(advisor_ids)))
+                ).scalars()
+            }
+            if advisor_ids
+            else {}
+        )
+
         warehouse_names = {
             w.id: w.name
             for w in (
@@ -942,10 +1224,10 @@ class AlmacenService:
         }
 
         results: list[ServiceOrderPartRequestRead] = []
-        for transfer, order, vehicle in rows.all():
+        for transfer, order, vehicle in request_rows:
             lines: list[ServiceOrderPartRequestLineRead] = []
             for line in transfer.lines:
-                part = await self.db.get(Part, line.part_id)
+                part = parts.get(line.part_id)
                 # A line isn't scoped to one warehouse — dispatch draws FIFO
                 # across every warehouse in the filial, so its quantity can
                 # (rarely) split across more than one. Group its real,
@@ -985,11 +1267,7 @@ class AlmacenService:
                         ],
                     )
                 )
-            from app.modules.users.models import User
-
-            advisor = (
-                await self.db.get(User, order.advisor_user_id) if order.advisor_user_id else None
-            )
+            advisor = advisors.get(order.advisor_user_id)
             results.append(
                 ServiceOrderPartRequestRead(
                     id=transfer.id,
@@ -1036,11 +1314,23 @@ class AlmacenService:
             .order_by(PartSale.created_at.desc())
         )
 
+        sales = list(result.scalars())
+        if not sales:
+            return []
+        part_ids = {line.part_id for sale in sales for line in sale.lines}
+        parts = {
+            part.id: part
+            for part in (
+                await self.db.execute(
+                    select(Part).where(Part.filial_id == filial_id, Part.id.in_(part_ids))
+                )
+            ).scalars()
+        }
         requests: list[PartSaleRequestRead] = []
-        for sale in result.scalars():
+        for sale in sales:
             lines: list[PartSaleRequestLineRead] = []
             for line in sale.lines:
-                part = await self.db.get(Part, line.part_id)
+                part = parts.get(line.part_id)
                 lines.append(
                     PartSaleRequestLineRead(
                         part_id=line.part_id,
@@ -1086,6 +1376,102 @@ class AlmacenService:
 
         await ServiceOrderService(self.db).complete_transfer(transfer_id, completed_by_user_id)
 
+    async def page_movements(
+        self,
+        filial_id,
+        *,
+        page=1,
+        page_size=50,
+        warehouse_id=None,
+        part_id=None,
+        movement_type=None,
+        search=None,
+        date_from=None,
+        date_to=None,
+    ):
+        from datetime import date, time, timedelta
+        from math import ceil
+        from zoneinfo import ZoneInfo
+
+        from sqlalchemy import or_
+
+        from app.core.exceptions import BadRequestError
+        from app.modules.users.models import User
+        from app.modules.warehouse.schemas import (
+            StockMovementPage,
+            StockMovementPageItem,
+            StockMovementRead,
+        )
+
+        if date_from and date_to and date_from > date_to:
+            raise BadRequestError("La fecha inicial no puede ser posterior a la final.")
+        query = (
+            select(StockMovement, Part.name, Part.code, Warehouse.name, User.full_name)
+            .join(Part, Part.id == StockMovement.part_id)
+            .join(Warehouse, Warehouse.id == StockMovement.warehouse_id)
+            .outerjoin(User, User.id == StockMovement.responsible_user_id)
+            .where(StockMovement.filial_id == filial_id)
+        )
+        if warehouse_id:
+            query = query.where(StockMovement.warehouse_id == warehouse_id)
+        if part_id:
+            query = query.where(StockMovement.part_id == part_id)
+        if movement_type:
+            types = (
+                [MovementType.TRANSFERENCIA_SALIDA, MovementType.TRANSFERENCIA_ENTRADA]
+                if movement_type == "transferencia"
+                else [MovementType(movement_type)]
+            )
+            query = query.where(StockMovement.movement_type.in_(types))
+        if search and search.strip():
+            term = search.strip().lower()
+            query = query.where(
+                or_(
+                    func.lower(Part.name).contains(term, autoescape=True),
+                    func.lower(Part.code).contains(term, autoescape=True),
+                    func.lower(User.full_name).contains(term, autoescape=True),
+                    func.lower(StockMovement.reference).contains(term, autoescape=True),
+                )
+            )
+        timezone = ZoneInfo("America/Caracas")
+        if date_from:
+            query = query.where(
+                StockMovement.created_at >= datetime.combine(date_from, time.min, timezone)
+            )
+        if date_to and date_to < date.max:
+            query = query.where(
+                StockMovement.created_at
+                < datetime.combine(date_to + timedelta(days=1), time.min, timezone)
+            )
+        total = (
+            await self.db.execute(select(func.count()).select_from(query.subquery()))
+        ).scalar_one()
+        total_pages = max(1, ceil(total / page_size))
+        page = min(page, total_pages)
+        rows = (
+            await self.db.execute(
+                query.order_by(StockMovement.created_at.desc(), StockMovement.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
+        return StockMovementPage(
+            items=[
+                StockMovementPageItem(
+                    **StockMovementRead.model_validate(movement).model_dump(),
+                    part_name=part_name,
+                    part_code=part_code,
+                    warehouse_name=warehouse_name,
+                    responsible_name=responsible_name,
+                )
+                for movement, part_name, part_code, warehouse_name, responsible_name in rows
+            ],
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+        )
+
     async def list_movements(
         self,
         filial_id: uuid.UUID,
@@ -1107,6 +1493,7 @@ class AlmacenService:
 
 def transfer_to_read(transfer: Transfer) -> TransferRead:
     return TransferRead(
+        workshop_request_id=transfer.workshop_request_id,
         id=transfer.id,
         code=transfer.code,
         origin_warehouse_id=transfer.origin_warehouse_id,

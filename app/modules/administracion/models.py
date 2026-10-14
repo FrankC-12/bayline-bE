@@ -1,7 +1,19 @@
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    JSON,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -17,8 +29,8 @@ from app.modules.administracion.enums import (
     IncomeSource,
     MovementSourceType,
     PurchaseRequestStatus,
-    SupplierStatus,
     SupplierPaymentMethod,
+    SupplierStatus,
     SupplierType,
     WarrantySubmissionStatus,
 )
@@ -29,7 +41,10 @@ class Supplier(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     business_name: Mapped[str] = mapped_column(String(150), nullable=False)
     trade_name: Mapped[str | None] = mapped_column(String(150), nullable=True)
@@ -56,7 +71,10 @@ class SupplierPaymentAccount(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     supplier_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("suppliers.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("suppliers.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     payment_method: Mapped[SupplierPaymentMethod] = mapped_column(
         Enum(SupplierPaymentMethod, name="supplier_payment_method"), nullable=False
@@ -83,7 +101,10 @@ class PurchaseRequest(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     supplier_id: Mapped[uuid.UUID] = mapped_column(
@@ -117,6 +138,17 @@ class PurchaseRequest(Base):
     paid_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
+    invoice_number: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    invoice_control_number: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    invoice_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    credit_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    invoice_iva_percentage: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    invoice_total: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    paid_amount_usd: Mapped[float] = mapped_column(
+        Numeric(14, 2), nullable=False, default=0, server_default="0"
+    )
+    activity: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -136,7 +168,10 @@ class PurchaseRequestLine(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     purchase_request_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("purchase_requests.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("purchase_requests.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
@@ -144,6 +179,11 @@ class PurchaseRequestLine(Base):
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_cost: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
 
+    received_quantity: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    invoiced_unit_cost: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+    receipts: Mapped[list] = mapped_column(JSON, nullable=False, default=list, server_default="[]")
     request: Mapped["PurchaseRequest"] = relationship(back_populates="lines")
 
 
@@ -152,7 +192,10 @@ class SupplierClaim(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False
@@ -193,7 +236,9 @@ class SupplierClaim(Base):
     # Set once this claim's workshop-absorbed cost is bundled into a monthly
     # submission to the holding for reimbursement — see WarrantySubmission.
     warranty_submission_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("warranty_submissions.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("warranty_submissions.id", ondelete="SET NULL"),
+        nullable=True,
     )
     warranty_submission: Mapped["WarrantySubmission | None"] = relationship(back_populates="claims")
 
@@ -218,7 +263,10 @@ class Account(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     bank: Mapped[str | None] = mapped_column(String(80), nullable=True)
@@ -243,7 +291,10 @@ class IncomeEntry(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     entry_date: Mapped[date] = mapped_column(Date, nullable=False)
     source: Mapped[IncomeSource] = mapped_column(
@@ -314,12 +365,21 @@ class WarrantySubmission(Base):
 
     __tablename__ = "warranty_submissions"
     __table_args__ = (
-        UniqueConstraint("filial_id", "period_year", "period_month", "currency", name="uq_warranty_submission_period"),
+        UniqueConstraint(
+            "filial_id",
+            "period_year",
+            "period_month",
+            "currency",
+            name="uq_warranty_submission_period",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
     period_year: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -368,7 +428,10 @@ class ExpenseEntry(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     entry_date: Mapped[date] = mapped_column(Date, nullable=False)
     category: Mapped[ExpenseCategory] = mapped_column(

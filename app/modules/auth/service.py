@@ -4,6 +4,7 @@ import jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.audit_logging import set_actor
 from app.core.config import get_settings
 from app.core.security import (
     create_access_token,
@@ -37,6 +38,7 @@ class AuthService:
         if role is None:
             raise InvalidCredentialsError()
 
+        set_actor(user.id, user.filial_id, user.holding_id)
         settings = get_settings()
         claims = {
             "sub": str(user.id),

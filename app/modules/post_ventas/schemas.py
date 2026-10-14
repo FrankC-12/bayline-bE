@@ -1,5 +1,6 @@
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -34,6 +35,8 @@ class LaborSettingsUpdate(BaseModel):
 class LaborSettingsRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    bcv_rate_mode: str = "automatic"
+    field_changes: dict = Field(default_factory=dict)
     filial_id: uuid.UUID
     hourly_rate: float
     commission_percentage: float
@@ -52,6 +55,30 @@ class LaborSettingsRead(BaseModel):
     iva_retention_default_percentage: float
     islr_retention_default_percentage: float
     updated_at: datetime
+
+
+class SettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    hourly_rate: float | None = Field(default=None, ge=0)
+    commission_percentage: float | None = Field(default=None, ge=0, le=100)
+    iva_percentage: float | None = Field(default=None, ge=0, le=100)
+    igtf_percentage: float | None = Field(default=None, ge=0, le=100)
+    bcv_rate: float | None = Field(default=None, gt=0)
+    part_warranty_days: int | None = Field(default=None, ge=0)
+    vehicle_warranty_default_months: int | None = Field(default=None, ge=0)
+    workshop_warranty_days: int | None = Field(default=None, ge=0)
+    workshop_warranty_km: int | None = Field(default=None, ge=0)
+    iva_retention_default_percentage: float | None = Field(default=None, ge=0, le=100)
+    islr_retention_default_percentage: float | None = Field(default=None, ge=0, le=100)
+    manual_movement_attachment_threshold_usd: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def nonempty(self):
+        if not self.model_fields_set or any(
+            getattr(self, k) is None for k in self.model_fields_set
+        ):
+            raise ValueError("Envía al menos un valor; los valores no pueden ser nulos.")
+        return self
 
 
 class CompatibleVehicle(BaseModel):
@@ -76,6 +103,9 @@ class TemparioPartRead(BaseModel):
 
 
 class TemparioCreate(BaseModel):
+    warranty_mode: Literal["standard", "custom", "none"] = "standard"
+    warranty_days: int | None = Field(default=None, ge=0)
+    warranty_km: int | None = Field(default=None, ge=0)
     labor_warranty_policy_id: uuid.UUID | None = None
     parts_warranty_policy_id: uuid.UUID | None = None
     filial_id: uuid.UUID
@@ -92,6 +122,10 @@ class TemparioCreate(BaseModel):
 
 
 class TemparioUpdate(BaseModel):
+    warranty_mode: Literal["standard", "custom", "none"] | None = None
+    warranty_days: int | None = Field(default=None, ge=0)
+    warranty_km: int | None = Field(default=None, ge=0)
+    is_active: bool | None = None
     labor_warranty_policy_id: uuid.UUID | None = None
     parts_warranty_policy_id: uuid.UUID | None = None
     name: str | None = Field(default=None, min_length=2, max_length=150)
@@ -105,6 +139,13 @@ class TemparioUpdate(BaseModel):
 
 
 class TemparioRead(BaseModel):
+    legacy_warranty_label: str | None = None
+    warranty_mode: Literal["standard", "custom", "none"] = "standard"
+    warranty_days: int | None = Field(default=None, ge=0)
+    warranty_km: int | None = Field(default=None, ge=0)
+    is_active: bool = True
+    updated_by_user_id: uuid.UUID | None = None
+    updated_by_name: str | None = None
     labor_warranty_policy_id: uuid.UUID | None = None
     parts_warranty_policy_id: uuid.UUID | None = None
     id: uuid.UUID
@@ -201,6 +242,7 @@ class VehicleWarrantyCreate(BaseModel):
 
 
 class VehicleWarrantyRead(BaseModel):
+    certificate_photo_url: str | None = None
     id: uuid.UUID
     filial_id: uuid.UUID
     vin: str

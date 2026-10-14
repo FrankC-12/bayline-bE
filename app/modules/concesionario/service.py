@@ -427,15 +427,17 @@ class ConcesionarioService:
 
             from app.modules.post_ventas.service import PostVentasService
 
-            await PostVentasService(self.db).create_or_renew_warranty_from_sale(
-                vehicle.filial_id,
-                vehicle.vin,
-                vehicle.brand,
-                vehicle.model,
-                venezuela_today(),
-                vehicle.id,
-                commit=False,
-            )
+            if vehicle.condition == VehicleCondition.NUEVO:
+                await PostVentasService(self.db).create_or_renew_warranty_from_sale(
+                    vehicle.filial_id,
+                    vehicle.vin,
+                    vehicle.brand,
+                    vehicle.model,
+                    venezuela_today(),
+                    vehicle.id,
+                    commit=False,
+                )
+
 
         if status_changing:
             reason = (payload.status_reason or "").strip()

@@ -1,4 +1,8 @@
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.modules.parts.models import Part
 from datetime import date, datetime
 
 from sqlalchemy import (
@@ -100,6 +104,12 @@ class LaborSettings(Base):
     manual_movement_attachment_threshold_usd: Mapped[float] = mapped_column(
         Numeric(10, 2), nullable=False, default=100, server_default="100"
     )
+    bcv_rate_mode: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="automatic", server_default="automatic"
+    )
+    field_changes: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -141,6 +151,17 @@ class Tempario(Base):
     parts_warranty_policy_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="RESTRICT"), nullable=True
     )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    warranty_mode: Mapped[str] = mapped_column(
+        String(12), nullable=False, default="standard", server_default="standard"
+    )
+    warranty_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    warranty_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -166,7 +187,10 @@ class MaintenancePlan(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     brand: Mapped[str] = mapped_column(String(60), nullable=False)
     name: Mapped[str] = mapped_column(String(150), nullable=False)
@@ -208,7 +232,10 @@ class TemparioPart(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tempario_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("temparios.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("temparios.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="SET NULL"), nullable=True
@@ -233,7 +260,10 @@ class VehicleWarranty(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     vin: Mapped[str] = mapped_column(String(17), nullable=False)
     brand: Mapped[str] = mapped_column(String(60), nullable=False)
@@ -252,6 +282,7 @@ class VehicleWarranty(Base):
     dealership_vehicle_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("dealership_vehicles.id", ondelete="SET NULL"), nullable=True
     )
+    certificate_photo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     note: Mapped[str | None] = mapped_column(String(300), nullable=True)
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -280,14 +311,19 @@ class WorkshopWarranty(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     vin: Mapped[str] = mapped_column(String(17), nullable=False, index=True)
     service_order_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("service_orders.id", ondelete="RESTRICT"), nullable=False
     )
     service_order_task_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("service_order_tasks.id", ondelete="RESTRICT"), nullable=False
+        UUID(as_uuid=True),
+        ForeignKey("service_order_tasks.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     coverage_type: Mapped[WorkshopWarrantyCoverage] = mapped_column(
         Enum(WorkshopWarrantyCoverage, name="workshop_warranty_coverage"),
@@ -337,7 +373,10 @@ class WarrantyPolicy(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("filiales.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("filiales.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(150), nullable=False)
     applies_to: Mapped[WarrantyPolicyAppliesTo] = mapped_column(
@@ -385,7 +424,10 @@ class WarrantyPolicyTempario(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     policy_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("warranty_policies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     tempario_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("temparios.id", ondelete="RESTRICT"), nullable=False
@@ -404,7 +446,10 @@ class WarrantyPolicyPart(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     policy_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("warranty_policies.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("warranty_policies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     part_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("parts.id", ondelete="RESTRICT"), nullable=False

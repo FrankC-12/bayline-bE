@@ -9,12 +9,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.database import get_db
+from app.core.pagination import Page
 from app.core.storage import save_upload_attachment, save_upload_image
 from app.modules.auth.dependencies import get_current_user
-from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
+from app.modules.service_orders.access import (
+    require_list_access as _ensure_list_access,
+)
+from app.modules.service_orders.access import (
+    require_order_access as _ensure_order_access,
+)
 from app.modules.service_orders.billing_schemas import (
     BillingInput,
     CollectInvoicePaymentInput,
@@ -38,6 +44,7 @@ from app.modules.service_orders.schemas import (
     ServiceOrderCancelInput,
     ServiceOrderCloseInput,
     ServiceOrderCreate,
+    ServiceOrderPageItem,
     ServiceOrderRead,
     ServiceOrderTypeCreate,
     ServiceOrderTypeRead,
@@ -69,13 +76,6 @@ from app.modules.service_orders.service import (
 )
 
 MODULE_ID = "asesor-servicios"
-# The técnico role (see seed_roles.py: "Acceso móvil a tareas asignadas e
-# inspecciones") was seeded with this module instead of asesor-servicios —
-# it grants no general visibility into the filial's orders, only the right
-# to view/work the orders it's personally assigned to as técnico (see
-# _has_access/_ensure_list_access/_ensure_order_access below).
-TECNICO_MODULE_ID = "tecnico-servicio"
-
 router = APIRouter(tags=["Service Orders"])
 
 
@@ -90,56 +90,6 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
-
-
-async def _has_access(
-    current_user: CurrentUser,
-    filial_id: uuid.UUID,
-    db: AsyncSession,
-    module_id: str,
-    level: AccessLevel = AccessLevel.VER,
-) -> bool:
-    try:
-        await ensure_module_access(db, current_user, filial_id, module_id, level)
-        return True
-    except InsufficientPermissionsError:
-        return False
-
-
-async def _ensure_list_access(
-    current_user: CurrentUser, filial_id: uuid.UUID, db: AsyncSession
-) -> uuid.UUID | None:
-    """Returns None if the caller can see every order in the filial
-    (asesor-servicios VER), or the caller's own user_id if they only have
-    tecnico-servicio access — in which case the list must be filtered to
-    orders assigned to them as técnico. Raises if neither applies."""
-    if await _has_access(current_user, filial_id, db, MODULE_ID):
-        return None
-    if await _has_access(current_user, filial_id, db, TECNICO_MODULE_ID):
-        return current_user.user_id
-    raise InsufficientPermissionsError()
-
-
-async def _ensure_order_access(
-    current_user: CurrentUser,
-    order,
-    db: AsyncSession,
-    level: AccessLevel = AccessLevel.VER,
-) -> None:
-    """Same idea as _ensure_list_access but for a single already-fetched
-    order: a técnico without asesor-servicios access can still act on it —
-    at the requested level — if they're the técnico assigned to it. Used
-    with level=EDITAR for task status/timer changes, which a técnico needs
-    to work their own assigned tasks (but not e.g. delete a task or change
-    who pays for it — those stay asesor-only via the plain _ensure_access)."""
-    if await _has_access(current_user, order.filial_id, db, MODULE_ID, level):
-        return
-    if (
-        await _has_access(current_user, order.filial_id, db, TECNICO_MODULE_ID, level)
-        and order.technician_user_id == current_user.user_id
-    ):
-        return
-    raise InsufficientPermissionsError()
 
 
 # Collecting a receivable is a sensitive Finanzas action — gated by its own
@@ -161,7 +111,7 @@ async def _ensure_cobrar_access(
 # Postventas admin action — gated by that module, separate from
 # asesor-servicios, which still just needs to LIST them (via _ensure_access
 # below) to populate the "tipo de orden" picker on a new ODS.
-ORDER_TYPES_MODULE_ID = "post-ventas"
+ORDER_TYPES_MODULE_ID = "ajustes"
 
 
 async def _ensure_order_types_access(
@@ -185,7 +135,7 @@ async def list_order_types(
 
 @router.post(
     "/service-order-types", response_model=ServiceOrderTypeRead, status_code=status.HTTP_201_CREATED
-)
+, deprecated=True, include_in_schema=False)
 async def create_order_type(
     payload: ServiceOrderTypeCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -197,7 +147,7 @@ async def create_order_type(
     return await service.create_order_type(payload.filial_id, payload)
 
 
-@router.patch("/service-order-types/{order_type_id}", response_model=ServiceOrderTypeRead)
+@router.patch("/service-order-types/{order_type_id}", response_model=ServiceOrderTypeRead, deprecated=True, include_in_schema=False)
 async def update_order_type(
     order_type_id: uuid.UUID,
     payload: ServiceOrderTypeUpdate,
@@ -232,6 +182,37 @@ async def list_service_orders(
     else:
         statuses = None
     return await service.list_orders(filial_id, statuses, date, technician_user_id)
+
+
+@router.get(
+    "/service-orders/page",
+    response_model=Page[ServiceOrderPageItem],
+    summary="Consultar ODS por páginas",
+)
+async def page_service_orders(
+    filial_id: uuid.UUID = Query(...),
+    view: str = Query("active", pattern="^(active|history|all)$"),
+    status: ServiceOrderStatus | None = Query(None),
+    search: str | None = Query(None, max_length=150),
+    date_from: dt.date | None = Query(None),
+    date_to: dt.date | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    technician_user_id = await _ensure_list_access(current_user, filial_id, service.db)
+    return await service.page_orders(
+        filial_id,
+        view=view,
+        status=status,
+        search=search,
+        date_from=date_from,
+        date_to=date_to,
+        technician_user_id=technician_user_id,
+        page=page,
+        page_size=page_size,
+    )
 
 
 @router.get("/service-orders/{order_id}", response_model=ServiceOrderRead)
@@ -509,6 +490,35 @@ async def remove_transfer_line(
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
     await service.remove_transfer_line(line_id)
     return await service.get_order_summary(order_id)
+
+
+@router.delete("/service-order-transfers/{transfer_id}", status_code=204)
+async def delete_transfer(
+    transfer_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> None:
+    """Elimina una ODT sin despacho y libera sus reservas y traslados pendientes."""
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+
+    filial_id = await service.get_transfer_filial(transfer_id)
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    await WorkshopDispatchService(service.db).delete(transfer_id)
+
+
+@router.delete("/service-orders/{order_id}/transfers/{transfer_id}", status_code=204)
+async def delete_order_transfer(
+    order_id: uuid.UUID,
+    transfer_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+) -> None:
+    """Elimina una ODT perteneciente a esta ODS; rechaza IDs de otra orden."""
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    await WorkshopDispatchService(service.db).delete(transfer_id, order_id=order_id)
 
 
 @router.post("/service-order-transfers/{transfer_id}/mark-ordered", response_model=TransferRead)
@@ -789,7 +799,10 @@ async def close_service_order(
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
     return await service.close_order(
-        order_id, payload.next_maintenance_due_at, payload.next_maintenance_tempario_id
+        order_id,
+        payload.next_maintenance_due_at,
+        payload.next_maintenance_tempario_id,
+        exit_mileage=payload.exit_mileage,
     )
 
 

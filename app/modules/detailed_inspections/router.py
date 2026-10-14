@@ -14,8 +14,8 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.detailed_inspections.schemas import DetailedInspectionRead, InspectionData
 from app.modules.detailed_inspections.service import DetailedInspectionService
 from app.modules.roles.enums import AccessLevel
+from app.modules.service_orders.access import require_order_access
 from app.modules.service_orders.guards import require_editable_order
-from app.modules.service_orders.router import _ensure_order_access
 from app.modules.service_orders.service import ServiceOrderService
 
 UserDependency = Annotated[CurrentUser, Depends(get_current_user)]
@@ -32,7 +32,7 @@ async def context(order_id, user, db, *, edit=False):
         if edit
         else await ServiceOrderService(db).get_order(order_id)
     )
-    await _ensure_order_access(user, order, db, AccessLevel.EDITAR if edit else AccessLevel.VER)
+    await require_order_access(user, order, db, AccessLevel.EDITAR if edit else AccessLevel.VER)
     return order, DetailedInspectionService(db)
 
 

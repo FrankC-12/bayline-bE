@@ -1,4 +1,6 @@
 import uuid
+from datetime import date
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +26,7 @@ from app.modules.warehouse.schemas import (
     StockInReasonCreate,
     StockInReasonRead,
     StockInReasonUpdate,
+    StockMovementPage,
     StockMovementRead,
     StockOutCreate,
     TransferCreate,
@@ -130,6 +133,7 @@ async def update_inventory_location(
     AlmacenService.set_inventory_location for why this writes to every
     in-stock lot rather than a single field)."""
     await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(filial_id, [payload.warehouse_id], [payload.part_id])
     return await service.set_inventory_location(
         filial_id, payload.part_id, payload.warehouse_id, payload.location
     )
@@ -156,7 +160,23 @@ async def get_lot_detail(
     service: AlmacenService = Depends(get_service),
 ) -> PartLotDetailRead:
     lot = await service.get_lot(lot_id)
-    await _ensure_access(current_user, lot.filial_id, service.db)
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    try:
+        await _ensure_access(current_user, lot.filial_id, service.db)
+    except InsufficientPermissionsError:
+        if not lot.purchase_request_id:
+            raise
+        for module in ("compras", "administracion"):
+            try:
+                await ensure_module_access(
+                    service.db, current_user, lot.filial_id, module, AccessLevel.VER
+                )
+                break
+            except InsufficientPermissionsError:
+                pass
+        else:
+            raise InsufficientPermissionsError()
     return await service.get_lot_detail(lot)
 
 
@@ -170,6 +190,9 @@ async def create_stock_in(
 ) -> list[PartLotRead]:
     """Registrar entrada: one or more lines, each creates its own FIFO lot."""
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(
+        payload.filial_id, [payload.warehouse_id], [line.part_id for line in payload.lines]
+    )
     lots = await service.create_stock_in(payload, current_user.user_id)
     return [_lot_to_read(lot) for lot in lots]
 
@@ -183,6 +206,7 @@ async def bulk_create_lots(
     service: AlmacenService = Depends(get_service),
 ) -> BulkLotResult:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(payload.filial_id, [payload.warehouse_id], [])
     created, skipped = await service.bulk_create_lots(
         payload.filial_id, payload.warehouse_id, payload.items, current_user.user_id
     )
@@ -196,6 +220,7 @@ async def review_bulk_lots(
     service: AlmacenService = Depends(get_service),
 ) -> BulkLotReview:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(payload.filial_id, [payload.warehouse_id], [])
     return await service.review_bulk_lots(payload.filial_id, payload.items)
 
 
@@ -208,6 +233,9 @@ async def create_stock_out(
     """Registrar salida: manual stock-out (consumption, adjustment, or a
     return to a supplier), consuming FIFO lots."""
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(
+        payload.filial_id, [payload.warehouse_id], [payload.part_id]
+    )
     await service.create_stock_out(payload, current_user.user_id)
     return {"status": "ok"}
 
@@ -243,8 +271,25 @@ async def create_transfer(
     """Creates an ODT in 'Pedido' status. Stock doesn't move until it's
     marked 'Completada'."""
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(
+        payload.filial_id,
+        [payload.origin_warehouse_id, payload.destination_warehouse_id],
+        [line.part_id for line in payload.lines],
+    )
     transfer = await service.create_transfer(payload)
     return transfer_to_read(transfer)
+
+
+@router.delete("/almacen/transfers/{transfer_id}", status_code=204)
+async def delete_transfer(
+    transfer_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+) -> None:
+    """Elimina un traslado sin recepción. Los traslados de ODS se eliminan desde su ODT."""
+    existing = await service.get_transfer(transfer_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await service.delete_transfer(transfer_id)
 
 
 @router.patch("/almacen/transfers/{transfer_id}", response_model=TransferRead)
@@ -256,6 +301,11 @@ async def update_transfer_status(
 ) -> TransferRead:
     existing = await service.get_transfer(transfer_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await service.ensure_inventory_scope(
+        existing.filial_id,
+        [existing.origin_warehouse_id, existing.destination_warehouse_id],
+        [line.part_id for line in existing.lines],
+    )
     transfer = await service.update_transfer_status(
         transfer_id, payload.status, current_user.user_id
     )
@@ -324,6 +374,48 @@ async def list_part_sale_requests(
     return await service.list_part_sale_requests(filial_id)
 
 
+@router.get(
+    "/almacen/movements/page",
+    response_model=StockMovementPage,
+    summary="Consultar historial paginado con filtros",
+)
+async def page_movements(
+    filial_id: uuid.UUID = Query(...),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    warehouse_id: uuid.UUID | None = Query(None),
+    part_id: uuid.UUID | None = Query(None),
+    movement_type: (
+        Literal[
+            "entrada",
+            "salida",
+            "transferencia",
+            "transferencia_entrada",
+            "transferencia_salida",
+            "devolucion",
+        ]
+        | None
+    ) = Query(None),
+    search: str | None = Query(None, max_length=120),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+):
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.page_movements(
+        filial_id,
+        page=page,
+        page_size=page_size,
+        warehouse_id=warehouse_id,
+        part_id=part_id,
+        movement_type=movement_type,
+        search=search,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+
 @router.get("/almacen/movements", response_model=list[StockMovementRead])
 async def list_movements(
     filial_id: uuid.UUID = Query(...),
@@ -346,7 +438,12 @@ async def list_stock_in_reasons(
     current_user: CurrentUser = Depends(get_current_user),
     service: AlmacenService = Depends(get_service),
 ) -> list[StockInReasonRead]:
-    await _ensure_ajustes_access(current_user, filial_id, service.db)
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    try:
+        await _ensure_ajustes_access(current_user, filial_id, service.db)
+    except InsufficientPermissionsError:
+        await _ensure_access(current_user, filial_id, service.db)
     holding_id = await _holding_id_for_filial(service.db, filial_id)
     return await service.list_stock_in_reasons(holding_id, include_inactive)
 
@@ -451,3 +548,106 @@ async def list_workshop_backorders(
         for line in request.lines
         if line.shortfall_quantity > 0 and request.status == "pedido"
     ]
+
+
+@router.get("/stock-out-reasons", response_model=list[StockInReasonRead], tags=["Ajustes"])
+async def list_stock_out_reasons(
+    filial_id: uuid.UUID = Query(...),
+    include_inactive: bool = False,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+):
+    from sqlalchemy import select
+
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+    from app.modules.warehouse.models import StockOutReason
+
+    try:
+        await _ensure_ajustes_access(current_user, filial_id, service.db)
+    except InsufficientPermissionsError:
+        await _ensure_access(current_user, filial_id, service.db)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    statement = select(StockOutReason).where(StockOutReason.holding_id == holding_id)
+    if not include_inactive:
+        statement = statement.where(StockOutReason.is_active.is_(True))
+    return list((await service.db.execute(statement.order_by(StockOutReason.name))).scalars())
+
+
+@router.post(
+    "/stock-out-reasons", response_model=StockInReasonRead, status_code=201, tags=["Ajustes"]
+)
+async def create_stock_out_reason(
+    payload: StockInReasonCreate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+):
+    from sqlalchemy import func, select
+
+    from app.core.exceptions import BadRequestError, ConflictError
+    from app.modules.warehouse.models import StockOutReason
+
+    await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    from app.modules.holdings.models import Holding
+
+    await service.db.execute(select(Holding.id).where(Holding.id == holding_id).with_for_update())
+    name = payload.name.strip()
+    if not name:
+        raise BadRequestError("El nombre es obligatorio.")
+    if (
+        await service.db.execute(
+            select(StockOutReason.id).where(
+                StockOutReason.holding_id == holding_id,
+                func.lower(StockOutReason.name) == name.lower(),
+            )
+        )
+    ).first():
+        raise ConflictError("Ya existe un motivo con este nombre.")
+    item = StockOutReason(holding_id=holding_id, name=name)
+    service.db.add(item)
+    await service.db.commit()
+    await service.db.refresh(item)
+    return item
+
+
+@router.patch("/stock-out-reasons/{reason_id}", response_model=StockInReasonRead, tags=["Ajustes"])
+async def update_stock_out_reason(
+    reason_id: uuid.UUID,
+    payload: StockInReasonUpdate,
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AlmacenService = Depends(get_service),
+):
+    from sqlalchemy import func, select
+
+    from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
+    from app.modules.holdings.models import Holding
+    from app.modules.warehouse.models import StockOutReason
+
+    await _ensure_ajustes_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    holding_id = await _holding_id_for_filial(service.db, filial_id)
+    await service.db.execute(select(Holding.id).where(Holding.id == holding_id).with_for_update())
+    item = await service.db.get(StockOutReason, reason_id)
+    if item is None or item.holding_id != holding_id:
+        raise NotFoundError("Motivo no encontrado.")
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise BadRequestError("El nombre es obligatorio.")
+        if (
+            await service.db.execute(
+                select(StockOutReason.id).where(
+                    StockOutReason.holding_id == holding_id,
+                    StockOutReason.id != reason_id,
+                    func.lower(StockOutReason.name) == name.lower(),
+                )
+            )
+        ).first():
+            raise ConflictError("Ya existe un motivo con este nombre.")
+        item.name = name
+    if payload.is_active is not None:
+        item.is_active = payload.is_active
+    await service.db.commit()
+    await service.db.refresh(item)
+    return item
