@@ -458,7 +458,11 @@ class Upsell(Base):
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
     approval_channel: Mapped[UpsellApprovalChannel | None] = mapped_column(
-        Enum(UpsellApprovalChannel, name="upsell_approval_channel"), nullable=True
+        Enum(
+            UpsellApprovalChannel,
+            name="upsell_approval_channel",
+            values_callable=lambda enum: [item.value for item in enum],
+        ), nullable=True
     )
     # Which ODS the recommendation actually landed on — usually the same as
     # service_order_id (approved the same visit it was detected), but can

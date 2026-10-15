@@ -230,3 +230,72 @@ async def test_list_upsells_includes_both_approved_and_rejected(env):
     statuses = {u.id: u.status for u in upsells}
     assert statuses[approved.id] == UpsellStatus.APROBADO
     assert statuses[rejected.id] == UpsellStatus.RECHAZADO
+
+
+@pytest.mark.asyncio
+async def test_approval_uses_separate_odt_even_when_original_is_pending(env):
+    service, _session, order, tempario, part = env
+    original = await service.add_transfer_line(order.id, part.id, 1)
+    upsell = await service.create_upsell(
+        order.id,
+        UpsellCreate(
+            title="Trabajo adicional", description="Hallazgo de la revisión",
+            severity=UpsellSeverity.MONITOREAR,
+            tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+            parts=[UpsellPartInput(part_id=part.id, quantity=2)],
+        ), [],
+    )
+    await service.decide_upsell(
+        upsell.id, UpsellDecisionInput(status="aprobado", approval_channel="presencial"), uuid.uuid4()
+    )
+    transfers = await service.list_transfers(order.id)
+    assert len(transfers) == 2
+    assert next(t for t in transfers if t.id == original.id).lines[0].quantity == 1
+    additional = next(t for t in transfers if t.id != original.id)
+    assert sum(line.quantity for line in additional.lines) == 3
+    assert additional.sequence_number == 2
+
+
+@pytest.mark.asyncio
+async def test_labor_only_approval_does_not_leave_empty_odt(env):
+    service, session, order, _tempario, _part = env
+    labor = Tempario(
+        filial_id=order.filial_id, category=TemparioCategory.FRENOS,
+        sequence_number=2, name="Diagnóstico", estimated_hours=1,
+    )
+    session.add(labor)
+    session.commit()
+    upsell = await service.create_upsell(order.id, UpsellCreate(
+        title="Diagnóstico", description="Revisión sin repuestos", severity=UpsellSeverity.MONITOREAR,
+        tasks=[UpsellTaskInput(tempario_id=labor.id)],
+    ), [])
+    await service.decide_upsell(
+        upsell.id, UpsellDecisionInput(status="aprobado", approval_channel="presencial"), uuid.uuid4()
+    )
+    assert len(await service.list_tasks(order.id)) == 1
+    assert await service.list_transfers(order.id) == []
+
+
+@pytest.mark.asyncio
+async def test_failed_approval_does_not_commit_partial_tasks(env):
+    service, session, order, tempario, part = env
+    upsell = await service.create_upsell(order.id, UpsellCreate(
+        title="Reparación", description="Trabajo adicional", severity=UpsellSeverity.MONITOREAR,
+        tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+        parts=[UpsellPartInput(part_id=part.id, quantity=1)],
+    ), [])
+    original_add = service.add_transfer_line
+
+    async def fail_part(*args, **kwargs):
+        raise RuntimeError("Simular fallo al agregar repuesto")
+
+    service.add_transfer_line = fail_part
+    with pytest.raises(RuntimeError):
+        await service.decide_upsell(
+            upsell.id, UpsellDecisionInput(status="aprobado", approval_channel="presencial"), uuid.uuid4()
+        )
+    session.rollback()
+    service.add_transfer_line = original_add
+    assert await service.list_tasks(order.id) == []
+    assert await service.list_transfers(order.id) == []
+    assert (await service.get_upsell(upsell.id)).status == UpsellStatus.PENDIENTE

@@ -269,3 +269,42 @@ async def test_delete_submitted_request_is_blocked_and_keeps_remote_reservations
                 select(func.sum(PartLot.quantity_remaining)).where(PartLot.part_id == part_id)
             )
         ).scalar() == 5
+
+
+@pytest.mark.asyncio
+async def test_concurrent_finding_approval_creates_only_one_additional_odt(billing_db):
+    from app.modules.service_orders.enums import UpsellSeverity
+    from app.modules.service_orders.schemas import UpsellCreate, UpsellDecisionInput, UpsellPartInput
+
+    ctx = billing_db
+    part_id, _, _ = await inventory(ctx)
+    async with ctx.sessions() as db:
+        service = ServiceOrderService(db)
+        original = await service.add_transfer_line(ctx.order_id, part_id, 1)
+        original_id = original.id
+        finding = await service.create_upsell(ctx.order_id, UpsellCreate(
+            title="Hallazgo", description="Trabajo adicional detectado",
+            severity=UpsellSeverity.MONITOREAR,
+            parts=[UpsellPartInput(part_id=part_id, quantity=1)],
+        ), [])
+        finding_id = finding.id
+
+    async def approve():
+        async with ctx.sessions() as db:
+            try:
+                await ServiceOrderService(db).decide_upsell(
+                    finding_id, UpsellDecisionInput(status="aprobado", approval_channel="presencial"), None
+                )
+                return "approved"
+            except BadRequestError as error:
+                await db.rollback()
+                return error.error_code
+
+    results = await asyncio.gather(approve(), approve())
+    assert results.count("approved") == 1
+    assert results.count("upsell_already_decided") == 1
+    async with ctx.sessions() as db:
+        transfers = await ServiceOrderService(db).list_transfers(ctx.order_id)
+        assert len(transfers) == 2
+        assert next(t for t in transfers if t.id == original_id).lines[0].quantity == 1
+        assert sum(line.quantity for t in transfers for line in t.lines) == 2

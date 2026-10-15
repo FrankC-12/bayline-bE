@@ -897,6 +897,9 @@ class ServiceOrderService:
         service_order_id: uuid.UUID,
         tempario_id: uuid.UUID,
         payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE,
+        *,
+        transfer: ServiceOrderTransfer | None = None,
+        commit: bool = True,
     ) -> ServiceOrderTask:
         order = await require_editable_order(self.db, service_order_id)
         tempario_result = await self.db.execute(
@@ -980,7 +983,7 @@ class ServiceOrderService:
         warnings: list[str] = []
         linked_parts = [p for p in tempario.parts if p.part_id is not None]
         if linked_parts:
-            transfer = await self._get_or_create_pending_transfer(service_order_id)
+            transfer = transfer or await self._get_or_create_pending_transfer(service_order_id)
             for tp in linked_parts:
                 part = await self.db.get(Part, tp.part_id)
                 if part is not None:
@@ -990,9 +993,11 @@ class ServiceOrderService:
                     if warning:
                         warnings.append(warning)
 
+        await self.db.flush()
         await self._sync_status_from_tasks(order)
-        await self.db.commit()
-        await self.db.refresh(task)
+        if commit:
+            await self.db.commit()
+            await self.db.refresh(task)
         # Not a mapped column — a transient hint for the router to surface as
         # a non-blocking warning on this one response, same convention as
         # Vehicle.current_mileage elsewhere in this codebase.
@@ -1090,15 +1095,19 @@ class ServiceOrderService:
         part_id: uuid.UUID,
         quantity: int,
         payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE,
+        *,
+        transfer: ServiceOrderTransfer | None = None,
+        commit: bool = True,
     ) -> ServiceOrderTransfer:
         await require_editable_order(self.db, service_order_id)
         part = await self.db.get(Part, part_id)
         if part is None:
             raise TransferNotFoundError(str(part_id))
-        transfer = await self._get_or_create_pending_transfer(service_order_id)
+        transfer = transfer or await self._get_or_create_pending_transfer(service_order_id)
         warning = await self._add_line_to_transfer(transfer, part.id, quantity, payer=payer)
-        await self.db.commit()
-        await self.db.refresh(transfer)
+        if commit:
+            await self.db.commit()
+            await self.db.refresh(transfer)
         transfer.stock_warnings = [warning] if warning else []
         return transfer
 
@@ -1198,7 +1207,7 @@ class ServiceOrderService:
         return await WorkshopDispatchService(self.db).dispatch(transfer_id, completed_by_user_id)
 
     async def _get_or_create_pending_transfer(
-        self, service_order_id: uuid.UUID
+        self, service_order_id: uuid.UUID, *, force_new: bool = False
     ) -> ServiceOrderTransfer:
         await require_editable_order(self.db, service_order_id)
         result = await self.db.execute(
@@ -1210,7 +1219,7 @@ class ServiceOrderService:
             .order_by(ServiceOrderTransfer.sequence_number.desc())
         )
         transfer = result.scalars().first()
-        if transfer is not None:
+        if transfer is not None and not force_new:
             return transfer
 
         seq_result = await self.db.execute(
@@ -1752,7 +1761,18 @@ class ServiceOrderService:
         payload: UpsellDecisionInput,
         decided_by_user_id: uuid.UUID | None,
     ) -> UpsellRead:
-        upsell = await self._get_upsell_model(upsell_id)
+        # Serialize decisions so two advisors cannot apply the same finding twice.
+        upsell = (
+            await self.db.execute(
+                select(Upsell)
+                .where(Upsell.id == upsell_id)
+                .options(selectinload(Upsell.tasks), selectinload(Upsell.parts))
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if upsell is None:
+            raise UpsellNotFoundError(str(upsell_id))
         if upsell.status not in (UpsellStatus.PENDIENTE, UpsellStatus.POSPUESTO):
             raise BadRequestError(
                 "Esta recomendación ya fue decidida.", error_code="upsell_already_decided"
@@ -1778,14 +1798,29 @@ class ServiceOrderService:
                     "La ODS destino debe ser del mismo vehículo que la recomendación.",
                     error_code="upsell_vehicle_mismatch",
                 )
+            # Additional work gets its own ODT, including catalog-linked parts.
+            # Keep the decision, tasks and parts in one transaction.
+            transfer = await self._get_or_create_pending_transfer(target_order_id, force_new=True)
             for task in upsell.tasks:
                 await self.add_task(
-                    target_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE
+                    target_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE,
+                    transfer=transfer, commit=False,
                 )
             for part in upsell.parts:
                 await self.add_transfer_line(
-                    target_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE
+                    target_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE,
+                    transfer=transfer, commit=False,
                 )
+            await self.db.flush()
+            has_lines = (
+                await self.db.execute(
+                    select(ServiceOrderTransferLine.id)
+                    .where(ServiceOrderTransferLine.transfer_id == transfer.id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if has_lines is None:
+                await self.db.delete(transfer)
             upsell.approved_by_user_id = decided_by_user_id
             upsell.approval_channel = payload.approval_channel
             upsell.applied_to_service_order_id = target_order_id
