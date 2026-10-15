@@ -92,9 +92,8 @@ class ServiceOrderCreate(BaseModel):
     # matching claim_type (see ServiceOrderService.create_order).
     warranty_claim_id: uuid.UUID | None = None
     advisor_user_id: uuid.UUID
-    # "Fecha de inicio de ODS" — a date + 30-minute time slot, captured the
-    # same way as scheduled_at's "Hora" select.
-    promised_at: datetime
+    # Explicit delivery commitment; never inferred from start/creation time.
+    promised_at: datetime | None = None
     notes: str | None = None
     # Used by "Agendar Orden de Servicio" in the Calendario view — optional
     # so a normal walk-in ODS (created from the kanban) can omit them.
@@ -111,6 +110,8 @@ class ServiceOrderUpdate(BaseModel):
     advisor_user_id: uuid.UUID | None = None
     bay_id: uuid.UUID | None = None
     scheduled_at: datetime | None = None
+    promised_at: datetime | None = None
+    clear_promised_at: bool = False
     notes: str | None = None
     # "None" above means "leave unchanged" — these flags are how the client
     # explicitly asks to clear a nullable assignment back to "Sin asignar".

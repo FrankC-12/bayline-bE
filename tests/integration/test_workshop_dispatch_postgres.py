@@ -239,7 +239,7 @@ async def test_legacy_request_is_not_deducted_a_second_time(billing_db):
 
 
 @pytest.mark.asyncio
-async def test_delete_submitted_request_cascades_and_releases_remote_reservations(billing_db):
+async def test_delete_submitted_request_is_blocked_and_keeps_remote_reservations(billing_db):
     from app.modules.service_orders.models import ServiceOrderTransfer
 
     ctx = billing_db
@@ -249,17 +249,20 @@ async def test_delete_submitted_request_cascades_and_releases_remote_reservation
         request_id = request.id
         await WorkshopDispatchService(db).submit(request_id)
         assert sum((await reserved_by_lot(db, part_id)).values()) == 3
-        await WorkshopDispatchService(db).delete(request_id, order_id=ctx.order_id)
+        from app.core.exceptions import ConflictError
+
+        with pytest.raises(ConflictError, match="pendientes"):
+            await WorkshopDispatchService(db).delete(request_id, order_id=ctx.order_id)
+        with pytest.raises(ConflictError, match="ODT pedidas o completadas"):
+            await ServiceOrderService(db).delete_order(ctx.order_id)
     async with ctx.sessions() as db:
-        assert await db.get(ServiceOrderTransfer, request_id) is None
+        assert await db.get(ServiceOrderTransfer, request_id) is not None
         assert (
-            not (
-                await db.execute(select(Transfer).where(Transfer.workshop_request_id == request_id))
-            )
+            (await db.execute(select(Transfer).where(Transfer.workshop_request_id == request_id)))
             .scalars()
             .all()
         )
-        assert not await reserved_by_lot(db, part_id)
+        assert sum((await reserved_by_lot(db, part_id)).values()) == 3
         assert (await db.get(Part, part_id)).stock_quantity == 5
         assert (
             await db.execute(

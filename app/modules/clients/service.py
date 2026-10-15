@@ -153,7 +153,10 @@ class ClientService:
         order-linked inspection — mixing mileage/date from one visit with a
         link to a different one would be wrong.
         """
-        vehicle_ids = [v.id for c in clients for v in c.vehicles]
+        await self.attach_vehicle_mileage([v for c in clients for v in c.vehicles])
+
+    async def attach_vehicle_mileage(self, vehicles: list[Vehicle]) -> None:
+        vehicle_ids = [v.id for v in vehicles]
         latest = await self._latest_mileage_inspections(vehicle_ids)
 
         order_ids = {i.service_order_id for i in latest.values() if i.service_order_id}
@@ -197,48 +200,45 @@ class ClientService:
         closed_by_vehicle = {}
         for row in closed_rows:
             closed_by_vehicle.setdefault(row.vehicle_id, row)
-        for client in clients:
-            for vehicle in client.vehicles:
-                inspection = latest.get(vehicle.id)
-                vehicle.current_mileage = inspection.mileage if inspection else None
+        for vehicle in vehicles:
+            inspection = latest.get(vehicle.id)
+            vehicle.current_mileage = inspection.mileage if inspection else None
+            vehicle.current_mileage_visit_date = (
+                inspection.created_at.date() if inspection else None
+            )
+            vehicle.current_mileage_service_order_id = (
+                inspection.service_order_id if inspection else None
+            )
+            sequence_number = orders_by_id.get(inspection.service_order_id) if inspection else None
+            vehicle.current_mileage_service_order_code = (
+                f"ODS-{sequence_number}" if sequence_number is not None else None
+            )
+            departure = closed_by_vehicle.get(vehicle.id)
+            if (
+                departure
+                and departure.closed_at
+                and (inspection is None or utc(departure.closed_at) >= utc(inspection.created_at))
+            ):
+                vehicle.current_mileage = departure.exit_mileage
                 vehicle.current_mileage_visit_date = (
-                    inspection.created_at.date() if inspection else None
+                    utc(departure.closed_at).astimezone(ZoneInfo("America/Caracas")).date()
                 )
-                vehicle.current_mileage_service_order_id = (
-                    inspection.service_order_id if inspection else None
-                )
-                sequence_number = (
-                    orders_by_id.get(inspection.service_order_id) if inspection else None
-                )
-                vehicle.current_mileage_service_order_code = (
-                    f"ODS-{sequence_number}" if sequence_number is not None else None
-                )
-                departure = closed_by_vehicle.get(vehicle.id)
-                if (
-                    departure
-                    and departure.closed_at
-                    and (
-                        inspection is None or utc(departure.closed_at) >= utc(inspection.created_at)
-                    )
-                ):
-                    vehicle.current_mileage = departure.exit_mileage
-                    vehicle.current_mileage_visit_date = (
-                        utc(departure.closed_at).astimezone(ZoneInfo("America/Caracas")).date()
-                    )
-                    vehicle.current_mileage_service_order_id = departure.id
-                    vehicle.current_mileage_service_order_code = f"ODS-{departure.sequence_number}"
+                vehicle.current_mileage_service_order_id = departure.id
+                vehicle.current_mileage_service_order_code = f"ODS-{departure.sequence_number}"
 
     async def _attach_next_maintenance_plan(self, clients: list[Client]) -> None:
         """Denormalizes the advisor-suggested next-visit tempario (set at ODS
         close time, see ServiceOrderService.close_order) and the assigned
         MaintenancePlan's brand/name onto each Vehicle as plain attributes —
         lets the frontend show both without a second round trip per vehicle."""
+        await self.attach_vehicle_maintenance([v for c in clients for v in c.vehicles])
+
+    async def attach_vehicle_maintenance(self, vehicles: list[Vehicle]) -> None:
         from app.modules.post_ventas.models import MaintenancePlan, Tempario
 
         tempario_ids = {
             v.next_maintenance_tempario_id
-            for c in clients
-            for v in c.vehicles
+            for v in vehicles
             if v.next_maintenance_tempario_id is not None
         }
         temparios_by_id: dict[uuid.UUID, Tempario] = {}
@@ -246,12 +246,7 @@ class ClientService:
             rows = await self.db.execute(select(Tempario).where(Tempario.id.in_(tempario_ids)))
             temparios_by_id = {t.id: t for t in rows.scalars()}
 
-        plan_ids = {
-            v.maintenance_plan_id
-            for c in clients
-            for v in c.vehicles
-            if v.maintenance_plan_id is not None
-        }
+        plan_ids = {v.maintenance_plan_id for v in vehicles if v.maintenance_plan_id is not None}
         plans_by_id: dict[uuid.UUID, MaintenancePlan] = {}
         if plan_ids:
             rows = await self.db.execute(
@@ -259,14 +254,13 @@ class ClientService:
             )
             plans_by_id = {p.id: p for p in rows.scalars()}
 
-        for client in clients:
-            for vehicle in client.vehicles:
-                tempario = temparios_by_id.get(vehicle.next_maintenance_tempario_id)
-                vehicle.next_maintenance_tempario_code = tempario.code if tempario else None
-                vehicle.next_maintenance_tempario_name = tempario.name if tempario else None
-                plan = plans_by_id.get(vehicle.maintenance_plan_id)
-                vehicle.maintenance_plan_brand = plan.brand if plan else None
-                vehicle.maintenance_plan_name = plan.name if plan else None
+        for vehicle in vehicles:
+            tempario = temparios_by_id.get(vehicle.next_maintenance_tempario_id)
+            vehicle.next_maintenance_tempario_code = tempario.code if tempario else None
+            vehicle.next_maintenance_tempario_name = tempario.name if tempario else None
+            plan = plans_by_id.get(vehicle.maintenance_plan_id)
+            vehicle.maintenance_plan_brand = plan.brand if plan else None
+            vehicle.maintenance_plan_name = plan.name if plan else None
 
     async def _latest_mileage_inspections(
         self, vehicle_ids: list[uuid.UUID]

@@ -13,6 +13,7 @@ from app.core.pagination import Page
 from app.core.storage import save_upload_attachment, save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.clients.schemas import ServiceVehicleRead
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 from app.modules.service_orders.access import (
@@ -134,8 +135,12 @@ async def list_order_types(
 
 
 @router.post(
-    "/service-order-types", response_model=ServiceOrderTypeRead, status_code=status.HTTP_201_CREATED
-, deprecated=True, include_in_schema=False)
+    "/service-order-types",
+    response_model=ServiceOrderTypeRead,
+    status_code=status.HTTP_201_CREATED,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def create_order_type(
     payload: ServiceOrderTypeCreate,
     current_user: CurrentUser = Depends(get_current_user),
@@ -147,7 +152,12 @@ async def create_order_type(
     return await service.create_order_type(payload.filial_id, payload)
 
 
-@router.patch("/service-order-types/{order_type_id}", response_model=ServiceOrderTypeRead, deprecated=True, include_in_schema=False)
+@router.patch(
+    "/service-order-types/{order_type_id}",
+    response_model=ServiceOrderTypeRead,
+    deprecated=True,
+    include_in_schema=False,
+)
 async def update_order_type(
     order_type_id: uuid.UUID,
     payload: ServiceOrderTypeUpdate,
@@ -212,6 +222,57 @@ async def page_service_orders(
         technician_user_id=technician_user_id,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/service-orders/vehicles", response_model=Page[ServiceVehicleRead])
+async def service_vehicles(
+    filial_id: uuid.UUID = Query(...),
+    search: str | None = Query(None, max_length=150),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    """Vehículos de la filial para consultar ficha, garantías e historial en Asesor."""
+    from sqlalchemy import func, or_, select
+
+    from app.core.pagination import page_query
+    from app.core.search import fold_search
+    from app.modules.clients.models import Client, Vehicle
+    from app.modules.clients.schemas import VehicleRead
+    from app.modules.clients.service import ClientService
+
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.VER)
+    query = (
+        select(Vehicle, Client.full_name)
+        .join(Client, Client.id == Vehicle.client_id)
+        .where(Client.filial_id == filial_id)
+    )
+    if search and search.strip():
+        term = search.strip().lower()
+        query = query.where(
+            or_(
+                func.lower(Vehicle.plate).contains(term, autoescape=True),
+                func.lower(Vehicle.vin).contains(term, autoescape=True),
+                func.lower(Vehicle.brand + " " + Vehicle.model).contains(term, autoescape=True),
+                Client.normalized_name.contains(fold_search(term), autoescape=True),
+            )
+        )
+    rows, metadata = await page_query(
+        service.db, query.order_by(Vehicle.brand, Vehicle.model, Vehicle.id), page, page_size
+    )
+    entries = rows.all()
+    reader = ClientService(service.db)
+    vehicles = [vehicle for vehicle, _ in entries]
+    await reader.attach_vehicle_mileage(vehicles)
+    await reader.attach_vehicle_maintenance(vehicles)
+    return Page[ServiceVehicleRead](
+        items=[
+            ServiceVehicleRead(vehicle=VehicleRead.model_validate(vehicle), client_name=name)
+            for vehicle, name in entries
+        ],
+        **metadata,
     )
 
 
@@ -498,7 +559,7 @@ async def delete_transfer(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> None:
-    """Elimina una ODT sin despacho y libera sus reservas y traslados pendientes."""
+    """Elimina únicamente una ODT pendiente; rechaza pedidas y completadas."""
     from app.modules.service_orders.dispatch import WorkshopDispatchService
 
     filial_id = await service.get_transfer_filial(transfer_id)

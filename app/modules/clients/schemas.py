@@ -90,6 +90,11 @@ class VehicleRead(BaseModel):
     maintenance_plan_name: str | None = None
 
 
+class ServiceVehicleRead(BaseModel):
+    vehicle: VehicleRead
+    client_name: str
+
+
 class VehicleMaintenancePlanAssign(BaseModel):
     plan_id: uuid.UUID | None = None
 

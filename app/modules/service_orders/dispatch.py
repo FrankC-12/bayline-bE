@@ -62,7 +62,7 @@ class WorkshopDispatchService:
         return request
 
     async def delete(self, request_id, *, order_id=None):
-        """Release unconsumed reservations; retain receipts of actual transfers."""
+        """Delete only pending requests; retain receipts of actual transfers."""
         from app.core.exceptions import ConflictError
         from app.modules.service_orders.guards import require_editable_order
 
@@ -75,6 +75,11 @@ class WorkshopDispatchService:
                 raise ConflictError(
                     "La ODT ya fue despachada. Registra una devolución para corregir el inventario.",
                     error_code="transfer_already_dispatched",
+                )
+            if request.status != TransferStatus.PENDIENTE:
+                raise ConflictError(
+                    "Solo se pueden eliminar ODT pendientes. Una ODT pedida no puede eliminarse.",
+                    error_code="transfer_not_pending",
                 )
             linked = list(
                 (

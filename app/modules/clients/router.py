@@ -41,6 +41,15 @@ async def _ensure_access(
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
 
 
+async def _ensure_profile_access(current_user, filial_id, db, level=AccessLevel.VER):
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    try:
+        await ensure_module_access(db, current_user, filial_id, "asesor-servicios", level)
+    except InsufficientPermissionsError:
+        await _ensure_access(current_user, filial_id, db, level)
+
+
 @router.get("", response_model=list[ClientRead])
 async def list_clients(
     filial_id: uuid.UUID = Query(...),
@@ -195,7 +204,7 @@ async def register_vehicle_factory_warranty(
     if vehicle is None:
         raise BadRequestError("Vehículo no encontrado.")
     client = await service.db.get(Client, vehicle.client_id)
-    await _ensure_access(current_user, client.filial_id, service.db, AccessLevel.EDITAR)
+    await _ensure_profile_access(current_user, client.filial_id, service.db, AccessLevel.EDITAR)
     if not vehicle.vin:
         raise BadRequestError("Registra el VIN antes de crear la garantía.")
     if not ((duration_months or 0) > 0 or (duration_km or 0) > 0):
@@ -300,7 +309,7 @@ async def vehicle_service_history(
     if vehicle is None:
         raise NotFoundError("Vehículo no encontrado.")
     client = await service.db.get(Client, vehicle.client_id)
-    await _ensure_access(current_user, client.filial_id, service.db)
+    await _ensure_profile_access(current_user, client.filial_id, service.db)
     statement = (
         select(ServiceOrder)
         .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)

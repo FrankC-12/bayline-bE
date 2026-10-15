@@ -24,13 +24,30 @@ def deletion_env():
 
 
 @pytest.mark.asyncio
-async def test_delete_submitted_releases_reservations_without_consuming_stock(deletion_env):
+async def test_delete_pending_request_without_consuming_stock(deletion_env):
     service, session, order, part = deletion_env
     request = await service.add_transfer_line(order.id, part.id, 2)
-    await service.mark_transfer_ordered(request.id)
     await WorkshopDispatchService(service.db).delete(request.id, order_id=order.id)
     assert session.get(ServiceOrderTransfer, request.id) is None
     assert not session.scalars(select(ServiceOrderTransferLotAllocation)).all()
+    assert session.scalars(select(PartLot.quantity_remaining)).all() == [5]
+
+
+@pytest.mark.asyncio
+async def test_delete_ordered_request_is_rejected_and_keeps_reservations(deletion_env):
+    service, session, order, part = deletion_env
+    request = await service.add_transfer_line(order.id, part.id, 2)
+    request_id = request.id
+    await service.mark_transfer_ordered(request_id)
+    before = session.scalars(select(ServiceOrderTransferLotAllocation)).all()
+    allocation_ids = {allocation.id for allocation in before}
+    with pytest.raises(ConflictError, match="pendientes"):
+        await WorkshopDispatchService(service.db).delete(request_id)
+    assert session.get(ServiceOrderTransfer, request_id) is not None
+    assert {
+        allocation.id
+        for allocation in session.scalars(select(ServiceOrderTransferLotAllocation)).all()
+    } == allocation_ids
     assert session.scalars(select(PartLot.quantity_remaining)).all() == [5]
 
 

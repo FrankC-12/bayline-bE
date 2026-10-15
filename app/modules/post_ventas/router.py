@@ -171,11 +171,14 @@ async def update_maintenance_plan(
 
 async def _ensure_vehicle_read_access(current_user, filial_id, db):
     try:
-        await _ensure_access(current_user, filial_id, db)
+        await ensure_module_access(db, current_user, filial_id, "asesor-servicios", AccessLevel.VER)
     except InsufficientPermissionsError:
-        await ensure_module_access(
-            db, current_user, filial_id, "clientes-vehiculos", AccessLevel.VER
-        )
+        try:
+            await _ensure_access(current_user, filial_id, db)
+        except InsufficientPermissionsError:
+            await ensure_module_access(
+                db, current_user, filial_id, "clientes-vehiculos", AccessLevel.VER
+            )
 
 
 @router.get("/vehicle-warranties", response_model=list[VehicleWarrantyRead])

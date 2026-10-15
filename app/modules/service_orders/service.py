@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -318,7 +319,13 @@ class ServiceOrderService:
         if statuses:
             query = query.where(ServiceOrder.status.in_(statuses))
         if scheduled_date is not None:
-            query = query.where(func.date(ServiceOrder.scheduled_at) == scheduled_date)
+            start = datetime.combine(
+                scheduled_date, datetime.min.time(), tzinfo=ZoneInfo("America/Caracas")
+            )
+            query = query.where(
+                ServiceOrder.scheduled_at >= start,
+                ServiceOrder.scheduled_at < start + timedelta(days=1),
+            )
         if technician_user_id is not None:
             query = query.where(ServiceOrder.technician_user_id == technician_user_id)
         query = query.order_by(ServiceOrder.created_at.desc())
@@ -611,6 +618,10 @@ class ServiceOrderService:
 
         if payload.scheduled_at is not None:
             order.scheduled_at = payload.scheduled_at
+        if payload.clear_promised_at:
+            order.promised_at = None
+        elif payload.promised_at is not None:
+            order.promised_at = payload.promised_at
 
         if payload.notes is not None:
             order.notes = payload.notes
@@ -759,9 +770,40 @@ class ServiceOrderService:
         return order
 
     async def delete_order(self, order_id: uuid.UUID) -> None:
-        order = await require_editable_order(self.db, order_id)
-        await self.db.delete(order)
-        await self.db.commit()
+        from sqlalchemy import or_
+
+        from app.core.exceptions import ConflictError
+        from app.modules.filiales.models import Filial
+
+        try:
+            existing = await self.get_order(order_id)
+            await self.db.execute(
+                select(Filial.id).where(Filial.id == existing.filial_id).with_for_update()
+            )
+            order = await require_editable_order(self.db, order_id)
+            protected = (
+                await self.db.execute(
+                    select(ServiceOrderTransfer.id)
+                    .where(
+                        ServiceOrderTransfer.service_order_id == order_id,
+                        or_(
+                            ServiceOrderTransfer.status != TransferStatus.PENDIENTE,
+                            ServiceOrderTransfer.stock_deducted.is_(True),
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if protected is not None:
+                raise ConflictError(
+                    "No se puede eliminar la ODS porque contiene ODT pedidas o completadas.",
+                    error_code="order_has_locked_transfers",
+                )
+            await self.db.delete(order)
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
 
     async def _next_sequence_number(self, filial_id: uuid.UUID) -> int:
         result = await self.db.execute(
@@ -1517,7 +1559,7 @@ class ServiceOrderService:
 
     async def _hourly_rate(self, filial_id: uuid.UUID, order=None) -> float:
         if order and order.settings_snapshot:
-            return float(order.settings_snapshot.get("hourly_rate",25))
+            return float(order.settings_snapshot.get("hourly_rate", 25))
         result = await self.db.execute(
             select(LaborSettings).where(LaborSettings.filial_id == filial_id)
         )
@@ -1591,14 +1633,16 @@ class ServiceOrderService:
         rows = result.all()
         hourly_rate = await self._hourly_rate(filial_id)
         return [
-            self._upsell_to_read(upsell, float(snapshot["hourly_rate"]) if snapshot else hourly_rate, discount_label)
+            self._upsell_to_read(
+                upsell, float(snapshot["hourly_rate"]) if snapshot else hourly_rate, discount_label
+            )
             for upsell, discount_label, snapshot in rows
         ]
 
     async def get_upsell(self, upsell_id: uuid.UUID) -> UpsellRead:
         upsell = await self._get_upsell_model(upsell_id)
         order = await self.get_order(upsell.service_order_id)
-        hourly_rate = await self._hourly_rate(order.filial_id,order)
+        hourly_rate = await self._hourly_rate(order.filial_id, order)
         return self._upsell_to_read(upsell, hourly_rate, order.discount_label)
 
     async def list_pending_upsells_for_vehicle(
@@ -1640,7 +1684,7 @@ class ServiceOrderService:
         self, service_order_id: uuid.UUID, payload: UpsellCreate, photo_urls: list[str]
     ) -> UpsellRead:
         order = await require_editable_order(self.db, service_order_id)
-        hourly_rate = await self._hourly_rate(order.filial_id,order)
+        hourly_rate = await self._hourly_rate(order.filial_id, order)
         multiplier = float(PARTS_MULTIPLIERS[order.discount_label])
         labor_cost = 0.0
         parts_cost = 0.0
@@ -2209,7 +2253,16 @@ class ServiceOrderService:
             await self.db.execute(
                 select(ServiceOrderTypeCatalog).where(
                     ServiceOrderTypeCatalog.filial_id == claim.filial_id,
-                    ServiceOrderTypeCatalog.code == (SYSTEM_ORDER_TYPE_GARANTIA_FABRICA if claim.claim_type == WarrantyClaimType.FABRICA else SYSTEM_ORDER_TYPE_CAMPANA if claim.claim_type == WarrantyClaimType.CAMPANA_RECALL else SYSTEM_ORDER_TYPE_RETRABAJO),
+                    ServiceOrderTypeCatalog.code
+                    == (
+                        SYSTEM_ORDER_TYPE_GARANTIA_FABRICA
+                        if claim.claim_type == WarrantyClaimType.FABRICA
+                        else (
+                            SYSTEM_ORDER_TYPE_CAMPANA
+                            if claim.claim_type == WarrantyClaimType.CAMPANA_RECALL
+                            else SYSTEM_ORDER_TYPE_RETRABAJO
+                        )
+                    ),
                 )
             )
         ).scalar_one()
@@ -2221,7 +2274,7 @@ class ServiceOrderService:
             advisor_user_id=original_order.advisor_user_id if original_order else None,
             intake_mileage=intake_mileage,
             customer_reason=f"Retrabajo de garantía — {cause_label}",
-            promised_at=payload.promised_at or datetime.now(UTC),
+            promised_at=payload.promised_at,
             sequence_number=next_seq,
         )
         from app.modules.ajustes.snapshots import settings_snapshot
