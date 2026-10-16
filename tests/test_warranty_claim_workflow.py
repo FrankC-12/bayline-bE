@@ -14,6 +14,7 @@ from test_part_sales_fifo import AsyncAdapter, seed_order_types
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.filiales.models import Filial
@@ -21,8 +22,6 @@ from app.modules.post_ventas.enums import VehicleWarrantySource
 from app.modules.post_ventas.models import VehicleWarranty
 from app.modules.service_orders.enums import (
     ReworkFailureCategory,
-    ServiceOrderPayer,
-    ServiceOrderStatus,
     WarrantyClaimStatus,
     WarrantyClaimType,
 )
@@ -221,7 +220,7 @@ async def test_authorizing_fabrica_with_vigente_warranty_needs_no_override(env):
     service, session, filial_id, vehicle = env
     session.add(VehicleWarranty(
         filial_id=filial_id, vin=vehicle.vin, brand="Toyota", starts_at=date(2020, 1, 1),
-        expires_at=date.today() + timedelta(days=100), source=VehicleWarrantySource.MANUAL,
+        expires_at=venezuela_today() + timedelta(days=100), source=VehicleWarrantySource.MANUAL,
     ))
     session.commit()
     claim = await service.create_warranty_claim(
@@ -247,7 +246,7 @@ async def test_converting_fabrica_claim_with_no_prior_order_uses_reported_mileag
     session.flush()
     session.add(VehicleWarranty(
         filial_id=filial_id, vin=vehicle.vin, brand="Toyota", starts_at=date(2020, 1, 1),
-        expires_at=date.today() + timedelta(days=100), source=VehicleWarrantySource.MANUAL,
+        expires_at=venezuela_today() + timedelta(days=100), source=VehicleWarrantySource.MANUAL,
     ))
     session.commit()
     claim = await service.create_warranty_claim(

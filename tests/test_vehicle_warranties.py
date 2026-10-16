@@ -13,6 +13,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 from app.core.database import Base
 from app.core.exceptions import ConflictError
+from app.core.venezuela_time import venezuela_today
 from app.modules.auth.schemas import CurrentUser
 from app.modules.concesionario.enums import SaleType, VehicleCondition, VehicleStatus
 from app.modules.concesionario.models import DealershipVehicle
@@ -66,7 +67,7 @@ async def test_create_manual_warranty_computes_expiration(env):
 @pytest.mark.asyncio
 async def test_manual_warranty_requires_a_duration():
     with pytest.raises(ValidationError):
-        VehicleWarrantyCreate(filial_id=uuid.uuid4(), vin=VIN, brand="Toyota", starts_at=date.today())
+        VehicleWarrantyCreate(filial_id=uuid.uuid4(), vin=VIN, brand="Toyota", starts_at=venezuela_today())
 
 
 @pytest.mark.asyncio
@@ -87,7 +88,7 @@ async def test_expired_warranty_shows_as_vencida(env):
     service, _session, filial_id = env
     warranty = await service.create_vehicle_warranty(
         VehicleWarrantyCreate(
-            filial_id=filial_id, vin=VIN, brand="Toyota", starts_at=date.today() - timedelta(days=1000),
+            filial_id=filial_id, vin=VIN, brand="Toyota", starts_at=venezuela_today() - timedelta(days=1000),
             duration_months=1,
         ),
         None,
@@ -99,12 +100,12 @@ async def test_expired_warranty_shows_as_vencida(env):
 async def test_duplicate_vin_in_same_filial_is_rejected(env):
     service, _session, filial_id = env
     await service.create_vehicle_warranty(
-        VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Toyota", starts_at=date.today(), duration_months=12),
+        VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Toyota", starts_at=venezuela_today(), duration_months=12),
         None,
     )
     with pytest.raises(ConflictError):
         await service.create_vehicle_warranty(
-            VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Honda", starts_at=date.today(), duration_months=12),
+            VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Honda", starts_at=venezuela_today(), duration_months=12),
             None,
         )
 
@@ -113,7 +114,7 @@ async def test_duplicate_vin_in_same_filial_is_rejected(env):
 async def test_get_by_vin_and_list_search(env):
     service, _session, filial_id = env
     await service.create_vehicle_warranty(
-        VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Toyota", model="Corolla", starts_at=date.today(), duration_months=12),
+        VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Toyota", model="Corolla", starts_at=venezuela_today(), duration_months=12),
         None,
     )
     found = await service.get_vehicle_warranty_by_vin(filial_id, VIN.lower())
@@ -128,14 +129,14 @@ async def test_get_by_vin_and_list_search(env):
 async def test_bulk_import_skips_duplicates_against_db_and_within_batch(env):
     service, _session, filial_id = env
     await service.create_vehicle_warranty(
-        VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Toyota", starts_at=date.today(), duration_months=12),
+        VehicleWarrantyCreate(filial_id=filial_id, vin=VIN, brand="Toyota", starts_at=venezuela_today(), duration_months=12),
         None,
     )
 
     items = [
-        VehicleWarrantyBulkItem(vin=VIN, brand="Toyota", starts_at=date.today(), duration_months=12),
-        VehicleWarrantyBulkItem(vin="2T1BURHE0JC014565", brand="Chevrolet", starts_at=date.today(), duration_months=36),
-        VehicleWarrantyBulkItem(vin="2T1BURHE0JC014565", brand="Chevrolet", starts_at=date.today(), duration_months=36),
+        VehicleWarrantyBulkItem(vin=VIN, brand="Toyota", starts_at=venezuela_today(), duration_months=12),
+        VehicleWarrantyBulkItem(vin="2T1BURHE0JC014565", brand="Chevrolet", starts_at=venezuela_today(), duration_months=36),
+        VehicleWarrantyBulkItem(vin="2T1BURHE0JC014565", brand="Chevrolet", starts_at=venezuela_today(), duration_months=36),
     ]
     created, skipped = await service.bulk_create_vehicle_warranties(filial_id, items, None)
 
@@ -214,3 +215,32 @@ async def test_marking_a_dealership_vehicle_sold_auto_creates_the_warranty(env):
     assert warranty.brand == "Kia"
     assert warranty.dealership_vehicle_id == dealership_vehicle.id
     assert warranty.duration_months == 36
+
+
+@pytest.mark.asyncio
+async def test_warranty_remains_valid_on_caracas_expiration_day(env, monkeypatch):
+    from datetime import datetime, timezone
+
+    import app.core.venezuela_time as vt
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = datetime(2026, 11, 1, 2, tzinfo=timezone.utc)
+            return instant if tz is None else instant.astimezone(tz)
+
+    monkeypatch.setattr(vt, "datetime", Clock)
+    service, _session, filial_id = env
+    warranty = await service.create_vehicle_warranty(
+        VehicleWarrantyCreate(
+            filial_id=filial_id,
+            vin=VIN,
+            brand="Toyota",
+            starts_at=date(2026, 7, 31),
+            duration_months=3,
+        ),
+        None,
+    )
+    assert warranty.expires_at == date(2026, 10, 31)
+    assert warranty.status == "vigente"
+    assert warranty.days_remaining == 0

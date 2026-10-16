@@ -3,7 +3,7 @@ exchange_rates scraper, the manual-override path, and the >0 validation."""
 
 import os
 import uuid
-from datetime import date, timedelta
+from datetime import timedelta
 
 os.environ["DEBUG"] = "false"
 
@@ -15,6 +15,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.service import AdministracionService
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.filiales.models import Filial
@@ -47,13 +48,13 @@ async def test_no_scraped_rate_stays_zero_and_stale(env):
 @pytest.mark.asyncio
 async def test_syncs_from_latest_scraped_usd_rate(env):
     service, _db, session, filial_id = env
-    session.add(ExchangeRate(currency="USD", rate_ves=100, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=100, value_date=venezuela_today()))
     session.commit()
 
     settings = await service.get_labor_settings(filial_id)
 
     assert float(settings.bcv_rate) == 100
-    assert settings.bcv_rate_date == date.today()
+    assert settings.bcv_rate_date == venezuela_today()
     assert settings.bcv_rate_is_stale is False
 
 
@@ -64,7 +65,7 @@ async def test_older_scraped_rate_does_not_overwrite_fresher_manual_value(env):
         filial_id, LaborSettingsUpdate(**VALID_UPDATE, bcv_rate=250)
     )
     session.add(
-        ExchangeRate(currency="USD", rate_ves=100, value_date=date.today() - timedelta(days=1))
+        ExchangeRate(currency="USD", rate_ves=100, value_date=venezuela_today() - timedelta(days=1))
     )
     session.commit()
 
@@ -77,7 +78,7 @@ async def test_older_scraped_rate_does_not_overwrite_fresher_manual_value(env):
 @pytest.mark.asyncio
 async def test_update_without_bcv_rate_keeps_the_synced_value(env):
     service, _db, session, filial_id = env
-    session.add(ExchangeRate(currency="USD", rate_ves=100, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=100, value_date=venezuela_today()))
     session.commit()
     await service.get_labor_settings(filial_id)
 
@@ -97,7 +98,7 @@ def test_bcv_rate_of_zero_is_rejected():
 @pytest.mark.asyncio
 async def test_administracion_reuses_the_same_synced_rate(env):
     service, db, session, filial_id = env
-    session.add(ExchangeRate(currency="USD", rate_ves=100, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=100, value_date=venezuela_today()))
     session.commit()
 
     settings = await service.get_labor_settings(filial_id)

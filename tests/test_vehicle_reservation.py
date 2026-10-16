@@ -4,7 +4,7 @@ validity date, locking the unit against every other salesperson until it's
 released or sold."""
 
 import uuid
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +15,7 @@ from test_part_sales_fifo import AsyncAdapter
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
 from app.core.exceptions import BadRequestError
+from app.core.venezuela_time import venezuela_today
 from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client
@@ -43,10 +44,10 @@ def _user(*, role_slug="vendedor", user_id=None, filial_id) -> CurrentUser:
 
 
 def _persist_sales_advisor(session, current):
-    from app.modules.roles.models import Role, RoleModulePermission
     from app.modules.roles.enums import AccessLevel
-    from app.modules.users.models import User
+    from app.modules.roles.models import Role, RoleModulePermission
     from app.modules.users.enums import UserStatus
+    from app.modules.users.models import User
     session.add(Role(id=current.role_id, name="Vendedor", slug="vendedor", scope=RoleScope.FILIAL))
     session.add(RoleModulePermission(role_id=current.role_id, module_id="concesionario", access=AccessLevel.EDITAR))
     session.add(User(id=current.user_id, full_name="Asesor", email=current.email, role_id=current.role_id, filial_id=current.filial_id, status=UserStatus.ACTIVO))
@@ -97,7 +98,7 @@ async def test_reserving_requires_client_deposit_and_validity(env):
     service, _session, _filial_id, vehicle, _client = env
     with pytest.raises(ValidationError):
         VehicleReservationInput(
-            advisor_user_id=uuid.uuid4(), deposit_amount=0, expires_at=date.today()
+            advisor_user_id=uuid.uuid4(), deposit_amount=0, expires_at=venezuela_today()
         )
 
 
@@ -113,7 +114,7 @@ async def test_reserve_vehicle_locks_it_to_the_chosen_advisor(env):
             client_id=client.id,
             advisor_user_id=advisor_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         caller,
     )
@@ -122,7 +123,7 @@ async def test_reserve_vehicle_locks_it_to_the_chosen_advisor(env):
     assert reserved.reserved_client_id == client.id
     assert reserved.reserved_by_user_id == advisor_id
     assert float(reserved.deposit_amount) == 500
-    assert reserved.reservation_expires_at == date.today() + timedelta(days=7)
+    assert reserved.reservation_expires_at == venezuela_today() + timedelta(days=7)
     assert reserved.reserved_at is not None
 
 
@@ -137,7 +138,7 @@ async def test_reserving_with_a_past_expiration_is_rejected(env):
                 client_id=client.id,
                 advisor_user_id=caller.user_id,
                 deposit_amount=500,
-                expires_at=date.today() - timedelta(days=1),
+                expires_at=venezuela_today() - timedelta(days=1),
             ),
             caller,
         )
@@ -155,7 +156,7 @@ async def test_another_salesperson_cannot_touch_a_reserved_vehicle(env):
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -170,7 +171,7 @@ async def test_another_salesperson_cannot_touch_a_reserved_vehicle(env):
                 client_id=client.id,
                 advisor_user_id=stranger.user_id,
                 deposit_amount=100,
-                expires_at=date.today() + timedelta(days=1),
+                expires_at=venezuela_today() + timedelta(days=1),
             ),
             stranger,
         )
@@ -188,7 +189,7 @@ async def test_a_filial_admin_can_override_someone_elses_reservation(env):
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -213,7 +214,7 @@ async def test_releasing_a_reservation_clears_its_fields(env):
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -255,7 +256,7 @@ async def test_disallowed_transitions_are_rejected_with_a_message(env, current, 
                     client_id=client.id,
                     advisor_user_id=caller.user_id,
                     deposit_amount=500,
-                    expires_at=date.today() + timedelta(days=7),
+                    expires_at=venezuela_today() + timedelta(days=7),
                 ),
                 caller,
             )
@@ -290,7 +291,7 @@ async def test_reserved_vehicle_cannot_jump_back_to_shipping_or_preparation(env,
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -347,7 +348,7 @@ async def test_reservation_snapshot_is_retained_after_release(env):
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
             reason="Cliente solicita reserva",
         ),
         owner,
@@ -383,7 +384,7 @@ async def test_reserved_unit_cannot_be_sold_to_a_different_client_even_by_admin(
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -422,7 +423,7 @@ async def test_sale_retains_reserved_client_and_advisor_and_audits_sale(env):
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -494,7 +495,7 @@ async def test_sale_failure_rolls_back_sale_income_and_keeps_reservation(env, mo
             client_id=client.id,
             advisor_user_id=owner.user_id,
             deposit_amount=500,
-            expires_at=date.today() + timedelta(days=7),
+            expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
     )
@@ -575,7 +576,7 @@ async def test_http_status_changes_enforce_reason_and_expose_trace(env, monkeypa
             json={
                 "advisor_user_id": str(caller.user_id),
                 "deposit_amount": 100,
-                "expires_at": date.today().isoformat(),
+                "expires_at": venezuela_today().isoformat(),
             },
         )
         assert reserve_without_client.status_code == 422

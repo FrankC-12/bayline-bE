@@ -14,7 +14,14 @@ from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
-from app.modules.administracion.enums import AccountCurrency, AccountType, CounterpartyType, IncomeConcept, IncomeSource
+from app.core.venezuela_time import venezuela_today
+from app.modules.administracion.enums import (
+    AccountCurrency,
+    AccountType,
+    CounterpartyType,
+    IncomeConcept,
+    IncomeSource,
+)
 from app.modules.administracion.models import IncomeEntry
 from app.modules.administracion.schemas import AccountCreate, IncomeEntryCreate
 from app.modules.administracion.service import AdministracionService
@@ -34,7 +41,6 @@ from app.modules.service_orders.models import (
     ServiceOrderTransferLine,
     ServiceOrderTransferLotAllocation,
 )
-from app.modules.service_orders.service import ServiceOrderService
 from app.modules.warehouse.models import PartLot, Warehouse
 
 
@@ -226,7 +232,7 @@ async def test_garantia_marca_and_fi_income_have_their_own_rows_and_count_as_man
     account = await admin.create_account(
         AccountCreate(filial_id=filial_id, name="Caja", currency=AccountCurrency.USD, account_type=AccountType.CAJA)
     )
-    today = date.today()
+    today = venezuela_today()
 
     await admin.create_income(
         IncomeEntryCreate(
@@ -258,7 +264,7 @@ async def test_diferencia_en_cambio_only_counts_entries_with_a_frozen_rate(env):
     bs_account = await admin.create_account(
         AccountCreate(filial_id=filial_id, name="Caja Bs", currency=AccountCurrency.BS, account_type=AccountType.CAJA)
     )
-    today = date.today()
+    today = venezuela_today()
 
     # Frozen at 40 (rate on file as of today), then the closing rate moves to 50.
     session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=today))
@@ -292,7 +298,7 @@ async def test_diferencia_en_cambio_only_counts_entries_with_a_frozen_rate(env):
 @pytest.mark.asyncio
 async def test_period_is_closed_reflects_current_calendar_month(env):
     admin, _session, filial_id, _holding_id, _client = env
-    today = date.today()
+    today = venezuela_today()
     last_month_end = today.replace(day=1) - timedelta(days=1)
 
     open_report = await admin.get_profitability(filial_id, today.replace(day=1), today)

@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.post_ventas.enums import (
     CATEGORY_PREFIXES,
     TemparioCategory,
@@ -118,7 +119,7 @@ class LaborSettings(Base):
     def bcv_rate_is_stale(self) -> bool:
         """True once the stored rate isn't today's — mirrors billing.py's
         same-day requirement for charging in Bs."""
-        return self.bcv_rate_date is None or self.bcv_rate_date < date.today()
+        return self.bcv_rate_date is None or self.bcv_rate_date < venezuela_today()
 
 
 class Tempario(Base):

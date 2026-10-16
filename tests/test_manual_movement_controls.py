@@ -7,7 +7,7 @@ must never be touched keep working with the new columns left null."""
 
 import io
 import uuid
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -18,7 +18,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
-from app.core.exceptions import BadRequestError
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.enums import (
     AccountCurrency,
     AccountType,
@@ -36,7 +36,12 @@ from app.modules.administracion.exceptions import (
     ExchangeRateRequiredError,
     FutureEntryDateError,
 )
-from app.modules.administracion.models import Account, ExpenseEntry, IncomeEntry, Supplier, SupplierClaim
+from app.modules.administracion.models import (
+    Account,
+    ExpenseEntry,
+    Supplier,
+    SupplierClaim,
+)
 from app.modules.administracion.router import router as administracion_router
 from app.modules.administracion.schemas import ExpenseEntryCreate, IncomeEntryCreate
 from app.modules.administracion.service import AdministracionService
@@ -70,7 +75,7 @@ def env():
 def _income_payload(filial_id, account_id, **overrides) -> IncomeEntryCreate:
     data = dict(
         filial_id=filial_id,
-        entry_date=date.today(),
+        entry_date=venezuela_today(),
         concept=IncomeConcept.OTRO_INGRESO,
         description="Ingreso de prueba",
         amount=50,
@@ -88,7 +93,7 @@ def _expense_payload(filial_id, account_id, **overrides) -> ExpenseEntryCreate:
 
     data = dict(
         filial_id=filial_id,
-        entry_date=date.today(),
+        entry_date=venezuela_today(),
         category=ExpenseCategory.OTRO,
         beneficiary="Proveedor Varios",
         description="Gasto de prueba",
@@ -108,7 +113,7 @@ def _expense_payload(filial_id, account_id, **overrides) -> ExpenseEntryCreate:
 def test_income_create_requires_concept():
     with pytest.raises(ValidationError):
         IncomeEntryCreate(
-            filial_id=uuid.uuid4(), entry_date=date.today(), description="x", amount=10,
+            filial_id=uuid.uuid4(), entry_date=venezuela_today(), description="x", amount=10,
             currency=AccountCurrency.USD, account_id=uuid.uuid4(),
             counterparty_type=CounterpartyType.SOCIO, counterparty_name="Socio",
         )
@@ -144,7 +149,7 @@ async def test_usd_income_into_a_bs_account_is_rejected(env):
 @pytest.mark.asyncio
 async def test_bs_income_into_a_usd_account_is_rejected(env):
     service, session, filial_id, usd_account, _bs_account, _ = env
-    session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=venezuela_today()))
     session.commit()
     payload = _income_payload(filial_id, usd_account.id, currency=AccountCurrency.BS, amount=800)
     with pytest.raises(AccountCurrencyMismatchError):
@@ -165,7 +170,7 @@ async def test_matching_currency_income_is_reflected_in_the_account_balance(env)
     correctly currency-matched entry must actually move the account's own
     computed balance, not just its amount_usd/amount_bs snapshot."""
     service, session, filial_id, _usd_account, bs_account, _ = env
-    session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=40, value_date=venezuela_today()))
     session.commit()
     before = await service.get_account_detail(bs_account.id)
     payload = _income_payload(filial_id, bs_account.id, currency=AccountCurrency.BS, amount=99)
@@ -189,7 +194,7 @@ async def test_bs_entry_without_rate_raises(env):
 @pytest.mark.asyncio
 async def test_bs_entry_with_rate_freezes_amounts(env):
     service, session, filial_id, _, bs_account, _ = env
-    rate = ExchangeRate(currency="USD", rate_ves=40, value_date=date.today())
+    rate = ExchangeRate(currency="USD", rate_ves=40, value_date=venezuela_today())
     session.add(rate)
     session.commit()
 
@@ -241,7 +246,7 @@ async def test_threshold_compares_the_usd_equivalent_not_the_raw_bs_amount(env):
     """Bs 50.000 at a rate of 1000 is ~$50 (under the $100 threshold) — must
     NOT require an attachment just because 50000 as a raw number is >= 100."""
     service, session, filial_id, _usd_account, bs_account, _ = env
-    session.add(ExchangeRate(currency="USD", rate_ves=1000, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=1000, value_date=venezuela_today()))
     session.commit()
 
     payload = _income_payload(filial_id, bs_account.id, amount=50000, currency=AccountCurrency.BS)
@@ -255,7 +260,7 @@ async def test_threshold_requires_attachment_once_the_usd_equivalent_crosses_it(
     """Bs 150.000 at a rate of 1000 is $150 — over the threshold, same as a
     raw $150 USD movement would be."""
     service, session, filial_id, _usd_account, bs_account, _ = env
-    session.add(ExchangeRate(currency="USD", rate_ves=1000, value_date=date.today()))
+    session.add(ExchangeRate(currency="USD", rate_ves=1000, value_date=venezuela_today()))
     session.commit()
 
     payload = _expense_payload(filial_id, bs_account.id, amount=150000, currency=AccountCurrency.BS)
@@ -284,7 +289,7 @@ async def test_amount_over_threshold_with_attachment_saves(env, tmp_path, monkey
 @pytest.mark.asyncio
 async def test_future_date_raises(env):
     service, _, filial_id, usd_account, _, _ = env
-    payload = _income_payload(filial_id, usd_account.id, entry_date=date.today() + timedelta(days=1))
+    payload = _income_payload(filial_id, usd_account.id, entry_date=venezuela_today() + timedelta(days=1))
     with pytest.raises(FutureEntryDateError):
         await service.create_income(payload, None, uuid.uuid4())
 
@@ -292,7 +297,7 @@ async def test_future_date_raises(env):
 @pytest.mark.asyncio
 async def test_prior_month_date_raises(env):
     service, _, filial_id, usd_account, _, _ = env
-    last_month = (date.today().replace(day=1) - timedelta(days=1))
+    last_month = (venezuela_today().replace(day=1) - timedelta(days=1))
     payload = _income_payload(filial_id, usd_account.id, entry_date=last_month)
     with pytest.raises(ClosedPeriodEntryDateError):
         await service.create_income(payload, None, uuid.uuid4())
@@ -311,7 +316,7 @@ async def test_reverse_income_creates_negative_row_and_nets_balance(env):
     assert reversal.reverses_entry_id == original.id
     assert reversal.reversal_reason == "Registrado por error"
     assert float(reversal.amount) == -80
-    assert reversal.entry_date == date.today()
+    assert reversal.entry_date == venezuela_today()
 
     account = await service.get_account(usd_account.id)
     balance, _ = await service._account_balance(account, bcv_rate=1)
@@ -413,7 +418,7 @@ async def test_manual_movements_rate_excludes_automatic_rows(env):
     payload = _income_payload(filial_id, usd_account.id, amount=30)
     await service.create_income(payload, None, uuid.uuid4())
 
-    report = await kpi_service.get_manual_movements_rate(filial_id, date.today(), date.today())
+    report = await kpi_service.get_manual_movements_rate(filial_id, venezuela_today(), venezuela_today())
     assert report.total_count == 2
     assert report.manual_count == 1
     assert report.rate == 0.5

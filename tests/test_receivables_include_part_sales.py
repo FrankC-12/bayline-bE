@@ -1,7 +1,7 @@
 """Receivables include unpaid and partially paid parts sales regardless of delivery."""
 
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine
@@ -90,9 +90,14 @@ async def test_receivables_plus_income_reconciles_with_rentabilidad_net_sales(en
     # A completado sale's income is posted separately by PartsService at the
     # moment of transition (update_sale_status) — simulate that here since
     # this test only constructs rows directly.
-    from app.modules.administracion.enums import AccountCurrency, AccountType, IncomeSource, MovementSourceType
-    from app.modules.administracion.models import Account, IncomeEntry
     from app.core.venezuela_time import venezuela_today
+    from app.modules.administracion.enums import (
+        AccountCurrency,
+        AccountType,
+        IncomeSource,
+        MovementSourceType,
+    )
+    from app.modules.administracion.models import Account, IncomeEntry
 
     account = Account(filial_id=filial_id, name="Caja", currency=AccountCurrency.USD, account_type=AccountType.CAJA)
     session.add(account)
@@ -110,7 +115,7 @@ async def test_receivables_plus_income_reconciles_with_rentabilidad_net_sales(en
     receivables = await admin.list_receivables(filial_id)
     cxc_total = sum(r.pending_amount for r in receivables if r.document_type == "part_sale")
 
-    report = await admin.get_profitability(filial_id, date.today() - timedelta(days=1), date.today() + timedelta(days=1))
+    report = await admin.get_profitability(filial_id, venezuela_today() - timedelta(days=1), venezuela_today() + timedelta(days=1))
     repuestos = next(d for d in report.departments if d.key == "repuestos")
 
     assert cxc_total == 390.0

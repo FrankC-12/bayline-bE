@@ -4,14 +4,15 @@ from datetime import date, datetime, time, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.models import ExpenseEntry, IncomeEntry
 from app.modules.clients.models import Client, Vehicle
 from app.modules.kpis.schemas import (
     KpiReport,
     KpiRow,
-    ManualMovementsRate,
     MaintenanceDueReport,
     MaintenanceDueRow,
+    ManualMovementsRate,
     ReworkPartRow,
     ReworkReport,
     ReworkServiceRow,
@@ -132,7 +133,7 @@ class KpiService:
         next `window_days` — the call list to fill the workshop's agenda —
         plus a separate count of vehicles whose suggested date already
         lapsed without a newer visit resetting it."""
-        today = date.today()
+        today = venezuela_today()
         horizon = today + timedelta(days=window_days)
 
         due_result = await self.db.execute(

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError
+from app.core.venezuela_time import venezuela_today
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.parts.models import Part
 from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
@@ -245,7 +246,7 @@ class PostVentasService:
         settings.islr_retention_default_percentage = payload.islr_retention_default_percentage
         if payload.bcv_rate is not None:
             settings.bcv_rate = payload.bcv_rate
-            settings.bcv_rate_date = date.today()
+            settings.bcv_rate_date = venezuela_today()
         await self.db.commit()
         await self.db.refresh(settings)
         return settings
@@ -664,10 +665,11 @@ class PostVentasService:
     def warranty_to_read(
         self, w: VehicleWarranty, current_mileage: int | None = None
     ) -> VehicleWarrantyRead:
+        today = venezuela_today()
         status = (
-            "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
+            "vencida" if w.expires_at is not None and w.expires_at < today else "vigente"
         )
-        days_remaining = max((w.expires_at - date.today()).days, 0) if w.expires_at else None
+        days_remaining = max((w.expires_at - today).days, 0) if w.expires_at else None
         km_remaining = (
             max(w.duration_km - current_mileage, 0)
             if w.duration_km is not None and current_mileage is not None
@@ -905,8 +907,9 @@ class PostVentasService:
         self, w: WorkshopWarranty, current_mileage=None
     ) -> WorkshopWarrantyRead:
         # expires_at is null for a "sin vencimiento" policy — never expires.
+        today = venezuela_today()
         status = (
-            "vencida" if w.expires_at is not None and w.expires_at < date.today() else "vigente"
+            "vencida" if w.expires_at is not None and w.expires_at < today else "vigente"
         )
         if (
             current_mileage is not None
@@ -915,7 +918,7 @@ class PostVentasService:
         ):
             status = "vencida"
         days_remaining = (
-            max((w.expires_at - date.today()).days, 0) if w.expires_at is not None else None
+            max((w.expires_at - today).days, 0) if w.expires_at is not None else None
         )
         return WorkshopWarrantyRead(
             id=w.id,

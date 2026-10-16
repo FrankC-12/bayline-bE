@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.kpis.service import KpiService
@@ -61,7 +62,7 @@ def workshop():
 async def test_close_order_sets_vehicle_next_maintenance_due_at(workshop):
     _filial_id, session, order, vehicle, _make = workshop
     service = ServiceOrderService(AsyncAdapter(session))
-    due = date.today() + timedelta(days=180)
+    due = venezuela_today() + timedelta(days=180)
 
     closed = await service.close_order(order.id, due)
 
@@ -86,7 +87,7 @@ async def test_close_order_without_a_date_leaves_vehicle_unchanged(workshop):
 @pytest.mark.asyncio
 async def test_maintenance_due_windows_and_overdue_count(workshop):
     filial_id, session, _order, in_window_vehicle, make_vehicle = workshop
-    today = date.today()
+    today = venezuela_today()
     in_window_vehicle.next_maintenance_due_at = today + timedelta(days=10)
 
     far_vehicle = make_vehicle("EF456GH")
@@ -117,7 +118,7 @@ async def test_maintenance_due_windows_and_overdue_count(workshop):
 @pytest.mark.asyncio
 async def test_maintenance_due_is_scoped_to_filial(workshop):
     filial_id, session, _order, vehicle, _make = workshop
-    vehicle.next_maintenance_due_at = date.today() + timedelta(days=5)
+    vehicle.next_maintenance_due_at = venezuela_today() + timedelta(days=5)
     session.commit()
     service = KpiService(AsyncAdapter(session))
 

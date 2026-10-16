@@ -1,12 +1,12 @@
 """PM flow: partial receipt, supplier invoice, abonos and exact FIFO lineage."""
 
 import uuid
-from datetime import date
 
 import pytest
 from sqlalchemy import select
 from test_workshop_dispatch_postgres import inventory
 
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.enums import SupplierType
 from app.modules.administracion.models import ExpenseEntry, Supplier
 from app.modules.administracion.purchase_workflow import PurchaseWorkflow
@@ -67,7 +67,7 @@ async def test_receive_partial_replay_reconcile_and_partial_payments(billing_db)
             PurchaseReconcile(
                 invoice_number="123",
                 invoice_control_number="C123",
-                invoice_date=date.today(),
+                invoice_date=venezuela_today(),
                 credit_days=30,
                 iva_percentage=16,
                 lines=[dict(line_id=order.lines[0].id, unit_cost=12)],
@@ -86,7 +86,7 @@ async def test_receive_partial_replay_reconcile_and_partial_payments(billing_db)
             account_id=account_id,
             currency="usd",
             amount=50,
-            entry_date=date.today(),
+            entry_date=venezuela_today(),
         )
         partial = await workflow.pay(order.id, payment, None)
         assert partial.balance_usd == 89.2 and partial.paid_at is None
@@ -99,7 +99,7 @@ async def test_receive_partial_replay_reconcile_and_partial_payments(billing_db)
                 account_id=account_id,
                 currency="usd",
                 amount=89.2,
-                entry_date=date.today(),
+                entry_date=venezuela_today(),
             ),
             None,
         )
@@ -203,7 +203,7 @@ async def test_bs_payment_reversal_restores_invoice_balance(billing_db):
                 currency="bs",
                 amount=500,
                 exchange_rate=10,
-                entry_date=date.today(),
+                entry_date=venezuela_today(),
             ),
             None,
         )

@@ -2,7 +2,7 @@
 (pendiente/vencido/cumplido/omitido) — pieces 3 and 4 of the plan module."""
 
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -11,6 +11,7 @@ from test_part_sales_fifo import AsyncAdapter, make_order_type
 
 from app.core.database import Base
 from app.core.exceptions import BadRequestError
+from app.core.venezuela_time import venezuela_today
 from app.modules.clients.enums import ClientType, DocumentType, MaintenancePlanEntryStatus
 from app.modules.clients.models import Client, Vehicle
 from app.modules.clients.service import ClientService
@@ -124,7 +125,7 @@ async def test_assign_plan_rejects_foreign_filial(fleet):
 
 @pytest.mark.asyncio
 async def test_all_entries_pendiente_when_new_and_below_threshold(fleet):
-    fleet["vehicle"].purchase_date = date.today()
+    fleet["vehicle"].purchase_date = venezuela_today()
     fleet["vehicle"].mileage = 0
     fleet["session"].commit()
     service = ClientService(AsyncAdapter(fleet["session"]))
@@ -139,7 +140,7 @@ async def test_all_entries_pendiente_when_new_and_below_threshold(fleet):
 
 @pytest.mark.asyncio
 async def test_entry_is_vencido_once_mileage_passes_its_threshold(fleet):
-    fleet["vehicle"].purchase_date = date.today()
+    fleet["vehicle"].purchase_date = venezuela_today()
     fleet["vehicle"].mileage = 6000
     fleet["session"].commit()
     service = ClientService(AsyncAdapter(fleet["session"]))
@@ -152,7 +153,7 @@ async def test_entry_is_vencido_once_mileage_passes_its_threshold(fleet):
 
 @pytest.mark.asyncio
 async def test_entry_is_vencido_once_months_since_purchase_pass(fleet):
-    fleet["vehicle"].purchase_date = date.today() - timedelta(days=200)  # > 6 months
+    fleet["vehicle"].purchase_date = venezuela_today() - timedelta(days=200)  # > 6 months
     fleet["vehicle"].mileage = 0
     fleet["session"].commit()
     service = ClientService(AsyncAdapter(fleet["session"]))
@@ -165,7 +166,7 @@ async def test_entry_is_vencido_once_months_since_purchase_pass(fleet):
 @pytest.mark.asyncio
 async def test_entry_is_cumplido_when_a_completed_task_matches_its_tempario(fleet):
     session = fleet["session"]
-    fleet["vehicle"].purchase_date = date.today()
+    fleet["vehicle"].purchase_date = venezuela_today()
     fleet["vehicle"].mileage = 6000
     order = ServiceOrder(
         filial_id=fleet["filial_id"],
@@ -201,7 +202,7 @@ async def test_entry_is_cumplido_when_a_completed_task_matches_its_tempario(flee
 @pytest.mark.asyncio
 async def test_entry_is_omitido_when_a_later_entry_was_done_instead(fleet):
     session = fleet["session"]
-    fleet["vehicle"].purchase_date = date.today()
+    fleet["vehicle"].purchase_date = venezuela_today()
     fleet["vehicle"].mileage = 0  # Never actually reached 5,000 km.
     order = ServiceOrder(
         filial_id=fleet["filial_id"],
@@ -235,7 +236,7 @@ async def test_entry_is_omitido_when_a_later_entry_was_done_instead(fleet):
 @pytest.mark.asyncio
 async def test_current_mileage_prefers_latest_inspection_over_registration_mileage(fleet):
     session = fleet["session"]
-    fleet["vehicle"].purchase_date = date.today()
+    fleet["vehicle"].purchase_date = venezuela_today()
     fleet["vehicle"].mileage = 1000
     session.add(
         PreliminaryInspection(

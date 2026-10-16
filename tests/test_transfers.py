@@ -4,7 +4,6 @@ source_type=ACCOUNT_TRANSFER, so it updates both balances but never counts
 as real income/expense or shows up in Ingresos, Egresos or Rentabilidad."""
 
 import uuid
-from datetime import date
 
 import pytest
 from sqlalchemy import create_engine
@@ -13,8 +12,12 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.enums import AccountCurrency, AccountType, MovementSourceType
-from app.modules.administracion.exceptions import SameAccountTransferError, TransferExchangeRateRequiredError
+from app.modules.administracion.exceptions import (
+    SameAccountTransferError,
+    TransferExchangeRateRequiredError,
+)
 from app.modules.administracion.models import Account
 from app.modules.administracion.schemas import TransferCreate
 from app.modules.administracion.service import AdministracionService
@@ -40,7 +43,7 @@ def env():
 def _payload(filial_id, from_account_id, to_account_id, **overrides) -> TransferCreate:
     data = dict(
         filial_id=filial_id,
-        entry_date=date.today(),
+        entry_date=venezuela_today(),
         from_account_id=from_account_id,
         to_account_id=to_account_id,
         amount=100,
@@ -143,6 +146,6 @@ async def test_transfer_excluded_from_operating_expenses(env):
     service, session, filial_id, cash_usd, bank_usd, _bank_bs = env
     await service.create_transfer(_payload(filial_id, cash_usd.id, bank_usd.id, amount=100), uuid.uuid4())
 
-    report = await service.get_profitability(filial_id, date.today().replace(day=1), date.today())
+    report = await service.get_profitability(filial_id, venezuela_today().replace(day=1), venezuela_today())
     adjustment = next(a for a in report.adjustments if a.key == "gastos_operacionales")
     assert adjustment.amount == 0.0

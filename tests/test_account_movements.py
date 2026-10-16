@@ -4,7 +4,7 @@ source_id back at whatever document generated it (a resolved SupplierClaim,
 an automatic sale) so the frontend can open the real source document."""
 
 import uuid
-from datetime import date, timedelta
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import create_engine
@@ -13,6 +13,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.enums import (
     AccountCurrency,
     AccountType,
@@ -104,14 +105,14 @@ async def test_get_account_movements_merges_and_sorts_descending(env):
     account = await service.create_account(
         AccountCreate(filial_id=filial_id, name="Caja", currency=AccountCurrency.USD, account_type=AccountType.CAJA)
     )
-    yesterday = date.today() - timedelta(days=1)
+    yesterday = venezuela_today() - timedelta(days=1)
 
     await service.record_automatic_income(filial_id, "Venta vieja", 10, "VR-0")
 
     # Manual income dated today, plus a manual expense dated yesterday —
     # confirm the feed comes back income+expense merged, newest first.
     income_payload = IncomeEntryCreate(
-        filial_id=filial_id, entry_date=date.today(), concept=IncomeConcept.OTRO_INGRESO,
+        filial_id=filial_id, entry_date=venezuela_today(), concept=IncomeConcept.OTRO_INGRESO,
         description="Ingreso manual", amount=30, currency=AccountCurrency.USD, account_id=account.id,
         counterparty_type=CounterpartyType.SOCIO, counterparty_name="Socio Uno",
     )

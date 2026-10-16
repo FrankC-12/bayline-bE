@@ -4,7 +4,6 @@ Computed the same way as Cuentas por Cobrar: no persisted "payable" row,
 just PurchaseRequest.paid_at IS NULL."""
 
 import uuid
-from datetime import date
 
 import pytest
 from sqlalchemy import create_engine
@@ -13,6 +12,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.enums import (
     AccountCurrency,
     AccountType,
@@ -104,7 +104,7 @@ def _make_request(
 def _expense_payload(filial_id, account_id, supplier_id, purchase_request_ids, **overrides):
     data = dict(
         filial_id=filial_id,
-        entry_date=date.today(),
+        entry_date=venezuela_today(),
         category=ExpenseCategory.COMPRAS_PROVEEDORES,
         beneficiary="Mitsubishi Vzla",
         description="Pago SC-1001",
@@ -202,7 +202,7 @@ async def test_linked_expense_still_excluded_from_operating_expenses(env):
     payload = _expense_payload(filial_id, account.id, supplier.id, [request.id])
     await service.create_expense(payload, None, uuid.uuid4())
 
-    report = await service.get_profitability(filial_id, date.today().replace(day=1), date.today())
+    report = await service.get_profitability(filial_id, venezuela_today().replace(day=1), venezuela_today())
     adjustment = next(a for a in report.adjustments if a.key == "gastos_operacionales")
     assert adjustment.amount == 0.0
 

@@ -14,6 +14,7 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
+from app.core.venezuela_time import venezuela_today
 from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.filiales.models import Filial
@@ -133,7 +134,7 @@ async def test_no_prior_mileage_on_record_skips_the_check(env):
 @pytest.mark.asyncio
 async def test_context_reports_vencida_factory_warranty(env):
     service, session, filial_id, vehicle = env
-    make_warranty(session, filial_id, vehicle.vin, expires_at=date.today() - timedelta(days=1))
+    make_warranty(session, filial_id, vehicle.vin, expires_at=venezuela_today() - timedelta(days=1))
 
     context = await service.get_claim_context(vehicle.id)
 
@@ -145,7 +146,7 @@ async def test_context_reports_vencida_factory_warranty(env):
 async def test_context_reports_vigente_factory_warranty_with_remaining(env):
     service, session, filial_id, vehicle = env
     vigente = make_warranty(
-        session, filial_id, vehicle.vin, expires_at=date.today() + timedelta(days=100), duration_km=80000
+        session, filial_id, vehicle.vin, expires_at=venezuela_today() + timedelta(days=100), duration_km=80000
     )
     make_inspection(session, filial_id, vehicle.id, mileage=30000)
 

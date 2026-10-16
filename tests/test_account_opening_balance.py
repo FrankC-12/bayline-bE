@@ -4,7 +4,6 @@ creation and folded into the account's balance alongside its income/expense
 entries, but is never itself an Income/Expense entry."""
 
 import uuid
-from datetime import date
 
 import pytest
 from sqlalchemy import create_engine
@@ -13,7 +12,13 @@ from test_part_sales_fifo import AsyncAdapter
 
 import app.core.models_registry  # noqa: F401
 from app.core.database import Base
-from app.modules.administracion.enums import AccountCurrency, AccountType, CounterpartyType, IncomeConcept
+from app.core.venezuela_time import venezuela_today
+from app.modules.administracion.enums import (
+    AccountCurrency,
+    AccountType,
+    CounterpartyType,
+    IncomeConcept,
+)
 from app.modules.administracion.schemas import AccountCreate, IncomeEntryCreate
 from app.modules.administracion.service import AdministracionService
 from app.modules.filiales.models import Filial
@@ -59,7 +64,7 @@ async def test_opening_balance_is_included_in_account_balance(env):
     assert rows[0]["opening_balance"] == 500
 
     payload = IncomeEntryCreate(
-        filial_id=filial_id, entry_date=date.today(), concept=IncomeConcept.OTRO_INGRESO,
+        filial_id=filial_id, entry_date=venezuela_today(), concept=IncomeConcept.OTRO_INGRESO,
         description="Ingreso", amount=50, currency=AccountCurrency.USD, account_id=account.id,
         counterparty_type=CounterpartyType.SOCIO, counterparty_name="Socio Uno",
     )

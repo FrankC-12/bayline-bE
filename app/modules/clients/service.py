@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError, ConflictError
 from app.core.search import fold_search
+from app.core.venezuela_time import venezuela_today
 from app.modules.administracion.exceptions import SupplierNotFoundError
 from app.modules.administracion.models import Supplier
 from app.modules.clients.enums import ClientType, DocumentType, MaintenancePlanEntryStatus
@@ -635,7 +636,7 @@ class ClientService:
                 # Keep the most recent completion per tempario.
                 completions.setdefault(task.tempario_id, (sequence_number, closed_at))
 
-        today = date.today()
+        today = venezuela_today()
         results: list[VehiclePlanEntryStatusRead] = []
         cumplido_flags = [entry.tempario_id in completions for entry in entries]
 

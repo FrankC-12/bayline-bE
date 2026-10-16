@@ -5,7 +5,7 @@ Venezuela evening can get stamped with tomorrow's UTC date, and daily income
 totals stop reconciling with daily sales totals."""
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, timezone
 from datetime import datetime as real_datetime
 
 import pytest
@@ -62,3 +62,36 @@ async def test_record_automatic_income_dates_itself_in_venezuela_time(env, monke
     entry = await service.record_automatic_income(filial_id, "Venta de vehículo", 100, "CV-1")
     assert entry.entry_date == date(2026, 9, 17)
     assert account.id == entry.account_id
+
+
+@pytest.mark.parametrize(
+    ("instant", "business_day"),
+    [
+        (real_datetime(2026, 10, 16, 2, tzinfo=timezone.utc), date(2026, 10, 15)),
+        (real_datetime(2026, 11, 1, 2, tzinfo=timezone.utc), date(2026, 10, 31)),
+        (real_datetime(2027, 1, 1, 2, tzinfo=timezone.utc), date(2026, 12, 31)),
+        (real_datetime(2027, 1, 1, 4, tzinfo=timezone.utc), date(2027, 1, 1)),
+    ],
+)
+def test_business_date_controls_rates_and_manual_entry_validation(
+    monkeypatch, instant, business_day
+):
+    from datetime import timedelta
+
+    from app.modules.administracion.exceptions import FutureEntryDateError
+    from app.modules.post_ventas.models import LaborSettings
+
+    class Clock(_FrozenDateTime):
+        _instant_utc = instant
+
+    monkeypatch.setattr(vt, "datetime", Clock)
+    assert vt.venezuela_today() == business_day
+    settings = LaborSettings(bcv_rate_date=business_day)
+    assert settings.bcv_rate_is_stale is False
+    settings.bcv_rate_date = business_day - timedelta(days=1)
+    assert settings.bcv_rate_is_stale is True
+
+    service = AdministracionService(None)
+    service._assert_open_period(business_day)
+    with pytest.raises(FutureEntryDateError):
+        service._assert_open_period(business_day + timedelta(days=1))
