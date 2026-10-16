@@ -4,6 +4,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import BadRequestError
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.storage import save_upload_image
@@ -119,6 +120,43 @@ async def update_part(
     existing = await service.get_part(part_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await service.update_part(part_id, payload)
+
+
+@router.post("/parts/{part_id}/image", response_model=PartRead)
+async def upload_part_image(
+    part_id: uuid.UUID,
+    image: UploadFile = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartRead:
+    existing = await service.get_part(part_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    header = await image.read(12)
+    await image.seek(0)
+    valid = {
+        "image/jpeg": header.startswith(b"\xff\xd8\xff"),
+        "image/png": header.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/webp": header.startswith(b"RIFF") and header[8:12] == b"WEBP",
+    }
+    if not valid.get(image.content_type, False):
+        raise BadRequestError("Selecciona una imagen JPG, PNG o WebP válida.", error_code="invalid_part_image")
+    settings = get_settings()
+    image_url = await save_upload_image(
+        image, directory=Path(settings.uploads_dir), subdir="parts",
+        url_prefix=f"{settings.api_v1_prefix}/uploads", max_mb=5,
+    )
+    return await service.set_part_image(part_id, image_url)
+
+
+@router.delete("/parts/{part_id}/image", response_model=PartRead)
+async def remove_part_image(
+    part_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: PartsService = Depends(get_service),
+) -> PartRead:
+    existing = await service.get_part(part_id)
+    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    return await service.set_part_image(part_id, None)
 
 
 @router.post("/parts/{part_id}/activate", response_model=PartRead)

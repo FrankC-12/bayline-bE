@@ -7,6 +7,7 @@ slowly). Each is VIN-anchored, starts at the invoice's issuance date. A
 vehicle with no VIN simply gets no warranties — the invoice still
 succeeds."""
 
+from app.core.venezuela_time import VENEZUELA_TZ
 import uuid
 from datetime import timedelta
 
@@ -86,7 +87,7 @@ async def test_issuing_invoice_creates_one_warranty_per_task(ready):
         assert w.vin == "1HGCM82633A123456"
         assert w.technician_user_id == order.technician_user_id
         assert w.coverage_type == WorkshopWarrantyCoverage.MANO_DE_OBRA
-        assert w.starts_at == invoice.issued_at.date()
+        assert w.starts_at == invoice.issued_at.astimezone(VENEZUELA_TZ).date()
         assert w.duration_days == 90
         assert w.duration_km == 5000
         assert w.expires_at == w.starts_at + timedelta(days=90)
@@ -116,7 +117,7 @@ async def test_uses_configured_workshop_warranty_settings(ready):
         assert w.coverage_type == WorkshopWarrantyCoverage.MANO_DE_OBRA
         assert w.duration_days == 45
         assert w.duration_km == 3000
-        assert w.expires_at == invoice.issued_at.date() + timedelta(days=45)
+        assert w.expires_at == invoice.issued_at.astimezone(VENEZUELA_TZ).date() + timedelta(days=45)
         assert w.expiration_mileage == 13000
 
 
@@ -230,7 +231,7 @@ async def test_task_with_installed_part_also_gets_repuesto_warranty(ready):
     by_coverage = {w.coverage_type: w for w in warranties}
     assert set(by_coverage) == {WorkshopWarrantyCoverage.MANO_DE_OBRA, WorkshopWarrantyCoverage.REPUESTO}
     for w in warranties:
-        assert w.starts_at == invoice.issued_at.date()
+        assert w.starts_at == invoice.issued_at.astimezone(VENEZUELA_TZ).date()
         assert w.tempario_code_snapshot == tempario.code
 
 
@@ -288,7 +289,7 @@ async def test_labor_and_parts_terms_can_differ(ready):
 
     payload = await invoice_payload(billing, order, accounts)
     invoice = await billing.issue(order.id, payload, None)
-    starts_at = invoice.issued_at.date()
+    starts_at = invoice.issued_at.astimezone(VENEZUELA_TZ).date()
 
     warranties = workshop_warranties_for(session, order.id)
     by_coverage = {w.coverage_type: w for w in warranties}
@@ -334,7 +335,7 @@ async def test_selected_labor_policy_overrides_settings(ready):
     for w in warranties:
         assert w.duration_days == 30
         assert w.duration_km == 2000
-        assert w.expires_at == invoice.issued_at.date() + timedelta(days=30)
+        assert w.expires_at == invoice.issued_at.astimezone(VENEZUELA_TZ).date() + timedelta(days=30)
         assert w.expiration_mileage == 12000
         assert w.warranty_policy_id == policy.id
         assert w.warranty_policy_name_snapshot == "Estándar de taller"

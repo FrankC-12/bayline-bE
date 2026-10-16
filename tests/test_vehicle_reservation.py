@@ -42,6 +42,17 @@ def _user(*, role_slug="vendedor", user_id=None, filial_id) -> CurrentUser:
     )
 
 
+def _persist_sales_advisor(session, current):
+    from app.modules.roles.models import Role, RoleModulePermission
+    from app.modules.roles.enums import AccessLevel
+    from app.modules.users.models import User
+    from app.modules.users.enums import UserStatus
+    session.add(Role(id=current.role_id, name="Vendedor", slug="vendedor", scope=RoleScope.FILIAL))
+    session.add(RoleModulePermission(role_id=current.role_id, module_id="concesionario", access=AccessLevel.EDITAR))
+    session.add(User(id=current.user_id, full_name="Asesor", email=current.email, role_id=current.role_id, filial_id=current.filial_id, status=UserStatus.ACTIVO))
+    session.commit()
+
+
 @pytest.fixture
 def env():
     engine = create_engine("sqlite://")
@@ -404,6 +415,7 @@ async def test_sale_retains_reserved_client_and_advisor_and_audits_sale(env):
 
     service, session, filial_id, vehicle, client = env
     owner = _user(filial_id=filial_id)
+    _persist_sales_advisor(session, owner)
     await service.reserve_vehicle(
         vehicle.id,
         VehicleReservationInput(
@@ -475,6 +487,7 @@ async def test_sale_failure_rolls_back_sale_income_and_keeps_reservation(env, mo
 
     service, session, filial_id, vehicle, client = env
     owner = _user(filial_id=filial_id)
+    _persist_sales_advisor(session, owner)
     await service.reserve_vehicle(
         vehicle.id,
         VehicleReservationInput(

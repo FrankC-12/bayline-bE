@@ -47,6 +47,51 @@ class ConcesionarioService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    def _sales_advisors_query(self, filial_id):
+        from sqlalchemy import and_
+        from app.modules.roles.models import Role, RoleModulePermission
+        from app.modules.users.models import User, UserModulePermission
+        from app.modules.users.enums import UserStatus
+        from app.modules.roles.enums import RoleScope
+
+        return (
+            select(User)
+            .join(Role, Role.id == User.role_id)
+            .outerjoin(RoleModulePermission, and_(
+                RoleModulePermission.role_id == Role.id,
+                RoleModulePermission.module_id == "concesionario",
+            ))
+            .outerjoin(UserModulePermission, and_(
+                UserModulePermission.user_id == User.id,
+                UserModulePermission.module_id == "concesionario",
+            ))
+            .where(
+                User.filial_id == filial_id,
+                User.status == UserStatus.ACTIVO,
+                Role.slug == "vendedor",
+                Role.scope == RoleScope.FILIAL,
+                func.coalesce(UserModulePermission.access, RoleModulePermission.access)
+                == AccessLevel.EDITAR,
+            )
+            .order_by(User.full_name, User.id)
+        )
+
+    async def list_sales_advisors(self, filial_id):
+        return list((await self.db.execute(self._sales_advisors_query(filial_id))).scalars().all())
+
+    async def _validate_sale_advisor(self, filial_id, advisor_id):
+        if advisor_id is None:
+            return  # Preserve the existing optional assignment contract.
+        from app.modules.users.models import User
+        advisor = (await self.db.execute(
+            self._sales_advisors_query(filial_id).where(User.id == advisor_id)
+        )).scalar_one_or_none()
+        if advisor is None:
+            raise BadRequestError(
+                "Selecciona un asesor de venta de vehículos activo de esta filial.",
+                error_code="invalid_vehicle_sales_advisor",
+            )
+
     async def list_vehicles(
         self, filial_id: uuid.UUID, search: str | None = None
     ) -> list[DealershipVehicle]:
@@ -315,6 +360,7 @@ class ConcesionarioService:
                 raise BadRequestError(
                     "La venta debe conservar el vendedor responsable de la reserva."
                 )
+            await self._validate_sale_advisor(vehicle.filial_id, payload.sale.advisor_user_id)
             if payload.sale.client_id is not None:
                 client = await self.db.get(Client, payload.sale.client_id)
                 if client is None or client.filial_id != vehicle.filial_id:

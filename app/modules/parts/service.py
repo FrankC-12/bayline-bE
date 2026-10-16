@@ -162,6 +162,7 @@ class PartsService:
         return [
             PartRead(
                 id=part.id,
+                image_url=part.image_url,
                 filial_id=part.filial_id,
                 code=part.code,
                 manufacturer_part_number=part.manufacturer_part_number,
@@ -295,6 +296,13 @@ class PartsService:
         if part is None:
             raise PartNotFoundError(str(part_id))
         return part
+
+    async def set_part_image(self, part_id: uuid.UUID, image_url: str | None) -> PartRead:
+        part = await self.get_part(part_id)
+        part.image_url = image_url
+        await self.db.commit()
+        await self.db.refresh(part)
+        return await self._part_to_read(part)
 
     async def create_part(self, payload: PartCreate) -> PartRead:
         await self._ensure_code_available(payload.filial_id, payload.code)

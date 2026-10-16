@@ -706,12 +706,8 @@ class ServiceOrderService:
             if order.intake_mileage is not None and exit_mileage < order.intake_mileage:
                 raise BadRequestError("El kilometraje de salida no puede ser menor al de ingreso.")
             order.exit_mileage = exit_mileage
-        if (
-            order.settings_snapshot
-            and order.intake_mileage is not None
-            and order.exit_mileage is None
-        ):
-            raise BadRequestError("Indica el kilometraje de salida para cerrar la ODS.")
+        # Delivery closes directly. Preserve an actual exit reading when provided;
+        # warranties otherwise use the existing intake mileage fallback.
         from app.modules.service_orders.billing import BillingService
 
         await BillingService(self.db).ensure_workshop_warranties(order)

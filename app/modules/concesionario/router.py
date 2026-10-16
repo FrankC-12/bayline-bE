@@ -19,6 +19,8 @@ from app.modules.concesionario.schemas import (
     VehicleUpdate,
 )
 from app.modules.concesionario.service import ConcesionarioService
+from app.modules.users.schemas import UserDirectoryEntry
+from app.modules.concesionario.financing import FinancingService, FinancingSnapshot
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 
@@ -38,6 +40,38 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
+
+
+@router.get("/vehicle-financings")
+async def list_vehicle_financings(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    await _ensure_access(current_user, filial_id, service.db)
+    return await FinancingService(service.db).list(filial_id)
+
+
+@router.put("/vehicle-sales/{sale_id}/financing")
+async def sync_vehicle_financing(
+    sale_id: uuid.UUID,
+    payload: FinancingSnapshot,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    sale = await service.get_sale(sale_id)
+    await _ensure_access(current_user, sale.filial_id, service.db, AccessLevel.EDITAR)
+    return await FinancingService(service.db).sync(sale_id, payload)
+
+
+@router.get("/vehicle-sales/advisors", response_model=list[UserDirectoryEntry])
+async def list_vehicle_sales_advisors(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.list_sales_advisors(filial_id)
 
 
 @router.get("/dealership-vehicles", response_model=list[VehicleRead])

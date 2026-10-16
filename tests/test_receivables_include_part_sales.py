@@ -81,7 +81,9 @@ async def test_completed_unpaid_sale_remains_and_cancelled_sale_is_excluded(env)
 @pytest.mark.asyncio
 async def test_receivables_plus_income_reconciles_with_rentabilidad_net_sales(env):
     admin, session, filial_id = env
-    now = datetime.now(timezone.utc)
+    from app.core.venezuela_time import venezuela_today
+    # This checks reconciliation, with fixtures inside a complete business day.
+    now = datetime.combine(venezuela_today(), datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=12)
     make_part_sale(session, filial_id, 5001, PartSaleStatus.PENDIENTE, 150.0, created_at=now)
     make_part_sale(session, filial_id, 5002, PartSaleStatus.PEDIDO, 240.0, created_at=now)
     completed = make_part_sale(session, filial_id, 5003, PartSaleStatus.COMPLETADO, 100.0, created_at=now)

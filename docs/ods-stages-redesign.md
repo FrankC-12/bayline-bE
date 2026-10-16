@@ -10,7 +10,7 @@ Las etapas se calculan con datos persistidos. No hay botones para avanzarlas man
 4. Minuciosa: estado `completada` del formulario del técnico.
 5. Trabajo: todas las tareas terminadas o canceladas, con al menos una tarea.
 6. Facturación y cobro: factura emitida y sin saldo pendiente en cuentas por cobrar.
-7. Entrega: orden cerrada mediante el flujo existente, conservando kilometraje de salida y próxima visita.
+7. Entrega: al pulsar Registrar entrega se cierra directamente la orden completada y facturada. No se abre un formulario ni se pide Confirmar cierre. El kilometraje de salida es opcional para clientes API; si no está disponible, las garantías usan el kilometraje de ingreso existente. No se inventa una lectura de salida.
 
 La web consulta los avances técnicos; no ofrece iniciar/pausar cronómetros, cambiar estados de tareas, completar la minuciosa ni registrar el retiro de repuestos. Esas operaciones siguen disponibles para la app mediante sus endpoints existentes. El asesor puede agregar tareas y repuestos, asignar técnico/bahía, editar agenda, gestionar hallazgos, facturar y registrar entrega.
 
@@ -29,3 +29,7 @@ Cada aprobación crea una ODT adicional para sus repuestos y los incluidos en su
 Se reutilizan `GET /detailed-inspections/by-order/{id}`, `GET /upsells`, `PATCH /upsells/{id}`, resumen de ODS, cuentas por cobrar, factura y cierre. No se agregan endpoints ni migraciones. El mapeo ORM del medio de aprobación se ajustó a los valores en minúscula definidos por la migración existente de PostgreSQL.
 
 Se conserva el desglose histórico y el precio congelado de las facturas. La tarjeta muestra precio normal de repuestos, descuento, mano de obra, subtotal, IVA y total, e IGTF cuando corresponde. Las órdenes facturadas, canceladas y cerradas mantienen sus bloqueos.
+
+## Ajuste del PM: entrega directa y sin fecha prometida
+
+Se retira la fecha prometida del detalle, edición, creación y tarjetas de ODS. El indicador del tablero pasa a mostrar trabajo en progreso. La agenda conserva únicamente el inicio de visita; los valores históricos `promised_at` se preservan en la base y la API. Registrar entrega envía directamente el cierre, bloquea dobles clics y muestra errores para permitir un reintento. Se mantienen las validaciones de orden completada y facturada, garantías y permisos.

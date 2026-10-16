@@ -58,7 +58,8 @@ async def test_partial_settings_patch_does_not_reprice_existing_order(billing_db
 
 
 @pytest.mark.asyncio
-async def test_new_workshop_warranty_starts_on_close_and_uses_departure_mileage(billing_db):
+@pytest.mark.parametrize("exit_mileage", [10050, None])
+async def test_new_workshop_warranty_starts_on_close_and_uses_departure_mileage(billing_db, exit_mileage):
     from conftest import invoice_input
     from sqlalchemy import func
 
@@ -106,11 +107,14 @@ async def test_new_workshop_warranty_starts_on_close_and_uses_departure_mileage(
                 .where(WorkshopWarranty.service_order_id == ctx.order_id)
             )
         ).scalar() == 0
-        await ServiceOrderService(db).close_order(ctx.order_id, exit_mileage=10050)
+        closed = await ServiceOrderService(db).close_order(ctx.order_id, exit_mileage=exit_mileage)
+        assert closed.status.value == "orden_cerrada"
+        assert closed.closed_at is not None
+        assert closed.exit_mileage == exit_mileage
         warranty = (
             await db.execute(
                 select(WorkshopWarranty).where(WorkshopWarranty.service_order_id == ctx.order_id)
             )
         ).scalar_one()
         assert warranty.duration_days == 30 and warranty.duration_km == 1000
-        assert warranty.expiration_mileage == 11050
+        assert warranty.expiration_mileage == (exit_mileage or 10000) + 1000

@@ -171,6 +171,8 @@ class VehicleSale(Base):
         ForeignKey("dealership_vehicles.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    financing_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    financing_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     mileage_at_sale: Mapped[int | None] = mapped_column(Integer, nullable=True)
     client_name: Mapped[str] = mapped_column(String(150), nullable=False)
     client_document: Mapped[str | None] = mapped_column(String(20), nullable=True)

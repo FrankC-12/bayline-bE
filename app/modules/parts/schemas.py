@@ -84,6 +84,8 @@ class PartUpdate(BaseModel):
 class PartRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    image_url: str | None = None
+
     id: uuid.UUID
     filial_id: uuid.UUID
     code: str

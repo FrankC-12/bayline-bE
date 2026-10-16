@@ -58,6 +58,7 @@ class Part(Base):
         index=True,
     )
     code: Mapped[str] = mapped_column(String(40), nullable=False)
+    image_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # The manufacturer's own part number — distinct from `code`, our internal
     # catalog code. Optional: not every part (e.g. a locally-made item) has one.
     manufacturer_part_number: Mapped[str | None] = mapped_column(String(80), nullable=True)
