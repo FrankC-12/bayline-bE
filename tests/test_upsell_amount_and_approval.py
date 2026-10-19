@@ -299,3 +299,33 @@ async def test_failed_approval_does_not_commit_partial_tasks(env):
     assert await service.list_tasks(order.id) == []
     assert await service.list_transfers(order.id) == []
     assert (await service.get_upsell(upsell.id)).status == UpsellStatus.PENDIENTE
+
+
+@pytest.mark.asyncio
+async def test_legacy_recommendation_without_lines_cannot_be_silently_approved(env):
+    from app.core.exceptions import BadRequestError
+    from app.modules.service_orders.models import Upsell
+
+    service, session, order, _tempario, _part = env
+    # Older findings could contain only a title/description, like the $0
+    # recommendation resurfacing on a later ODS. There is no work to apply.
+    finding = Upsell(
+        service_order_id=order.id,
+        title="Fuga de refrigerante",
+        description="Fuga considerable",
+        severity=UpsellSeverity.MONITOREAR,
+        status=UpsellStatus.PENDIENTE,
+        quoted_price_snapshot=0,
+        photo_urls=[],
+    )
+    session.add(finding)
+    session.commit()
+    with pytest.raises(BadRequestError, match="no tiene tareas ni repuestos"):
+        await service.decide_upsell(
+            finding.id,
+            UpsellDecisionInput(status="aprobado", approval_channel="presencial"),
+            uuid.uuid4(),
+        )
+    assert (await service.get_upsell(finding.id)).status == UpsellStatus.PENDIENTE
+    assert await service.list_tasks(order.id) == []
+    assert await service.list_transfers(order.id) == []

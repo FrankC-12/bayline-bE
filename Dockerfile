@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
-RUN useradd --create-home app && mkdir -p /app/uploads /app/logs && chown -R app:app /app/uploads /app/logs
+RUN useradd --create-home app && mkdir -p /app/uploads /app/private-uploads /app/logs && chown -R app:app /app/uploads /app/private-uploads /app/logs
 USER app
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]

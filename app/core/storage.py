@@ -34,6 +34,8 @@ def _s3_client():
 
 async def _upload_to_s3(*, key: str, data: bytes, content_type: str | None) -> str:
     settings = get_settings()
+    if settings.uploads_environment and settings.uploads_environment != settings.app_env:
+        raise BadRequestError("El almacenamiento configurado pertenece a otro entorno.")
     # boto3 is synchronous — offload to a thread so this never blocks the
     # event loop other requests are running on.
     await asyncio.to_thread(
@@ -99,3 +101,48 @@ async def save_upload_attachment(
     return await _save_upload(
         file, directory=directory, subdir=subdir, url_prefix=url_prefix, max_mb=max_mb, allowed=ALLOWED_ATTACHMENT_TYPES
     )
+
+
+async def save_private_pickup(file: UploadFile) -> str:
+    """New pickup evidence never goes into the public uploads directory/bucket."""
+    settings = get_settings()
+    _validate(b"", file.content_type, settings.max_upload_mb, ALLOWED_IMAGE_TYPES)
+    data = await file.read(settings.max_upload_mb * 1024 * 1024 + 1)
+    extension = _validate(data, file.content_type, settings.max_upload_mb, ALLOWED_IMAGE_TYPES)
+    name = f"{uuid.uuid4()}{extension}"
+    if settings.s3_private_bucket_name:
+        if settings.s3_private_bucket_name == settings.s3_bucket_name:
+            raise BadRequestError("Configura un bucket privado separado para las evidencias de retiro.")
+        key = f"{settings.app_env}/dispatch-pickups/{name}"
+        await asyncio.to_thread(_s3_client().put_object, Bucket=settings.s3_private_bucket_name, Key=key, Body=data, ContentType=file.content_type)
+        return f"s3://{settings.s3_private_bucket_name}/{key}"
+    directory = Path(settings.private_uploads_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread((directory / name).write_bytes, data)
+    return f"private://{name}"
+
+
+def pickup_photo_endpoint(transfer) -> str | None:
+    if not transfer.pickup_photo_url:
+        return None
+    return f"{get_settings().api_v1_prefix}/service-order-transfers/{transfer.id}/pickup-photo"
+
+
+def private_pickup_location(reference: str):
+    """Only configured storage locations are allowed; never fetch arbitrary URLs."""
+    from urllib.parse import urlparse
+    settings = get_settings()
+    parsed = urlparse(reference)
+    if parsed.scheme == "s3" and parsed.netloc in {settings.s3_private_bucket_name, settings.s3_bucket_name}:
+        return "s3", parsed.netloc, parsed.path.lstrip("/")
+    if parsed.scheme == "https" and settings.s3_bucket_name and parsed.netloc == f"{settings.s3_bucket_name}.s3.{settings.aws_region}.amazonaws.com":
+        return "s3", settings.s3_bucket_name, parsed.path.lstrip("/")
+    if reference.startswith("private://"):
+        name = reference.removeprefix("private://")
+        if name != Path(name).name:
+            raise BadRequestError("Referencia de archivo inválida.")
+        return "local", None, str(Path(settings.private_uploads_dir) / name)
+    prefix = f"{settings.api_v1_prefix}/uploads/dispatch-pickups/"
+    if reference.startswith(prefix) and Path(reference[len(prefix):]).name == reference[len(prefix):]:
+        return "local", None, str(Path(settings.uploads_dir) / "dispatch-pickups" / reference[len(prefix):])
+    raise BadRequestError("Referencia de archivo inválida.")

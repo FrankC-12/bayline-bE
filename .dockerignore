@@ -8,3 +8,8 @@ tests
 
 logs
 *.log
+
+private-uploads
+
+secrets
+**/secrets

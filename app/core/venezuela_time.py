@@ -27,3 +27,9 @@ def aging_bucket(days_outstanding: int) -> str:
     if days_outstanding <= 90:
         return "61-90"
     return "90+"
+
+
+def caracas_date(value: datetime) -> date:
+    """A persisted UTC timestamp's calendar day in Caracas (SQLite omits tzinfo)."""
+    from datetime import UTC
+    return (value if value.tzinfo else value.replace(tzinfo=UTC)).astimezone(VENEZUELA_TZ).date()

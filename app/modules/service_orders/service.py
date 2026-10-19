@@ -10,10 +10,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.exceptions import BadRequestError
+from app.core.exceptions import BadRequestError, ConflictError
+from app.core.storage import pickup_photo_endpoint
 from app.modules.administracion.models import PurchaseRequest, SupplierClaim
 from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.models import Vehicle
+from app.modules.notifications.service import queue_order_event
 from app.modules.parts.models import Part
 from app.modules.parts.pricing import PARTS_MULTIPLIERS, price_parts_cost
 from app.modules.post_ventas.enums import WarrantyPolicyAppliesTo, WarrantyPolicyStatus
@@ -311,11 +313,14 @@ class ServiceOrderService:
         statuses: list[ServiceOrderStatus] | None = None,
         scheduled_date: date | None = None,
         technician_user_id: uuid.UUID | None = None,
+        include_drafts: bool = False,
     ) -> list[ServiceOrder]:
         """`technician_user_id` restricts the list to orders assigned to that
         técnico — used when the caller doesn't have general asesor-servicios
         access but may still see their own assigned work (see router._ensure_access)."""
         query = select(ServiceOrder).where(ServiceOrder.filial_id == filial_id)
+        if not include_drafts or technician_user_id is not None:
+            query = query.where(ServiceOrder.is_draft.is_(False))
         if statuses:
             query = query.where(ServiceOrder.status.in_(statuses))
         if scheduled_date is not None:
@@ -330,7 +335,9 @@ class ServiceOrderService:
             query = query.where(ServiceOrder.technician_user_id == technician_user_id)
         query = query.order_by(ServiceOrder.created_at.desc())
         result = await self.db.execute(query)
-        return list(result.scalars().all())
+        orders = list(result.scalars().all())
+        await self.attach_workflow(orders)
+        return orders
 
     async def page_orders(
         self,
@@ -344,6 +351,7 @@ class ServiceOrderService:
         technician_user_id=None,
         page=1,
         page_size=30,
+        include_drafts=False,
     ):
         from sqlalchemy import String, cast, or_
 
@@ -362,14 +370,16 @@ class ServiceOrderService:
                 Vehicle.plate,
                 User.full_name,
             )
-            .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
-            .join(Client, Client.id == Vehicle.client_id)
+            .outerjoin(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
+            .outerjoin(Client, Client.id == Vehicle.client_id)
             .outerjoin(User, User.id == ServiceOrder.technician_user_id)
             .where(ServiceOrder.filial_id == filial_id)
         )
         statuses = (
             ACTIVE_STATUSES if view == "active" else HISTORY_STATUSES if view == "history" else None
         )
+        if not include_drafts or technician_user_id is not None:
+            query = query.where(ServiceOrder.is_draft.is_(False))
         if statuses:
             query = query.where(ServiceOrder.status.in_(statuses))
         if status:
@@ -392,12 +402,14 @@ class ServiceOrderService:
         query = date_range(query, ServiceOrder.created_at, date_from, date_to)
         query = query.order_by(ServiceOrder.created_at.desc(), ServiceOrder.id.desc())
         rows, metadata = await page_query(self.db, query, page, page_size)
+        rows = list(rows)
+        await self.attach_workflow([row[0] for row in rows])
         return Page[ServiceOrderPageItem](
             items=[
                 ServiceOrderPageItem(
                     **ServiceOrderRead.model_validate(order).model_dump(),
-                    client_name=client_name,
-                    vehicle_label=f"{brand} {model}",
+                    client_name=client_name or "Sin cliente",
+                    vehicle_label=f"{brand} {model}" if brand else "Vehículo por seleccionar",
                     vehicle_plate=plate,
                     technician_name=technician_name,
                 )
@@ -419,13 +431,66 @@ class ServiceOrderService:
         )
         return dict(result.all())
 
+    async def attach_workflow(self, orders):
+        if not orders:
+            return
+        ids = [o.id for o in orders]
+        rows = (
+            await self.db.execute(
+                select(
+                    ServiceOrderTask.service_order_id,
+                    ServiceOrderTask.status,
+                    func.sum(ServiceOrderTask.hours_snapshot),
+                )
+                .where(ServiceOrderTask.service_order_id.in_(ids))
+                .group_by(ServiceOrderTask.service_order_id, ServiceOrderTask.status)
+            )
+        ).all()
+        from collections import defaultdict
+
+        hours = defaultdict(float)
+        waiting = set()
+        for order_id, status, total in rows:
+            if status != TaskStatus.CANCELADA:
+                hours[order_id] += float(total or 0)
+            if status == TaskStatus.EN_ESPERA_DE_REPUESTOS:
+                waiting.add(order_id)
+        now = datetime.now(UTC)
+        for order in orders:
+            order.estimated_hours = hours[order.id]
+            scheduled = order.scheduled_at
+            if scheduled and scheduled.tzinfo is None:
+                scheduled = scheduled.replace(tzinfo=UTC)
+            if order.is_draft:
+                stage = "agendada" if scheduled else "borrador"
+            elif order.status == ServiceOrderStatus.CANCELADO:
+                stage = "cancelada"
+            elif order.status == ServiceOrderStatus.ORDEN_CERRADA:
+                stage = "cerrada"
+            elif order.status == ServiceOrderStatus.COMPLETADO:
+                stage = "por_cobrar"
+            elif scheduled and scheduled > now and not order.vehicle_received_at:
+                stage = "agendada"
+            elif order.id in waiting:
+                stage = "esperando_repuestos"
+            elif order.status == ServiceOrderStatus.EN_PROGRESO:
+                stage = "en_trabajo"
+            else:
+                stage = "en_revision"
+            order.workshop_stage = stage
+
     async def get_order(self, order_id: uuid.UUID) -> ServiceOrder:
-        order = await self.db.get(ServiceOrder, order_id)
+        order = (
+            await self.db.execute(select(ServiceOrder).where(ServiceOrder.id == order_id))
+        ).scalar_one_or_none()
         if order is None:
             raise ServiceOrderNotFoundError(str(order_id))
+        await self.attach_workflow([order])
         return order
 
-    async def create_order(self, payload: ServiceOrderCreate) -> ServiceOrder:
+    async def create_order(
+        self, payload: ServiceOrderCreate, *, created_by_user_id: uuid.UUID | None = None
+    ) -> ServiceOrder:
         from app.modules.inspections.models import PreliminaryInspection
 
         # intake_mileage is always a view inherited from a PreliminaryInspection,
@@ -446,15 +511,8 @@ class ServiceOrderService:
                 error_code="inspection_required",
             )
 
-        # customer_reason is inherited from the inspection's notes, the same
-        # way intake_mileage is — an inspection that has notes always wins
-        # over whatever the client sent. The client-sent value is only used
-        # as a fallback for a walk-in with no inspection, or an inspection
-        # from before notes became required to complete one.
-        inherited_reason = inspection.notes.strip() if inspection and inspection.notes else None
-        customer_reason = inherited_reason or (
-            payload.customer_reason.strip() if payload.customer_reason else None
-        )
+        # The customer's words and inspection findings are different records.
+        customer_reason = payload.customer_reason.strip() if payload.customer_reason else None
         if not customer_reason:
             raise BadRequestError(
                 "Se requiere el motivo o síntoma reportado por el cliente.",
@@ -535,8 +593,33 @@ class ServiceOrderService:
         )
         self.db.add(order)
         await self.db.flush()
+        if order.technician_user_id:
+            await queue_order_event(
+                self.db,
+                order,
+                "tecnico_asignado",
+                f"{order.id}:{order.technician_user_id}",
+                [order.technician_user_id],
+            )
         if inspection is not None:
             inspection.service_order_id = order.id
+        seen_upsells = set()
+        for accepted in payload.accepted_upsells:
+            if accepted.upsell_id in seen_upsells:
+                raise BadRequestError(
+                    "No repitas una recomendación.", error_code="duplicate_upsell"
+                )
+            seen_upsells.add(accepted.upsell_id)
+            await self.decide_upsell(
+                accepted.upsell_id,
+                UpsellDecisionInput(
+                    status="aprobado",
+                    approval_channel=accepted.approval_channel,
+                    target_service_order_id=order.id,
+                ),
+                created_by_user_id or payload.advisor_user_id,
+                commit=False,
+            )
         await self.db.commit()
         await self.db.refresh(order)
         return order
@@ -556,6 +639,11 @@ class ServiceOrderService:
                 "Cancelar la orden requiere confirmar un motivo; usa la acción de cancelar."
             )
         order = await require_editable_order(self.db, order_id)
+        if order.is_draft:
+            raise ConflictError(
+                "Edita el borrador desde su flujo de guardado automático.",
+                error_code="order_is_draft",
+            )
 
         if payload.status is not None:
             # pendiente/en_progreso/completado are derived from the order's
@@ -582,10 +670,33 @@ class ServiceOrderService:
                 await self._resolve_order_type(order.filial_id, payload.order_type_id)
             ).id
 
-        if payload.clear_technician:
-            order.technician_user_id = None
-        elif payload.technician_user_id is not None:
-            order.technician_user_id = payload.technician_user_id
+        new_technician = None if payload.clear_technician else payload.technician_user_id
+        changing_technician = payload.clear_technician or payload.technician_user_id is not None
+        if changing_technician and new_technician != order.technician_user_id:
+            running = (
+                await self.db.execute(
+                    select(ServiceOrderTask.id)
+                    .where(
+                        ServiceOrderTask.service_order_id == order.id,
+                        ServiceOrderTask.timer_started_at.is_not(None),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if running is not None:
+                raise ConflictError(
+                    "Pausa el cronómetro antes de cambiar el técnico.",
+                    error_code="technician_timer_running",
+                )
+            order.technician_user_id = new_technician
+            if new_technician:
+                await queue_order_event(
+                    self.db,
+                    order,
+                    "tecnico_asignado",
+                    f"{order.id}:{new_technician}:{datetime.now(UTC).isoformat()}",
+                    [new_technician],
+                )
 
         if payload.clear_advisor:
             order.advisor_user_id = None
@@ -640,6 +751,11 @@ class ServiceOrderService:
         indefinitely), recording who did it and leaving a visible flag on
         the order (completed_with_pending_items)."""
         order = await require_editable_order(self.db, order_id)
+        if order.is_draft:
+            raise ConflictError(
+                "Envía el borrador al taller antes de iniciar el trabajo.",
+                error_code="order_is_draft",
+            )
         if order.status not in (ServiceOrderStatus.PENDIENTE, ServiceOrderStatus.EN_PROGRESO):
             raise InvalidStatusTransitionError(
                 order.status.value, ServiceOrderStatus.COMPLETADO.value
@@ -650,9 +766,14 @@ class ServiceOrderService:
             if t.status not in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA)
         ]
         pending_transfers = [
-            t for t in await self.list_transfers(order_id) if t.status == TransferStatus.PENDIENTE
+            t for t in await self.list_transfers(order_id) if t.picked_up_at is None
         ]
         order.status = ServiceOrderStatus.COMPLETADO
+        await queue_order_event(
+            self.db, order, "orden_lista", f"{order.id}:{datetime.now(UTC).isoformat()}"
+        )
+        for task in await self.list_tasks(order.id):
+            self._stop_timer(task)
         order.completed_at = datetime.now(UTC)
         order.completed_with_pending_items = bool(pending_tasks or pending_transfers)
         if order.completed_with_pending_items:
@@ -711,6 +832,8 @@ class ServiceOrderService:
         from app.modules.service_orders.billing import BillingService
 
         await BillingService(self.db).ensure_workshop_warranties(order)
+        for task in await self.list_tasks(order.id):
+            self._stop_timer(task)
         order.status = ServiceOrderStatus.ORDEN_CERRADA
         order.closed_at = datetime.now(UTC)
         if next_maintenance_due_at is not None or next_maintenance_tempario_id is not None:
@@ -728,10 +851,17 @@ class ServiceOrderService:
         self, order_id: uuid.UUID, reason: str, cancelled_by_user_id: uuid.UUID
     ) -> ServiceOrder:
         order = await require_editable_order(self.db, order_id)
+        if order.is_draft:
+            raise ConflictError(
+                "Descarta el borrador en lugar de cancelar una orden no enviada.",
+                error_code="order_is_draft",
+            )
         if ServiceOrderStatus.CANCELADO not in ALLOWED_TRANSITIONS.get(order.status, set()):
             raise InvalidStatusTransitionError(
                 order.status.value, ServiceOrderStatus.CANCELADO.value
             )
+        for task in await self.list_tasks(order.id):
+            self._stop_timer(task)
         order.status = ServiceOrderStatus.CANCELADO
         order.cancel_reason = reason
         order.cancelled_by_user_id = cancelled_by_user_id
@@ -802,6 +932,9 @@ class ServiceOrderService:
             raise
 
     async def _next_sequence_number(self, filial_id: uuid.UUID) -> int:
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
         result = await self.db.execute(
             select(func.max(ServiceOrder.sequence_number)).where(
                 ServiceOrder.filial_id == filial_id
@@ -861,6 +994,8 @@ class ServiceOrderService:
         same reasoning as force_complete_order's pending-tasks check.
         Dispatch and pickup have their own lifecycle and do not block
         the task-derived completion status."""
+        if order.is_draft:
+            return
         if order.status not in (
             ServiceOrderStatus.PENDIENTE,
             ServiceOrderStatus.EN_PROGRESO,
@@ -881,11 +1016,18 @@ class ServiceOrderService:
         else:
             target = ServiceOrderStatus.EN_PROGRESO
 
+        if target == ServiceOrderStatus.COMPLETADO:
+            transfers = await self.list_transfers(order.id)
+            order.completed_with_pending_items = any(t.picked_up_at is None for t in transfers)
+        else:
+            order.completed_with_pending_items = False
         if target == order.status:
             return
         if target == ServiceOrderStatus.COMPLETADO:
+            await queue_order_event(
+                self.db, order, "orden_lista", f"{order.id}:{datetime.now(UTC).isoformat()}"
+            )
             order.completed_at = datetime.now(UTC)
-            order.completed_with_pending_items = False
         order.status = target
 
     async def add_task(
@@ -898,6 +1040,8 @@ class ServiceOrderService:
         commit: bool = True,
     ) -> ServiceOrderTask:
         order = await require_editable_order(self.db, service_order_id)
+        if order.is_draft and not order.vehicle_id:
+            raise ConflictError("Selecciona el vehículo antes de agregar tareas.")
         tempario_result = await self.db.execute(
             select(Tempario).options(selectinload(Tempario.parts)).where(Tempario.id == tempario_id)
         )
@@ -1016,37 +1160,120 @@ class ServiceOrderService:
             raise TaskNotFoundError(str(task_id))
         return await self.get_order(task.service_order_id)
 
+    async def _require_task_parts_received(self, task):
+        pending = (
+            await self.db.execute(
+                select(ServiceOrderTransferLine.id)
+                .join(
+                    ServiceOrderTransfer,
+                    ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                )
+                .where(
+                    ServiceOrderTransferLine.service_order_task_id == task.id,
+                    ServiceOrderTransfer.picked_up_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if pending is not None:
+            raise ConflictError(
+                "Retira los repuestos de esta tarea antes de iniciarla.",
+                error_code="task_parts_not_received",
+            )
+
+    @staticmethod
+    def _stop_timer(task):
+        if task.timer_started_at is not None:
+            started = task.timer_started_at
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            task.timer_accumulated_seconds += max(
+                0, round((datetime.now(UTC) - started).total_seconds())
+            )
+            task.timer_started_at = None
+
     async def start_task_timer(self, task_id: uuid.UUID) -> ServiceOrderTask:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
-        await require_editable_order(self.db, task.service_order_id)
+        order = await require_editable_order(self.db, task.service_order_id)
+        if order.is_draft:
+            raise ConflictError(
+                "Envía el borrador al taller antes de iniciar el trabajo.",
+                error_code="order_is_draft",
+            )
+        # Lock the technician before checking ALL their orders, not just this task.
+        if order.technician_user_id:
+            from app.modules.users.models import User
+
+            await self.db.execute(
+                select(User.id).where(User.id == order.technician_user_id).with_for_update()
+            )
+            running = (
+                await self.db.execute(
+                    select(ServiceOrderTask.id)
+                    .join(ServiceOrder, ServiceOrder.id == ServiceOrderTask.service_order_id)
+                    .where(
+                        ServiceOrder.technician_user_id == order.technician_user_id,
+                        ServiceOrderTask.timer_started_at.is_not(None),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if running is not None:
+                raise ConflictError(
+                    "El técnico ya tiene un cronómetro en ejecución.",
+                    error_code="technician_timer_running",
+                )
         if task.timer_started_at is not None:
             raise TaskTimerAlreadyRunningError()
+        if task.status in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA):
+            raise ConflictError("La tarea ya está finalizada.", error_code="task_finished")
+        await self._require_task_parts_received(task)
         task.timer_started_at = datetime.now(UTC)
         await self.db.commit()
         await self.db.refresh(task)
         return task
 
-    async def pause_task_timer(self, task_id: uuid.UUID) -> ServiceOrderTask:
+    async def pause_task_timer(
+        self, task_id: uuid.UUID, reason: str | None = None, notes: str | None = None
+    ) -> ServiceOrderTask:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
         await require_editable_order(self.db, task.service_order_id)
         if task.timer_started_at is None:
             raise TaskTimerNotRunningError()
-        elapsed = (datetime.now(UTC) - task.timer_started_at).total_seconds()
-        task.timer_accumulated_seconds += max(0, round(elapsed))
-        task.timer_started_at = None
+        self._stop_timer(task)
+        task.pause_reason = reason
+        task.pause_history = [
+            *(task.pause_history or []),
+            {"reason": reason, "notes": notes, "paused_at": datetime.now(UTC).isoformat()},
+        ]
         await self.db.commit()
         await self.db.refresh(task)
         return task
 
-    async def update_task_status(self, task_id: uuid.UUID, status: TaskStatus) -> ServiceOrderTask:
+    async def update_task_status(
+        self, task_id: uuid.UUID, status: TaskStatus, reason: str | None = None
+    ) -> ServiceOrderTask:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
         order = await require_editable_order(self.db, task.service_order_id)
+        if order.is_draft:
+            raise ConflictError(
+                "Envía el borrador al taller antes de iniciar el trabajo.",
+                error_code="order_is_draft",
+            )
+        if status == TaskStatus.EN_PROGRESO:
+            await self._require_task_parts_received(task)
+        if status in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA):
+            self._stop_timer(task)
+        if status == TaskStatus.CANCELADA:
+            task.cancellation_reason = reason
+        if status in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA) and task.status != status:
+            await queue_order_event(self.db, order, "tarea_cerrada", f"{task.id}:{status.value}")
         task.status = status
         await self._sync_status_from_tasks(order)
         await self.db.commit()
@@ -1070,6 +1297,22 @@ class ServiceOrderService:
         if task is None:
             raise TaskNotFoundError(str(task_id))
         order = await require_editable_order(self.db, task.service_order_id)
+        if order.is_draft:
+            from sqlalchemy import delete
+
+            line_ids = select(ServiceOrderTransferLine.id).where(
+                ServiceOrderTransferLine.service_order_task_id == task.id
+            )
+            await self.db.execute(
+                delete(ServiceOrderTransferLotAllocation).where(
+                    ServiceOrderTransferLotAllocation.transfer_line_id.in_(line_ids)
+                )
+            )
+            await self.db.execute(
+                delete(ServiceOrderTransferLine).where(
+                    ServiceOrderTransferLine.service_order_task_id == task.id
+                )
+            )
         await self.db.delete(task)
         await self._sync_status_from_tasks(order)
         await self.db.commit()
@@ -1082,8 +1325,9 @@ class ServiceOrderService:
             .options(selectinload(ServiceOrderTransfer.lines))
             .where(ServiceOrderTransfer.service_order_id == service_order_id)
             .order_by(ServiceOrderTransfer.sequence_number)
+            .execution_options(populate_existing=True)
         )
-        return list(result.scalars().all())
+        return [t for t in result.scalars().all() if t.lines]
 
     async def add_transfer_line(
         self,
@@ -1177,6 +1421,9 @@ class ServiceOrderService:
             raise TransferLineNotEditableError()
 
         await self.db.delete(line)
+        await self.db.flush()
+        order = await self.get_order(transfer.service_order_id)
+        await self._sync_status_from_tasks(order)
         await self.db.commit()
         await self.db.refresh(transfer)
         return transfer
@@ -1415,7 +1662,9 @@ class ServiceOrderService:
                         warehouse_id=tr.warehouse_id,
                         preparation_started_at=tr.preparation_started_at,
                         picked_up_at=tr.picked_up_at,
-                        pickup_photo_url=tr.pickup_photo_url,
+                        pickup_photo_url=pickup_photo_endpoint(tr),
+                        receipt_incident=tr.receipt_incident,
+                        receipt_incident_history=tr.receipt_incident_history,
                         stock_deducted=tr.stock_deducted,
                         completed_at=tr.completed_at,
                         fulfilled_at=tr.fulfilled_at,
@@ -1515,6 +1764,11 @@ class ServiceOrderService:
                     created_at=t.created_at,
                     timer_started_at=t.timer_started_at,
                     timer_accumulated_seconds=t.timer_accumulated_seconds,
+                    notes=t.notes,
+                    photo_urls=t.photo_urls,
+                    cancellation_reason=t.cancellation_reason,
+                    pause_reason=t.pause_reason,
+                    pause_history=t.pause_history,
                 )
                 for t in tasks
             ],
@@ -1538,7 +1792,9 @@ class ServiceOrderService:
                     warehouse_id=tr.warehouse_id,
                     preparation_started_at=tr.preparation_started_at,
                     picked_up_at=tr.picked_up_at,
-                    pickup_photo_url=tr.pickup_photo_url,
+                    pickup_photo_url=pickup_photo_endpoint(tr),
+                    receipt_incident=tr.receipt_incident,
+                    receipt_incident_history=tr.receipt_incident_history,
                     stock_deducted=tr.stock_deducted,
                     completed_at=tr.completed_at,
                     fulfilled_at=tr.fulfilled_at,
@@ -1617,6 +1873,7 @@ class ServiceOrderService:
             ],
             parts=parts,
             amount=amount,
+            resolved_by_user_id=upsell.resolved_by_user_id,
             approved_by_user_id=upsell.approved_by_user_id,
             approval_channel=upsell.approval_channel,
             applied_to_service_order_id=upsell.applied_to_service_order_id,
@@ -1689,6 +1946,10 @@ class ServiceOrderService:
         self, service_order_id: uuid.UUID, payload: UpsellCreate, photo_urls: list[str]
     ) -> UpsellRead:
         order = await require_editable_order(self.db, service_order_id)
+        if order.is_draft:
+            raise ConflictError(
+                "Envía la ODS al taller antes de registrar hallazgos.", error_code="order_is_draft"
+            )
         hourly_rate = await self._hourly_rate(order.filial_id, order)
         multiplier = float(PARTS_MULTIPLIERS[order.discount_label])
         labor_cost = 0.0
@@ -1746,6 +2007,8 @@ class ServiceOrderService:
         # Frozen the instant it's detected — never recalculated afterward,
         # even if the hourly rate, FIFO cost, or discount tier later change.
         upsell.quoted_price_snapshot = Decimal(str(round(labor_cost + parts_cost, 2)))
+        await self.db.flush()
+        await queue_order_event(self.db, order, "upsell_identificado", upsell.id)
 
         await self.db.commit()
         await self.db.refresh(upsell)
@@ -1756,6 +2019,8 @@ class ServiceOrderService:
         upsell_id: uuid.UUID,
         payload: UpsellDecisionInput,
         decided_by_user_id: uuid.UUID | None,
+        *,
+        commit: bool = True,
     ) -> UpsellRead:
         # Serialize decisions so two advisors cannot apply the same finding twice.
         upsell = (
@@ -1788,8 +2053,19 @@ class ServiceOrderService:
             # to still be editable.
             target_order_id = payload.target_service_order_id or upsell.service_order_id
             target_order = await require_editable_order(self.db, target_order_id)
+            # Legacy findings may contain only free text. Approving one
+            # would mark it resolved without adding any work to the ODS.
+            if not upsell.tasks and not upsell.parts:
+                raise BadRequestError(
+                    "Esta recomendación no tiene tareas ni repuestos asociados. "
+                    "Registra el trabajo en la ODS antes de descartar la recomendación.",
+                    error_code="upsell_without_lines",
+                )
             origin_order = await self.get_order(upsell.service_order_id)
-            if target_order.vehicle_id != origin_order.vehicle_id:
+            if (
+                target_order.vehicle_id != origin_order.vehicle_id
+                or target_order.filial_id != origin_order.filial_id
+            ):
                 raise BadRequestError(
                     "La ODS destino debe ser del mismo vehículo que la recomendación.",
                     error_code="upsell_vehicle_mismatch",
@@ -1799,13 +2075,20 @@ class ServiceOrderService:
             transfer = await self._get_or_create_pending_transfer(target_order_id, force_new=True)
             for task in upsell.tasks:
                 await self.add_task(
-                    target_order_id, task.tempario_id, payer=ServiceOrderPayer.CLIENTE,
-                    transfer=transfer, commit=False,
+                    target_order_id,
+                    task.tempario_id,
+                    payer=ServiceOrderPayer.CLIENTE,
+                    transfer=transfer,
+                    commit=False,
                 )
             for part in upsell.parts:
                 await self.add_transfer_line(
-                    target_order_id, part.part_id, part.quantity, payer=ServiceOrderPayer.CLIENTE,
-                    transfer=transfer, commit=False,
+                    target_order_id,
+                    part.part_id,
+                    part.quantity,
+                    payer=ServiceOrderPayer.CLIENTE,
+                    transfer=transfer,
+                    commit=False,
                 )
             await self.db.flush()
             has_lines = (
@@ -1828,8 +2111,12 @@ class ServiceOrderService:
             upsell.postponed_at = datetime.now(UTC)
 
         upsell.status = status
+        upsell.resolved_by_user_id = decided_by_user_id
         upsell.resolved_at = datetime.now(UTC)
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         return await self.get_upsell(upsell.id)
 
     # Warranty claims (unified "reclamo de garantía") — covers all four
@@ -1858,14 +2145,15 @@ class ServiceOrderService:
         supplier_claim_note: str | None = None
         if (
             claim.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
-            and claim.claim_type == WarrantyClaimType.REPUESTO_PROVEEDOR
+            and claim.claim_type
+            in (WarrantyClaimType.REPUESTO_PROVEEDOR, WarrantyClaimType.COMEBACK)
             and claim.part_id is not None
         ):
             result = await self.db.execute(
                 select(SupplierClaim.id).where(SupplierClaim.warranty_claim_id == claim.id)
             )
             auto_claim_ids = [row[0] for row in result.all()]
-            if not auto_claim_ids:
+            if not auto_claim_ids and claim.claim_type == WarrantyClaimType.REPUESTO_PROVEEDOR:
                 if claim.service_order_id is None:
                     supplier_claim_note = (
                         "No se pudo generar el reclamo al proveedor: este reclamo no tiene una orden de "
@@ -1918,12 +2206,23 @@ class ServiceOrderService:
             filial_id=claim.filial_id,
             claim_type=claim.claim_type,
             vehicle_id=claim.vehicle_id,
+            vehicle_label=" ".join(
+                str(value) for value in (vehicle.brand, vehicle.model, vehicle.year) if value
+            ),
             vehicle_plate=vehicle.plate,
             vehicle_vin=vehicle.vin,
             client_name=vehicle.client.full_name,
             service_order_id=claim.service_order_id,
             service_order_code=service_order_code,
             tempario_id=claim.tempario_id,
+            coverage_snapshot=claim.coverage_snapshot,
+            workshop_warranty_id=claim.workshop_warranty_id,
+            factory_warranty_id=claim.factory_warranty_id,
+            rejection_reason=claim.rejection_reason,
+            brand_status=claim.brand_status,
+            brand_sent_at=claim.brand_sent_at,
+            brand_response_at=claim.brand_response_at,
+            brand_responded_by_user_id=claim.brand_responded_by_user_id,
             tempario_name=tempario_name,
             part_id=claim.part_id,
             part_name=part_name,
@@ -1952,7 +2251,10 @@ class ServiceOrderService:
             resulting_service_order_code=resulting_service_order_code,
         )
 
-    async def _auto_claim_defective_part(self, order: ServiceOrder, claim: WarrantyClaim) -> None:
+    async def _auto_claim_defective_part(
+        self, order: ServiceOrder, claim: WarrantyClaim, *, part_id=None
+    ) -> None:
+        part_id = part_id or claim.part_id
         # Only allocations from an actually-dispatched ODT count as real
         # consumption — a line's allocation is set the moment it's added
         # (a FIFO price preview, before any stock moves) and again,
@@ -1973,7 +2275,7 @@ class ServiceOrderService:
                 )
                 .where(
                     ServiceOrderTransfer.service_order_id == order.id,
-                    ServiceOrderTransferLine.part_id == claim.part_id,
+                    ServiceOrderTransferLine.part_id == part_id,
                     # PEDIDO or COMPLETADO — both mean it was actually
                     # dispatched; COMPLETADO is just a later confirmation of
                     # the same allocation, not a different one.
@@ -2001,17 +2303,29 @@ class ServiceOrderService:
             purchase_request = await self.db.get(PurchaseRequest, lot.purchase_request_id)
             if purchase_request is None:
                 continue
+            existing = (
+                await self.db.execute(
+                    select(SupplierClaim.id).where(
+                        SupplierClaim.warranty_claim_id == claim.id,
+                        SupplierClaim.lot_id == lot.id,
+                        SupplierClaim.part_id == part_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing:
+                continue
             await admin_service.create_claim(
                 SupplierClaimCreate(
                     filial_id=order.filial_id,
-                    part_id=claim.part_id,
+                    part_id=part_id,
                     quantity=quantity,
                     supplier_id=purchase_request.supplier_id,
                     note=f"Generado automáticamente — reclamo {claim.code}, repuesto defectuoso",
                     lot_id=lot.id,
                     purchase_request_id=purchase_request.id,
                     warranty_claim_id=claim.id,
-                )
+                ),
+                commit=False,
             )
 
     async def _get_order_invoice(self, order_id: uuid.UUID) -> ServiceOrderInvoice:
@@ -2024,6 +2338,9 @@ class ServiceOrderService:
         return invoice
 
     async def _next_claim_sequence_number(self, filial_id: uuid.UUID) -> int:
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
         result = await self.db.execute(
             select(func.max(WarrantyClaim.sequence_number)).where(
                 WarrantyClaim.filial_id == filial_id
@@ -2123,6 +2440,8 @@ class ServiceOrderService:
         photo_urls: list[str],
         document_urls: list[str],
         recorded_by_user_id: uuid.UUID | None,
+        *,
+        commit: bool = True,
     ) -> WarrantyClaimRead:
         vehicle = await self._get_vehicle_with_client(payload.vehicle_id)
         filial_id = vehicle.client.filial_id
@@ -2189,7 +2508,10 @@ class ServiceOrderService:
             document_urls=document_urls,
         )
         self.db.add(claim)
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         await self.db.refresh(claim)
         return await self._warranty_claim_to_read(claim, vehicle)
 
@@ -2198,10 +2520,17 @@ class ServiceOrderService:
         claim_id: uuid.UUID,
         payload: WarrantyClaimAuthorizationInput,
         authorized_by_user_id: uuid.UUID | None,
+        *,
+        commit: bool = True,
     ) -> WarrantyClaimRead:
         claim = await self.db.get(WarrantyClaim, claim_id)
         if claim is None:
             raise WarrantyClaimNotFoundError(str(claim_id))
+        if claim.workshop_warranty_id or claim.factory_warranty_id or claim.brand_status:
+            raise ConflictError(
+                "Usa la revisión del reclamo y su respuesta de marca para este registro.",
+                error_code="claim_review_required",
+            )
         if claim.status != WarrantyClaimStatus.SOLICITADO:
             raise WarrantyClaimAlreadyDecidedError()
 
@@ -2242,7 +2571,10 @@ class ServiceOrderService:
         claim.authorized_by_user_id = authorized_by_user_id
         claim.authorized_at = datetime.now(UTC)
 
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         await self.db.refresh(claim)
         return await self._warranty_claim_to_read(claim, vehicle)
 
@@ -2251,6 +2583,8 @@ class ServiceOrderService:
         claim_id: uuid.UUID,
         payload: WarrantyClaimConvertInput,
         converted_by_user_id: uuid.UUID | None,
+        *,
+        commit: bool = True,
     ) -> WarrantyClaimRead:
         claim = await self.db.get(WarrantyClaim, claim_id)
         if claim is None:
@@ -2260,6 +2594,8 @@ class ServiceOrderService:
         if claim.status != WarrantyClaimStatus.AUTORIZADO:
             raise WarrantyClaimNotAuthorizedError()
 
+        if claim.brand_status == "en_marca":
+            raise ConflictError("La marca aún no ha autorizado el reclamo.")
         vehicle = await self._get_vehicle_with_client(claim.vehicle_id)
         original_order = (
             await self.get_order(claim.service_order_id) if claim.service_order_id else None
@@ -2318,12 +2654,14 @@ class ServiceOrderService:
         await self.db.flush()
 
         if claim.tempario_id is not None:
-            await self.add_task(new_order.id, claim.tempario_id, payer=payer)
+            await self.add_task(new_order.id, claim.tempario_id, payer=payer, commit=False)
         if claim.part_id is not None:
             quantity = 1
             if original_order is not None:
                 quantity = await self._line_quantity_for_part(original_order.id, claim.part_id)
-            await self.add_transfer_line(new_order.id, claim.part_id, quantity, payer=payer)
+            await self.add_transfer_line(
+                new_order.id, claim.part_id, quantity, payer=payer, commit=False
+            )
 
         claim.resulting_service_order_id = new_order.id
         claim.converted_by_user_id = converted_by_user_id
@@ -2337,7 +2675,10 @@ class ServiceOrderService:
         ):
             await self._auto_claim_defective_part(original_order, claim)
 
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         await self.db.refresh(claim)
         return await self._warranty_claim_to_read(claim, vehicle)
 

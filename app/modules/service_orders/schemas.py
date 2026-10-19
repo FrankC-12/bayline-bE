@@ -65,25 +65,20 @@ class ServiceOrderTypeUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class AcceptedUpsellInput(BaseModel):
+    upsell_id: uuid.UUID
+    approval_channel: UpsellApprovalChannel
+
+
 class ServiceOrderCreate(BaseModel):
+    accepted_upsells: list[AcceptedUpsellInput] = Field(default_factory=list, max_length=50)
     discount_label: DiscountLabel = DEFAULT_DISCOUNT
     filial_id: uuid.UUID
     vehicle_id: uuid.UUID
     # None resolves to this filial's "regular" system type — see
     # ServiceOrderService.create_order.
     order_type_id: uuid.UUID | None = None
-    # Reception data. customer_reason is inherited from the linked
-    # PreliminaryInspection's notes whenever it has any — same as
-    # intake_mileage, never re-entered by hand in that case (see
-    # ServiceOrderService.create_order). It's only actually taken from this
-    # field when there's no inspection, or an older inspection predating the
-    # notes-required-to-complete rule left it blank.
-    # advisor_user_id/promised_at have no inspection equivalent and are
-    # always entered by hand. A walk-in ODS (no scheduled_at) must reference
-    # an existing unlinked inspection for this vehicle here; one scheduled
-    # ahead via "Agendar Orden de Servicio" can't know it yet (the vehicle
-    # isn't there), so inspection_id may be omitted and gets linked later,
-    # from the order detail screen, once it arrives.
+    # Customer-reported symptom, independent from inspection findings.
     inspection_id: uuid.UUID | None = None
     customer_reason: str | None = Field(default=None, min_length=1, max_length=2000)
     # Required exactly when the chosen order_type_id's catalog row has a
@@ -142,6 +137,14 @@ class ServiceOrderCloseInput(BaseModel):
 
 
 class ServiceOrderRead(BaseModel):
+    vehicle_received_at: datetime | None = None
+    vehicle_received_by_user_id: uuid.UUID | None = None
+    is_draft: bool = False
+    draft_revision: int = 1
+    creation_source: str = "mobile"
+    submitted_at: datetime | None = None
+    estimated_hours: float = 0
+    workshop_stage: str = "en_revision"
     exit_mileage: int | None = None
     discount_label: DiscountLabel
     model_config = ConfigDict(from_attributes=True)
@@ -149,7 +152,7 @@ class ServiceOrderRead(BaseModel):
     id: uuid.UUID
     filial_id: uuid.UUID
     code: str
-    vehicle_id: uuid.UUID
+    vehicle_id: uuid.UUID | None
     status: ServiceOrderStatus
     order_type: ServiceOrderTypeRead
     warranty_claim_id: uuid.UUID | None
@@ -205,6 +208,27 @@ class TaskCreate(BaseModel):
 
 class TaskStatusUpdate(BaseModel):
     status: TaskStatus
+    reason: str | None = Field(default=None, min_length=3, max_length=2000)
+
+
+class TaskPauseInput(BaseModel):
+    reason: Literal["almuerzo", "otra_tarea", "esperando_repuesto"] | None = None
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class TaskNotesInput(BaseModel):
+    notes: str = Field(max_length=5000)
+
+
+class TransferNotReceivedInput(BaseModel):
+    reason: Literal["faltante", "incorrecto", "danado", "otro"]
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def require_other_description(self):
+        if self.reason == "otro" and not (self.notes and self.notes.strip()):
+            raise ValueError("Describe el motivo de la incidencia.")
+        return self
 
 
 class TaskPayerUpdate(BaseModel):
@@ -214,6 +238,11 @@ class TaskPayerUpdate(BaseModel):
 
 
 class TaskRead(BaseModel):
+    notes: str | None = None
+    photo_urls: list[str] = Field(default_factory=list)
+    cancellation_reason: str | None = None
+    pause_reason: str | None = None
+    pause_history: list[dict] = Field(default_factory=list)
     id: uuid.UUID
     tempario_id: uuid.UUID
     code_snapshot: str
@@ -254,6 +283,8 @@ class TransferLineRead(BaseModel):
 
 
 class TransferRead(BaseModel):
+    receipt_incident: dict | None = None
+    receipt_incident_history: list[dict] = Field(default_factory=list)
     id: uuid.UUID
     code: str
     status: TransferStatus
@@ -376,6 +407,7 @@ class UpsellPartRead(BaseModel):
 
 
 class UpsellRead(BaseModel):
+    resolved_by_user_id: uuid.UUID | None = None
     id: uuid.UUID
     service_order_id: uuid.UUID
     title: str
@@ -458,7 +490,46 @@ class WarrantyClaimConvertInput(BaseModel):
     promised_at: datetime | None = None
 
 
+class WarrantyClaimFromWarranty(BaseModel):
+    vehicle_id: uuid.UUID
+    workshop_warranty_id: uuid.UUID | None = None
+    factory_warranty_id: uuid.UUID | None = None
+    campaign: bool = False
+    reported_mileage: int = Field(ge=0)
+    symptom: str = Field(min_length=3, max_length=2000)
+
+    @model_validator(mode="after")
+    def one_coverage(self):
+        if (
+            sum([bool(self.workshop_warranty_id), bool(self.factory_warranty_id), self.campaign])
+            != 1
+        ):
+            raise ValueError("Selecciona una garantía o campaña.")
+        return self
+
+
+class ClaimReviewInput(BaseModel):
+    decision: Literal["aprobado", "rechazado"]
+    rejection_reason: str | None = Field(default=None, max_length=2000)
+    failure_category: ReworkFailureCategory | None = None
+
+    @model_validator(mode="after")
+    def rejection_requires_reason(self):
+        if self.decision == "rechazado" and not (self.rejection_reason or "").strip():
+            raise ValueError("Indica el motivo del rechazo.")
+        return self
+
+
 class WarrantyClaimRead(BaseModel):
+    vehicle_label: str | None = None
+    coverage_snapshot: dict | None = None
+    brand_responded_by_user_id: uuid.UUID | None = None
+    workshop_warranty_id: uuid.UUID | None = None
+    factory_warranty_id: uuid.UUID | None = None
+    rejection_reason: str | None = None
+    brand_status: str | None = None
+    brand_sent_at: datetime | None = None
+    brand_response_at: datetime | None = None
     id: uuid.UUID
     code: str
     filial_id: uuid.UUID
@@ -513,3 +584,20 @@ class WarrantyClaimContext(BaseModel):
     factory_warranty: VehicleWarrantyRead | None = None
     workshop_warranties: list[WorkshopWarrantyRead] = Field(default_factory=list)
     duplicate_open_claim: WarrantyClaimRead | None = None
+
+
+class ServiceOrderDraftCreate(BaseModel):
+    filial_id: uuid.UUID
+    vehicle_id: uuid.UUID | None = None
+    scheduled_at: datetime | None = None
+    bay_id: uuid.UUID | None = None
+    upsell_id: uuid.UUID | None = None
+
+
+class ServiceOrderDraftUpdate(BaseModel):
+    expected_revision: int | None = None
+    vehicle_id: uuid.UUID | None = None
+    technician_user_id: uuid.UUID | None = None
+    bay_id: uuid.UUID | None = None
+    scheduled_at: datetime | None = None
+    customer_reason: str | None = Field(default=None, max_length=2000)

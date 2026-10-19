@@ -16,6 +16,8 @@ from app.core.database import AsyncSessionLocal
 from app.core.http_security import HttpSecurityMiddleware
 from app.core.request_tracking import RequestTrackingMiddleware
 from app.core.exception_handlers import register_exception_handlers
+from app.modules.notifications.router import router as notifications_router
+from app.modules.notifications.service import worker as push_worker
 from app.modules.auth.router import router as auth_router
 from app.modules.holdings.router import router as holdings_router
 from app.modules.filiales.router import router as filiales_router
@@ -61,10 +63,14 @@ async def lifespan(app: FastAPI):
     log_runtime = AuditLogRuntime(settings.logs_dir, settings.logs_timezone).start()
     register_database_audit()
     record_event(audit_logger, "application_started")
+    push_task = asyncio.create_task(push_worker())
     task = asyncio.create_task(_refresh_bcv_rate_loop())
     try:
         yield
     finally:
+        push_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await push_task
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -93,6 +99,7 @@ app.add_middleware(RequestTrackingMiddleware)
 
 register_exception_handlers(app)
 
+app.include_router(notifications_router, prefix=settings.api_v1_prefix)
 app.include_router(auth_router, prefix=settings.api_v1_prefix)
 app.include_router(telemetry_router, prefix=settings.api_v1_prefix)
 app.include_router(holdings_router, prefix=settings.api_v1_prefix)

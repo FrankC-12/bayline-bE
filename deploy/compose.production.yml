@@ -34,10 +34,22 @@ services:
       FORWARDED_ALLOW_IPS: "172.30.40.10"
       ACCESS_TOKEN_EXPIRE_MINUTES: "15"
       REFRESH_TOKEN_EXPIRE_DAYS: "30"
+      PUSH_ENABLED: ${PUSH_ENABLED:-false}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+      FIREBASE_CREDENTIALS_FILE: ${FIREBASE_CREDENTIALS_FILE:-/run/secrets/firebase-service-account.json}
+      PRIVATE_UPLOADS_DIR: /app/private-uploads
+      S3_PRIVATE_BUCKET_NAME: ${S3_PRIVATE_BUCKET_NAME:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      S3_BUCKET_NAME: ${S3_BUCKET_NAME:-}
+      UPLOADS_ENVIRONMENT: production
       LOGS_DIR: ${LOGS_DIR:-/app/logs}
       LOGS_TIMEZONE: ${LOGS_TIMEZONE:-America/Caracas}
     volumes:
       - backend_uploads:/app/uploads
+      - backend_private_uploads:/app/private-uploads
+      - ./secrets:/run/secrets:ro
       - backend_logs:/app/logs
     networks: [app]
     depends_on:
@@ -75,4 +87,5 @@ volumes:
   caddy_data:
   caddy_config:
   backend_uploads:
+  backend_private_uploads:
   backend_logs:

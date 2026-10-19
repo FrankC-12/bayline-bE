@@ -134,10 +134,8 @@ async def test_already_linked_inspection_is_rejected(env):
 
 
 @pytest.mark.asyncio
-async def test_create_order_inherits_customer_reason_from_inspection_notes(env):
-    """customer_reason is heredado from the inspection's notes just like
-    intake_mileage — whatever the client sends in customer_reason is
-    ignored once the inspection has its own notes recorded."""
+async def test_create_order_preserves_customer_reason_independently_of_inspection_notes(env):
+    """Customer-reported symptoms must never be overwritten by inspection findings."""
     service, session = env
     filial_id, vehicle_id, advisor_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     inspection = _make_inspection(session, vehicle_id, mileage=15000)
@@ -152,7 +150,8 @@ async def test_create_order_inherits_customer_reason_from_inspection_notes(env):
         )
     )
 
-    assert order.customer_reason == "Ruido metálico en suspensión delantera"
+    assert order.customer_reason == "Motivo distinto tecleado en el panel"
+    assert inspection.notes == "Ruido metálico en suspensión delantera"
 
 
 @pytest.mark.asyncio

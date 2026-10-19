@@ -143,6 +143,13 @@ async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(
                 )
             )
             await db.commit()
+            incident = await http.post(
+                f"/api/v1/service-order-transfers/{transfer_id}/not-received",
+                json={"reason": "faltante", "notes": "Falta una pieza del despacho"},
+            )
+            assert incident.status_code == 200
+            assert incident.json()["receipt_incident"]["reason"] == "faltante"
+            assert incident.json()["picked_up_at"] is None
             assert (await http.post(pickup_path)).status_code == 422
             stored = []
 
@@ -150,11 +157,16 @@ async def test_dispatched_workshop_transfer_is_visible_in_warehouse_http_feed(
                 stored.append(file.filename)
                 return "/api/v1/uploads/dispatch-pickups/retirada.jpg"
 
-            monkeypatch.setattr(order_routes, "save_upload_image", save_photo)
+            monkeypatch.setattr("app.core.storage.save_private_pickup", save_photo)
             assert (await http.post(pickup_path, files=photo)).status_code == 204
             row = (await http.get(path)).json()[0]
             assert row["stage"] == "completado"
             assert row["picked_up_at"] is not None
-            assert row["pickup_photo_url"].endswith("retirada.jpg")
+            assert row["pickup_photo_url"].endswith(f"/{transfer_id}/pickup-photo")
             assert (await http.post(pickup_path, files=photo)).status_code == 204
             assert stored == ["retiro.jpg"]
+            rejected = await http.post(
+                f"/api/v1/service-order-transfers/{transfer_id}/not-received",
+                json={"reason": "faltante"},
+            )
+            assert rejected.status_code == 409

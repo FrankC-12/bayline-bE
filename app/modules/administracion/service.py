@@ -586,10 +586,15 @@ class AdministracionService:
         for claim in claims:
             claim.client_name = names.get(claim.client_id) if claim.client_id else None
 
-    async def create_claim(self, payload: SupplierClaimCreate) -> SupplierClaim:
+    async def create_claim(
+        self, payload: SupplierClaimCreate, *, commit: bool = True
+    ) -> SupplierClaim:
         claim = SupplierClaim(**payload.model_dump())
         self.db.add(claim)
-        await self.db.commit()
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         await self.db.refresh(claim)
         await self._attach_client_name([claim])
         return claim

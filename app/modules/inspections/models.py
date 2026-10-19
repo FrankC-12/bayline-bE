@@ -32,6 +32,7 @@ class PreliminaryInspection(Base):
         index=True,
     )
     mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mileage_correction_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[InspectionStatus] = mapped_column(
         Enum(InspectionStatus, name="inspection_status"),

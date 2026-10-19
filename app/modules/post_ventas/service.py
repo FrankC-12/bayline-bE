@@ -675,7 +675,12 @@ class PostVentasService:
             if w.duration_km is not None and current_mileage is not None
             else None
         )
+        expiration_reason = "fecha" if status == "vencida" else None
+        if w.duration_km is not None and current_mileage is not None and current_mileage >= w.duration_km:
+            status = "vencida"
+            expiration_reason = "fecha_y_kilometraje" if expiration_reason else "kilometraje"
         return VehicleWarrantyRead(
+            current_mileage=current_mileage, expiration_reason=expiration_reason,
             certificate_photo_url=w.certificate_photo_url,
             id=w.id,
             filial_id=w.filial_id,
@@ -727,33 +732,14 @@ class PostVentasService:
 
     async def _current_mileage_by_vin(self, filial_id, vin):
         from app.modules.clients.models import Client, Vehicle
-        from app.modules.inspections.models import PreliminaryInspection
-        from app.modules.service_orders.models import ServiceOrder
-
-        saved = (
-            await self.db.execute(
-                select(func.max(Vehicle.mileage))
-                .join(Client, Client.id == Vehicle.client_id)
-                .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
-            )
-        ).scalar()
-        inspected = (
-            await self.db.execute(
-                select(func.max(PreliminaryInspection.mileage))
-                .join(Vehicle, Vehicle.id == PreliminaryInspection.vehicle_id)
-                .join(Client, Client.id == Vehicle.client_id)
-                .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
-            )
-        ).scalar()
-        departure = (
-            await self.db.execute(
-                select(func.max(ServiceOrder.exit_mileage))
-                .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
-                .where(ServiceOrder.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
-            )
-        ).scalar()
-        values = [value for value in (saved, inspected, departure) if value is not None]
-        return max(values) if values else None
+        from app.modules.clients.service import ClientService
+        vehicle = (await self.db.execute(
+            select(Vehicle).join(Client, Client.id == Vehicle.client_id)
+            .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
+        )).scalars().first()
+        if vehicle is None:
+            return None
+        return await ClientService(self.db).get_current_mileage(vehicle.id)
 
     async def get_vehicle_warranty_by_vin(
         self, filial_id: uuid.UUID, vin: str
@@ -920,7 +906,11 @@ class PostVentasService:
         days_remaining = (
             max((w.expires_at - today).days, 0) if w.expires_at is not None else None
         )
+        date_expired = w.expires_at is not None and w.expires_at < today
+        km_expired = current_mileage is not None and w.expiration_mileage is not None and current_mileage >= w.expiration_mileage
+        expiration_reason = "fecha_y_kilometraje" if date_expired and km_expired else "fecha" if date_expired else "kilometraje" if km_expired else None
         return WorkshopWarrantyRead(
+            current_mileage=current_mileage, expiration_reason=expiration_reason,
             id=w.id,
             filial_id=w.filial_id,
             vin=w.vin,

@@ -58,6 +58,7 @@ async def require_order_access(
         return
     if (
         await has_module_access(current_user, order.filial_id, db, TECNICO_MODULE_ID, level)
+        and not getattr(order, "is_draft", False)
         and order.technician_user_id == current_user.user_id
     ):
         return

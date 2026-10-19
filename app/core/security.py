@@ -1,6 +1,8 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import uuid
+
 import bcrypt
 import jwt
 
@@ -16,7 +18,10 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify a plaintext password against a bcrypt hash."""
-    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        return False
 
 
 def create_access_token(claims: dict[str, Any], expires_minutes: int | None = None) -> str:
@@ -33,7 +38,7 @@ def create_refresh_token(subject: str, expires_days: int | None = None) -> str:
     settings = get_settings()
     days = expires_days or settings.refresh_token_expire_days
     expire_at = datetime.now(UTC) + timedelta(days=days)
-    payload = {"sub": subject, "type": "refresh", "exp": expire_at}
+    payload = {"sub": subject, "type": "refresh", "exp": expire_at, "jti": uuid.uuid4().hex}
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 

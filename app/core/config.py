@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     logs_dir: str = "logs"
     logs_timezone: str = "America/Caracas"
 
+    push_enabled: bool = False
+    firebase_project_id: str | None = None
+    firebase_credentials_file: str | None = None
+    private_uploads_dir: str = "private-uploads"
+    s3_private_bucket_name: str | None = None
+    uploads_environment: str | None = None
+
     uploads_dir: str = "uploads"
     max_upload_mb: int = 8
 

@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 """A service order's status (pendiente/en_progreso/completado) is derived
 automatically from its tasks (and, for completado, its ODTs) — see
 ServiceOrderService._sync_status_from_tasks. Completing with something
@@ -103,6 +105,11 @@ async def test_adding_a_pending_task_keeps_the_order_pendiente(env):
 async def test_a_task_en_progreso_moves_the_order_to_en_progreso(env):
     service, order, tempario, _user = env
     task = await service.add_task(order.id, tempario.id)
+    transfer = (await service.list_transfers(order.id))[0]
+    await service.mark_transfer_ordered(transfer.id)
+    await service.complete_transfer(transfer.id, _user.user_id)
+    transfer.picked_up_at = datetime.now(UTC)
+    await service.db.commit()
     await service.update_task_status(task.id, TaskStatus.EN_PROGRESO)
     assert order.status == ServiceOrderStatus.EN_PROGRESO
 
@@ -135,7 +142,7 @@ async def test_all_tasks_completed_and_odt_dispatched_auto_completes_the_order(e
 
     assert order.status == ServiceOrderStatus.COMPLETADO
     assert order.completed_at is not None
-    assert order.completed_with_pending_items is False
+    assert order.completed_with_pending_items is True
 
 
 @pytest.mark.asyncio
@@ -166,7 +173,7 @@ async def test_a_cancelled_only_task_with_no_pending_odt_still_completes(env):
     await service.mark_transfer_ordered(transfer.id)
 
     assert order.status == ServiceOrderStatus.COMPLETADO
-    assert order.completed_with_pending_items is False
+    assert order.completed_with_pending_items is True
 
 
 @pytest.mark.asyncio

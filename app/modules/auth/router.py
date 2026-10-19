@@ -8,7 +8,14 @@ from app.core.exceptions import DomainError
 from app.modules.auth.cookies import REFRESH_COOKIE, clear_session_cookies, set_session_cookies
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.exceptions import InvalidTokenError
-from app.modules.auth.schemas import AccessMapResponse, CurrentUser, LoginRequest, RefreshRequest, TokenResponse
+from app.modules.auth.schemas import (
+    AccessMapResponse,
+    CurrentUser,
+    LoginRequest,
+    LogoutRequest,
+    RefreshRequest,
+    TokenResponse,
+)
 from app.modules.auth.service import AuthService
 from app.modules.roles.models import RoleModulePermission
 from app.modules.roles.module_catalog import MODULE_CATALOG
@@ -24,6 +31,7 @@ def get_auth_service(db: AsyncSession = Depends(get_db)) -> AuthService:
 @router.post("/login", response_model=TokenResponse)
 async def login(
     payload: LoginRequest,
+    request: Request,
     response: Response,
     service: AuthService = Depends(get_auth_service),
 ) -> TokenResponse:
@@ -31,6 +39,7 @@ async def login(
     tokens in the body — a mobile client has no cookie jar to lean on, so it
     stores access_token/refresh_token itself and sends the former as
     `Authorization: Bearer <access_token>` on every subsequent call."""
+    await service.check_login_budget(str(payload.email), request.client.host if request.client else "unknown")
     tokens = await service.login(payload.email, payload.password)
     set_session_cookies(response, tokens)
     return tokens
@@ -59,12 +68,13 @@ async def refresh(
 
 
 @router.post("/logout", status_code=204)
-async def logout(request: Request):
+async def logout(request: Request, payload: LogoutRequest = LogoutRequest(), service: AuthService = Depends(get_auth_service)):
     # Identify authenticated logouts without breaking expired-session cleanup.
     try:
         get_current_user(request)
     except InvalidTokenError:
         pass
+    await service.logout(request.cookies.get(REFRESH_COOKIE) or payload.refresh_token or "", payload.device_id)
     response = Response(status_code=204)
     clear_session_cookies(response)
     return response

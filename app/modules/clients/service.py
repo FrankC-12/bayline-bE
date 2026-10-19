@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError, ConflictError
 from app.core.search import fold_search
-from app.core.venezuela_time import venezuela_today
+from app.core.venezuela_time import venezuela_today, caracas_date
 from app.modules.administracion.exceptions import SupplierNotFoundError
 from app.modules.administracion.models import Supplier
 from app.modules.clients.enums import ClientType, DocumentType, MaintenancePlanEntryStatus
@@ -205,7 +205,7 @@ class ClientService:
             inspection = latest.get(vehicle.id)
             vehicle.current_mileage = inspection.mileage if inspection else None
             vehicle.current_mileage_visit_date = (
-                inspection.created_at.date() if inspection else None
+                caracas_date(inspection.created_at) if inspection else None
             )
             vehicle.current_mileage_service_order_id = (
                 inspection.service_order_id if inspection else None
@@ -283,22 +283,14 @@ class ClientService:
         return latest
 
     async def get_current_mileage(self, vehicle_id: uuid.UUID) -> int | None:
-        latest = await self._latest_mileage_inspections([vehicle_id])
-        inspection = latest.get(vehicle_id)
-        return inspection.mileage if inspection else None
+        return (await self.get_mileage_context(vehicle_id))[0]
 
-    async def get_mileage_context(
-        self, vehicle_id: uuid.UUID
-    ) -> tuple[int | None, date | None, uuid.UUID | None]:
-        """Mileage, visit date, and originating service_order_id from the
-        vehicle's most recent mileage-carrying inspection — the same source
-        as get_current_mileage, bundled for callers (e.g. a warranty claim's
-        coverage-context panel) that need the visit date too."""
-        latest = await self._latest_mileage_inspections([vehicle_id])
-        inspection = latest.get(vehicle_id)
-        if inspection is None:
+    async def get_mileage_context(self, vehicle_id: uuid.UUID) -> tuple[int | None, date | None, uuid.UUID | None]:
+        vehicle = await self.db.get(Vehicle, vehicle_id)
+        if vehicle is None:
             return None, None, None
-        return inspection.mileage, inspection.created_at.date(), inspection.service_order_id
+        await self.attach_vehicle_mileage([vehicle])
+        return vehicle.current_mileage, vehicle.current_mileage_visit_date, vehicle.current_mileage_service_order_id
 
     async def list_mileage_history(self, vehicle_id: uuid.UUID) -> list[VehicleMileageHistoryEntry]:
         """Every recorded odometer reading for this vehicle, newest first —

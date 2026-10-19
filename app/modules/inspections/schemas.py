@@ -32,13 +32,15 @@ class InspectionCreate(BaseModel):
     filial_id: uuid.UUID
     vehicle_id: uuid.UUID
     mileage: int | None = Field(default=None, ge=0)
+    mileage_correction_reason: str | None = Field(default=None, min_length=3, max_length=1000)
     notes: str | None = None
     status: InspectionStatus = InspectionStatus.COMPLETADA
     damages: list[InspectionDamageInput] = Field(default_factory=list)
 
 
 class InspectionUpdate(BaseModel):
-    mileage: int | None = None
+    mileage: int | None = Field(default=None, ge=0)
+    mileage_correction_reason: str | None = Field(default=None, min_length=3, max_length=1000)
     notes: str | None = None
     status: InspectionStatus | None = None
     service_order_id: uuid.UUID | None = None
@@ -54,6 +56,7 @@ class InspectionRead(BaseModel):
     inspector_user_id: uuid.UUID
     service_order_id: uuid.UUID | None
     mileage: int | None
+    mileage_correction_reason: str | None = Field(default=None, min_length=3, max_length=1000)
     notes: str | None
     status: InspectionStatus
     damages: list[InspectionDamageRead]

@@ -215,6 +215,9 @@ class WorkshopDispatchService:
             request = await self.request(request_id, lock=True)
             await require_editable_order(self.db, request.service_order_id)
             request, order, plan = await self.preview(request_id, lock=True)
+            if order.is_draft:
+                from app.core.exceptions import ConflictError
+                raise ConflictError("Envía el borrador al taller antes de solicitar repuestos.", error_code="order_is_draft")
             if request.status != TransferStatus.PENDIENTE:
                 return request
             if not request.lines:
@@ -326,6 +329,9 @@ class WorkshopDispatchService:
                     .execution_options(populate_existing=True)
                 )
             ).scalar_one()
+            if order.is_draft:
+                from app.core.exceptions import ConflictError
+                raise ConflictError("La ODS sigue en borrador.", error_code="order_is_draft")
             if order.status == ServiceOrderStatus.CANCELADO:
                 raise BadRequestError("No se puede despachar una ODS cancelada.")
             if not request.stock_deducted:
@@ -428,6 +434,8 @@ class WorkshopDispatchService:
             request.status = TransferStatus.COMPLETADO
             request.completed_by_user_id = user_id
             request.completed_at = datetime.now(UTC)
+            from app.modules.notifications.service import queue_order_event
+            await queue_order_event(self.db, order, "repuestos_listos", request.id, [order.technician_user_id, order.advisor_user_id])
             await self.db.commit()
             return request
         except Exception:

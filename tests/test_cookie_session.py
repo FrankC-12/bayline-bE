@@ -54,6 +54,12 @@ def session_app(monkeypatch):
         )
 
     class FakeAuth:
+        async def check_login_budget(self, email, ip):
+            pass
+
+        async def logout(self, token, device_id=None):
+            pass
+
         async def login(self, email, password):
             return tokens()
 
@@ -224,3 +230,11 @@ def test_insecure_production_configuration_fails(overrides):
     values.update(overrides)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **values)
+
+
+@pytest.mark.asyncio
+async def test_native_logout_accepts_custom_csrf_header_without_invented_origin(session_app):
+    async with AsyncClient(transport=ASGITransport(app=session_app), base_url=ORIGIN) as client:
+        response = await client.post("/api/v1/auth/logout", headers={"X-CSRF-Protection": "1"})
+        assert response.status_code == 204
+        assert (await client.post("/api/v1/auth/logout")).status_code == 403

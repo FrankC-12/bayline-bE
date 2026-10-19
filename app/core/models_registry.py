@@ -41,3 +41,7 @@ from app.modules.compras.models import (  # noqa: F401
 from app.modules.detailed_inspections.models import DetailedInspection  # noqa: F401
 
 from app.core.idempotency import OperationReceipt  # noqa: F401
+
+from app.modules.auth.models import RefreshSession, LoginBucket  # noqa: F401
+
+from app.modules.notifications.models import Device, Notification  # noqa: F401

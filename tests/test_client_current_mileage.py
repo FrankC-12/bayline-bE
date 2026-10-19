@@ -96,7 +96,7 @@ async def test_current_mileage_picks_the_most_recent_visit(env):
 
     vehicle_read = read_client.vehicles[0]
     assert vehicle_read.current_mileage == 15_000
-    assert vehicle_read.current_mileage_visit_date == datetime(2026, 6, 1).date()
+    assert vehicle_read.current_mileage_visit_date == datetime(2026, 5, 31).date()
     assert vehicle_read.mileage == 0  # registration value untouched
 
 

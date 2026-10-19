@@ -4,6 +4,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.modules.clients.exceptions import VehicleNotFoundError
+from app.modules.clients.mileage import validate_mileage
+from app.modules.clients.models import Vehicle
+from app.modules.filiales.exceptions import FilialNotFoundError
+from app.modules.filiales.models import Filial
 from app.modules.inspections.enums import InspectionStatus
 from app.modules.inspections.exceptions import (
     CannotDeleteLinkedInspectionError,
@@ -12,10 +17,6 @@ from app.modules.inspections.exceptions import (
     InspectionNotesRequiredError,
     InspectionNotFoundError,
 )
-from app.modules.clients.exceptions import VehicleNotFoundError
-from app.modules.clients.models import Vehicle
-from app.modules.filiales.exceptions import FilialNotFoundError
-from app.modules.filiales.models import Filial
 from app.modules.inspections.models import InspectionDamage, PreliminaryInspection
 from app.modules.inspections.schemas import InspectionCreate, InspectionUpdate
 from app.modules.service_orders.guards import require_editable_order
@@ -64,7 +65,9 @@ class InspectionService:
             raise FilialNotFoundError(str(payload.filial_id))
         if await self.db.get(Vehicle, payload.vehicle_id) is None:
             raise VehicleNotFoundError(str(payload.vehicle_id))
+        await validate_mileage(self.db, payload.vehicle_id, payload.mileage, payload.mileage_correction_reason)
         inspection = PreliminaryInspection(
+            mileage_correction_reason=payload.mileage_correction_reason,
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
             inspector_user_id=inspector_user_id,
@@ -99,6 +102,8 @@ class InspectionService:
         was_already_completada = inspection.status == InspectionStatus.COMPLETADA
 
         if payload.mileage is not None:
+            await validate_mileage(self.db, inspection.vehicle_id, payload.mileage, payload.mileage_correction_reason, inspection.id)
+            inspection.mileage_correction_reason = payload.mileage_correction_reason
             inspection.mileage = payload.mileage
         if payload.notes is not None:
             inspection.notes = payload.notes
@@ -129,6 +134,15 @@ class InspectionService:
                 if order is not None:
                     order.intake_mileage = inspection.mileage
 
+        if inspection.service_order_id is not None:
+            from app.core.exceptions import ConflictError
+            from app.modules.service_orders.models import ServiceOrder
+            linked_order = await self.db.get(ServiceOrder, inspection.service_order_id)
+            if linked_order and (linked_order.vehicle_id != inspection.vehicle_id or linked_order.filial_id != inspection.filial_id):
+                raise ConflictError("La inspección y la ODS deben corresponder al mismo vehículo y filial.")
+            if linked_order and inspection.mileage is not None:
+                linked_order.intake_mileage = inspection.mileage
+
         await self.db.commit()
         await self.db.refresh(inspection)
         return inspection
@@ -144,6 +158,8 @@ class InspectionService:
         self, inspection_id: uuid.UUID, damage_id: uuid.UUID, photo_url: str
     ) -> PreliminaryInspection:
         inspection = await self.get_inspection(inspection_id)
+        if inspection.service_order_id:
+            await require_editable_order(self.db, inspection.service_order_id)
         damage = next((d for d in inspection.damages if d.id == damage_id), None)
         if damage is None:
             raise InspectionDamageNotFoundError(str(damage_id))
@@ -156,6 +172,8 @@ class InspectionService:
         self, inspection_id: uuid.UUID, photo_urls: list[str]
     ) -> PreliminaryInspection:
         inspection = await self.get_inspection(inspection_id)
+        if inspection.service_order_id:
+            await require_editable_order(self.db, inspection.service_order_id)
         inspection.photo_urls = [*inspection.photo_urls, *photo_urls]
         await self.db.commit()
         await self.db.refresh(inspection)

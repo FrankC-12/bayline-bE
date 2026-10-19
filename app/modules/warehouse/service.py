@@ -1,3 +1,4 @@
+from app.core.storage import pickup_photo_endpoint
 import uuid
 from datetime import UTC, datetime
 
@@ -1284,7 +1285,7 @@ class AlmacenService:
                     advisor_name=advisor.full_name if advisor else None,
                     preparation_started_at=transfer.preparation_started_at,
                     picked_up_at=transfer.picked_up_at,
-                    pickup_photo_url=transfer.pickup_photo_url,
+                    pickup_photo_url=pickup_photo_endpoint(transfer),
                     backorder_notified_at=transfer.backorder_notified_at,
                     created_at=transfer.created_at,
                     stage=(

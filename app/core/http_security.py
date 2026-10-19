@@ -48,7 +48,8 @@ class HttpSecurityMiddleware(BaseHTTPMiddleware):
                     f"{settings.api_v1_prefix}/auth/refresh",
                 }
                 origin_ok = (
-                    has_bearer_token
+                    request.headers.get("origin") is None
+                    or has_bearer_token
                     or is_token_endpoint
                     or request.headers.get("origin") in settings.allowed_origins
                 )

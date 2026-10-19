@@ -1,13 +1,20 @@
 import uuid
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.modules.roles.enums import RoleScope
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
+    email: EmailStr = Field(max_length=254)
+    password: str = Field(min_length=1, max_length=72)
+
+    @field_validator("password")
+    @classmethod
+    def password_byte_limit(cls, value):
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("La contraseña excede el máximo de 72 bytes.")
+        return value
 
 
 class RefreshRequest(BaseModel):
@@ -17,6 +24,10 @@ class RefreshRequest(BaseModel):
     hands it back."""
 
     refresh_token: str | None = None
+
+
+class LogoutRequest(RefreshRequest):
+    device_id: uuid.UUID | None = None
 
 
 class TokenResponse(BaseModel):

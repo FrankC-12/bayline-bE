@@ -2,6 +2,9 @@ import uuid
 
 import jwt
 from fastapi import Depends, Request
+from fastapi.security import HTTPBearer
+
+api_bearer = HTTPBearer(auto_error=False)
 
 from app.core.audit_logging import set_actor
 from app.core.security import decode_access_token
@@ -11,7 +14,7 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import RoleScope
 
 
-def get_current_user(request: Request) -> CurrentUser:
+def get_current_user(request: Request, _bearer=Depends(api_bearer)) -> CurrentUser:
     """Validate the access cookie (web) or an `Authorization: Bearer` token
     (mobile/native clients, which have no browser cookie jar to rely on) —
     whichever the request actually sent. See also HttpSecurityMiddleware,

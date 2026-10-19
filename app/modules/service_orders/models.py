@@ -114,11 +114,24 @@ class ServiceOrder(Base):
         index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    vehicle_id: Mapped[uuid.UUID] = mapped_column(
+    vehicle_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("vehicles.id", ondelete="RESTRICT"),
-        nullable=False,
+        nullable=True,
         index=True,
+    )
+    is_draft: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    draft_revision: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    creation_source: Mapped[str] = mapped_column(
+        String(12), nullable=False, default="mobile", server_default="mobile"
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    draft_upsells: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
     )
     status: Mapped[ServiceOrderStatus] = mapped_column(
         Enum(ServiceOrderStatus, name="service_order_status"),
@@ -175,6 +188,12 @@ class ServiceOrder(Base):
     promised_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
     settings_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    vehicle_received_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    vehicle_received_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -260,6 +279,15 @@ class ServiceOrderTask(Base):
         DateTime(timezone=True), nullable=True
     )
     timer_accumulated_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    photo_urls: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
+    cancellation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pause_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    pause_history: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -321,6 +349,10 @@ class ServiceOrderTransfer(Base):
     )
     backorder_notified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    receipt_incident: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    receipt_incident_history: Mapped[list] = mapped_column(
+        JSON, nullable=False, default=list, server_default="[]"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -451,6 +483,9 @@ class Upsell(Base):
         Enum(UpsellStatus, name="upsell_status"), nullable=False, default=UpsellStatus.PENDIENTE
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    resolved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Only ever set together, and only when status becomes APROBADO — how
     # the client actually agreed to pay for this, and who took that down.
@@ -462,7 +497,8 @@ class Upsell(Base):
             UpsellApprovalChannel,
             name="upsell_approval_channel",
             values_callable=lambda enum: [item.value for item in enum],
-        ), nullable=True
+        ),
+        nullable=True,
     )
     # Which ODS the recommendation actually landed on — usually the same as
     # service_order_id (approved the same visit it was detected), but can
@@ -620,6 +656,20 @@ class WarrantyClaim(Base):
         ForeignKey("filiales.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
+    )
+    coverage_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    workshop_warranty_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    factory_warranty_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    brand_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    brand_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    brand_responded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    brand_response_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     # Per-filial human-readable number — see the `code` property below.
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)

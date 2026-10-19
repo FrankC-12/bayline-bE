@@ -242,6 +242,8 @@ class VehicleWarrantyCreate(BaseModel):
 
 
 class VehicleWarrantyRead(BaseModel):
+    current_mileage: int | None = None
+    expiration_reason: str | None = None
     certificate_photo_url: str | None = None
     id: uuid.UUID
     filial_id: uuid.UUID
@@ -290,6 +292,8 @@ class VehicleWarrantyBulkResult(BaseModel):
 
 
 class WorkshopWarrantyRead(BaseModel):
+    current_mileage: int | None = None
+    expiration_reason: str | None = None
     id: uuid.UUID
     filial_id: uuid.UUID
     vin: str

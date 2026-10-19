@@ -1,10 +1,10 @@
 import datetime as dt
-import json
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
-from pydantic import TypeAdapter
+from fastapi.exceptions import RequestValidationError
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -40,11 +40,14 @@ from app.modules.service_orders.schemas import (
     BayCreate,
     BayRead,
     BayUpdate,
+    ClaimReviewInput,
     OrderSummary,
     PendingUpsellRead,
     ServiceOrderCancelInput,
     ServiceOrderCloseInput,
     ServiceOrderCreate,
+    ServiceOrderDraftCreate,
+    ServiceOrderDraftUpdate,
     ServiceOrderPageItem,
     ServiceOrderRead,
     ServiceOrderTypeCreate,
@@ -52,12 +55,15 @@ from app.modules.service_orders.schemas import (
     ServiceOrderTypeUpdate,
     ServiceOrderUpdate,
     TaskCreate,
+    TaskNotesInput,
+    TaskPauseInput,
     TaskPayerUpdate,
     TaskRead,
     TaskStatusUpdate,
     TransferLineInput,
     TransferLinePayerUpdate,
     TransferLineQuantityUpdate,
+    TransferNotReceivedInput,
     TransferRead,
     UpsellCreate,
     UpsellDecisionInput,
@@ -78,6 +84,22 @@ from app.modules.service_orders.service import (
 
 MODULE_ID = "asesor-servicios"
 router = APIRouter(tags=["Service Orders"])
+
+
+def _validated_form(model, **values):
+    try:
+        return model(**values)
+    except ValidationError as error:
+        raise RequestValidationError(error.errors()) from error
+
+
+def _form_items(model, value, field):
+    try:
+        return TypeAdapter(list[model]).validate_json(value)
+    except ValidationError as error:
+        raise RequestValidationError(
+            [{**item, "loc": ("body", field, *item["loc"])} for item in error.errors()]
+        ) from error
 
 
 def get_service(db: AsyncSession = Depends(get_db)) -> ServiceOrderService:
@@ -176,6 +198,7 @@ async def list_service_orders(
     filial_id: uuid.UUID = Query(...),
     view: str = Query(default="active", pattern="^(active|history|all)$"),
     date: dt.date | None = Query(default=None),
+    include_drafts: bool = Query(False),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> list[ServiceOrderRead]:
@@ -191,7 +214,9 @@ async def list_service_orders(
         statuses = HISTORY_STATUSES
     else:
         statuses = None
-    return await service.list_orders(filial_id, statuses, date, technician_user_id)
+    return await service.list_orders(
+        filial_id, statuses, date, technician_user_id, include_drafts=include_drafts
+    )
 
 
 @router.get(
@@ -208,6 +233,7 @@ async def page_service_orders(
     date_to: dt.date | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(30, ge=1, le=100),
+    include_drafts: bool = Query(False),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ):
@@ -215,6 +241,7 @@ async def page_service_orders(
     return await service.page_orders(
         filial_id,
         view=view,
+        include_drafts=include_drafts,
         status=status,
         search=search,
         date_from=date_from,
@@ -296,7 +323,7 @@ async def create_service_order(
     service: ServiceOrderService = Depends(get_service),
 ) -> ServiceOrderRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_order(payload)
+    return await service.create_order(payload, created_by_user_id=current_user.user_id)
 
 
 @router.patch("/service-orders/{order_id}", response_model=ServiceOrderRead)
@@ -328,7 +355,10 @@ async def list_bays(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> list[BayRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    from app.modules.service_orders.access import has_module_access
+
+    if not await has_module_access(current_user, filial_id, service.db, "ajustes"):
+        await _ensure_list_access(current_user, filial_id, service.db)
     return await service.list_bays(filial_id)
 
 
@@ -339,7 +369,7 @@ async def create_bay(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> BayRead:
-    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    await ensure_module_access(service.db, current_user, filial_id, "ajustes", AccessLevel.EDITAR)
     return await service.create_bay(filial_id, payload)
 
 
@@ -351,7 +381,9 @@ async def update_bay(
     service: ServiceOrderService = Depends(get_service),
 ) -> BayRead:
     existing = await service.get_bay(bay_id)
-    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    await ensure_module_access(
+        service.db, current_user, existing.filial_id, "ajustes", AccessLevel.EDITAR
+    )
     return await service.update_bay(bay_id, payload)
 
 
@@ -380,6 +412,11 @@ def _task_read(task) -> TaskRead:
         created_at=task.created_at,
         timer_started_at=task.timer_started_at,
         timer_accumulated_seconds=task.timer_accumulated_seconds,
+        notes=task.notes,
+        photo_urls=task.photo_urls,
+        cancellation_reason=task.cancellation_reason,
+        pause_reason=task.pause_reason,
+        pause_history=task.pause_history,
     )
 
 
@@ -421,7 +458,7 @@ async def update_task_status(
 ) -> TaskRead:
     order = await service.get_task_order(task_id)
     await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
-    task = await service.update_task_status(task_id, payload.status)
+    task = await service.update_task_status(task_id, payload.status, payload.reason)
     return _task_read(task)
 
 
@@ -443,12 +480,13 @@ async def start_task_timer(
 @router.post("/service-order-tasks/{task_id}/timer/pause", response_model=TaskRead)
 async def pause_task_timer(
     task_id: uuid.UUID,
+    payload: TaskPauseInput = TaskPauseInput(),
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> TaskRead:
     order = await service.get_task_order(task_id)
     await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
-    task = await service.pause_task_timer(task_id)
+    task = await service.pause_task_timer(task_id, payload.reason, payload.notes)
     return _task_read(task)
 
 
@@ -648,7 +686,27 @@ async def create_upsell(
     service: ServiceOrderService = Depends(get_service),
 ) -> UpsellRead:
     order = await service.get_order(order_id)
-    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+    from app.modules.service_orders.guards import require_editable_order
+
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    order = await require_editable_order(service.db, order_id)
+
+    await ensure_module_access(
+        service.db, current_user, order.filial_id, "tecnico-servicio", AccessLevel.EDITAR
+    )
+    if order.is_draft or order.technician_user_id != current_user.user_id:
+        raise InsufficientPermissionsError()
+
+    payload = _validated_form(
+        UpsellCreate,
+        title=title,
+        description=description,
+        severity=severity,
+        detected_by_user_id=current_user.user_id,
+        tasks=_form_items(UpsellTaskInput, tasks_json, "tasks_json"),
+        parts=_form_items(UpsellPartInput, parts_json, "parts_json"),
+    )
 
     settings = get_settings()
     photo_urls = [
@@ -662,14 +720,6 @@ async def create_upsell(
         for photo in photos
     ]
 
-    payload = UpsellCreate(
-        title=title,
-        description=description,
-        severity=severity,
-        detected_by_user_id=detected_by_user_id,
-        tasks=TypeAdapter(list[UpsellTaskInput]).validate_python(json.loads(tasks_json)),
-        parts=TypeAdapter(list[UpsellPartInput]).validate_python(json.loads(parts_json)),
-    )
     return await service.create_upsell(order_id, payload, photo_urls)
 
 
@@ -944,6 +994,68 @@ async def list_warranty_claims(
     )
 
 
+async def _ensure_claim_manager(user, filial_id, db):
+    # Administracion is the permission granted to jefe de taller / gerente.
+    await ensure_module_access(db, user, filial_id, "administracion", AccessLevel.EDITAR)
+
+
+@router.get("/warranty-claims/overview")
+async def claims_overview(
+    filial_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.claims_workflow import ClaimsWorkflow
+
+    await _ensure_access(current_user, filial_id, service.db)
+    return await ClaimsWorkflow(service.db).overview(filial_id)
+
+
+@router.post("/warranty-claims/from-warranty", response_model=WarrantyClaimRead, status_code=201)
+async def claim_from_warranty(
+    vehicle_id: uuid.UUID = Form(...),
+    reported_mileage: int = Form(...),
+    symptom: str = Form(...),
+    workshop_warranty_id: uuid.UUID | None = Form(None),
+    factory_warranty_id: uuid.UUID | None = Form(None),
+    campaign: bool = Form(False),
+    photos: list[UploadFile] = File(default=[]),
+    documents: list[UploadFile] = File(default=[]),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.claims_workflow import ClaimsWorkflow
+    from app.modules.service_orders.schemas import WarrantyClaimFromWarranty
+
+    filial_id = await service.get_vehicle_filial_id(vehicle_id)
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    payload = _validated_form(
+        WarrantyClaimFromWarranty,
+        vehicle_id=vehicle_id,
+        reported_mileage=reported_mileage,
+        symptom=symptom,
+        workshop_warranty_id=workshop_warranty_id,
+        factory_warranty_id=factory_warranty_id,
+        campaign=campaign,
+    )
+    settings = get_settings()
+    saved = []
+    for files in [photos, documents]:
+        saved.append(
+            [
+                await save_upload_attachment(
+                    file,
+                    directory=Path(settings.uploads_dir),
+                    subdir="warranty-claims",
+                    url_prefix=f"{settings.api_v1_prefix}/uploads",
+                    max_mb=settings.max_upload_mb,
+                )
+                for file in files
+            ]
+        )
+    return await ClaimsWorkflow(service.db).create(payload, saved[0], saved[1], current_user)
+
+
 @router.get("/warranty-claims/{claim_id}", response_model=WarrantyClaimRead)
 async def get_warranty_claim(
     claim_id: uuid.UUID,
@@ -1089,14 +1201,401 @@ async def confirm_workshop_pickup(
 
         raise BadRequestError("El almacén debe despachar antes de confirmar el retiro.")
     if request.picked_up_at is None:
-        settings = get_settings()
-        request.pickup_photo_url = await save_upload_image(
-            photo,
-            directory=Path(settings.uploads_dir),
-            subdir="dispatch-pickups",
-            url_prefix=f"{settings.api_v1_prefix}/uploads",
-            max_mb=settings.max_upload_mb,
-        )
+        from app.core.storage import save_private_pickup
+
+        request.pickup_photo_url = await save_private_pickup(photo)
+        request.receipt_incident = None
         request.picked_up_at = dt.datetime.now(dt.UTC)
         request.picked_up_by_user_id = current_user.user_id
+        await service.db.flush()
+        await service._sync_status_from_tasks(order)
         await service.db.commit()
+
+
+@router.post("/service-orders/{order_id}/vehicle-received", response_model=ServiceOrderRead)
+async def receive_vehicle(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.guards import require_editable_order
+
+    order = await require_editable_order(service.db, order_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    if order.vehicle_received_at is None:
+        order.vehicle_received_at = dt.datetime.now(dt.UTC)
+        order.vehicle_received_by_user_id = current_user.user_id
+        await service.db.commit()
+        await service.db.refresh(order)
+    return order
+
+
+@router.patch("/service-order-tasks/{task_id}/notes", response_model=TaskRead)
+async def task_notes(
+    task_id: uuid.UUID,
+    payload: TaskNotesInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.guards import require_editable_order
+    from app.modules.service_orders.models import ServiceOrderTask
+
+    order = await service.get_task_order(task_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    await require_editable_order(service.db, order.id)
+    task = await service.db.get(ServiceOrderTask, task_id)
+    task.notes = payload.notes
+    await service.db.commit()
+    return _task_read(task)
+
+
+@router.post("/service-order-tasks/{task_id}/photos", response_model=TaskRead)
+async def task_photos(
+    task_id: uuid.UUID,
+    photos: list[UploadFile] = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.core.exceptions import BadRequestError
+    from app.modules.service_orders.guards import require_editable_order
+    from app.modules.service_orders.models import ServiceOrderTask
+
+    order = await service.get_task_order(task_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    await require_editable_order(service.db, order.id)
+    task = await service.db.get(ServiceOrderTask, task_id)
+    if len(task.photo_urls or []) + len(photos) > 10:
+        raise BadRequestError("Máximo 10 fotos por tarea.")
+    urls = list(task.photo_urls or [])
+    for photo in photos:
+        urls.append(
+            await save_upload_image(
+                photo,
+                directory=Path(get_settings().uploads_dir),
+                subdir="task-evidence",
+                url_prefix=f"{get_settings().api_v1_prefix}/uploads",
+                max_mb=get_settings().max_upload_mb,
+            )
+        )
+    task.photo_urls = urls
+    await service.db.commit()
+    return _task_read(task)
+
+
+@router.post("/service-order-transfers/{transfer_id}/not-received", response_model=TransferRead)
+async def transfer_not_received(
+    transfer_id: uuid.UUID,
+    payload: TransferNotReceivedInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.core.exceptions import ConflictError
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+    from app.modules.service_orders.guards import require_editable_order
+
+    transfer = await WorkshopDispatchService(service.db).request(transfer_id, lock=True)
+    order = await require_editable_order(service.db, transfer.service_order_id)
+    await _ensure_order_access(current_user, order, service.db, AccessLevel.EDITAR)
+    if transfer.status.value != "completado" or transfer.picked_up_at:
+        raise ConflictError(
+            "Solo puedes reportar un despacho que todavía no has recibido.",
+            error_code="receipt_incident_not_allowed",
+        )
+    incident = {
+        "reason": payload.reason,
+        "notes": payload.notes,
+        "reported_at": dt.datetime.now(dt.UTC).isoformat(),
+        "reported_by_user_id": str(current_user.user_id),
+    }
+    transfer.receipt_incident = incident
+    transfer.receipt_incident_history = [*(transfer.receipt_incident_history or []), incident]
+    await service.db.commit()
+    summary = await service.get_order_summary(order.id)
+    return next(t for t in summary.transfers if t.id == transfer_id)
+
+
+@router.get("/service-order-transfers/{transfer_id}/pickup-photo")
+async def pickup_photo(
+    transfer_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    import asyncio
+
+    from fastapi.responses import FileResponse, RedirectResponse
+
+    from app.core.exceptions import NotFoundError
+    from app.core.storage import _s3_client, private_pickup_location
+    from app.modules.service_orders.dispatch import WorkshopDispatchService
+
+    transfer = await WorkshopDispatchService(service.db).request(transfer_id)
+    order = await service.get_order(transfer.service_order_id)
+    # Almacén and this order's technician/advisor can inspect the receipt.
+    from app.modules.service_orders.access import has_module_access
+
+    if not await has_module_access(current_user, order.filial_id, service.db, "almacen"):
+        await _ensure_order_access(current_user, order, service.db)
+    if not transfer.pickup_photo_url:
+        raise NotFoundError("Esta ODT no tiene foto de retiro.")
+    kind, bucket, location = private_pickup_location(transfer.pickup_photo_url)
+    if kind == "s3":
+        url = await asyncio.to_thread(
+            _s3_client().generate_presigned_url,
+            "get_object",
+            Params={"Bucket": bucket, "Key": location},
+            ExpiresIn=300,
+        )
+        return RedirectResponse(url, headers={"Cache-Control": "no-store"})
+    if not Path(location).is_file():
+        raise NotFoundError("Archivo no disponible.")
+    return FileResponse(location, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/upsells/{upsell_id}/quote")
+async def quote_upsell(
+    upsell_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    """Current reception estimate, separate from the immutable original amount."""
+    from decimal import Decimal
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.core.exceptions import ConflictError
+    from app.modules.parts.models import Part
+    from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
+    from app.modules.post_ventas.models import Tempario
+    from app.modules.post_ventas.service import PostVentasService
+
+    finding = await service._get_upsell_model(upsell_id)
+    order = await service.get_order(finding.service_order_id)
+    await _ensure_access(current_user, order.filial_id, service.db)
+    settings = await PostVentasService(service.db).get_labor_settings(order.filial_id, commit=False)
+    labor = Decimal(0)
+    quantities = {}
+    for task in finding.tasks:
+        tempario = (
+            await service.db.execute(
+                select(Tempario)
+                .where(Tempario.id == task.tempario_id)
+                .options(selectinload(Tempario.parts))
+            )
+        ).scalar_one_or_none()
+        if tempario is None or not tempario.is_active:
+            raise ConflictError(
+                "Un servicio de la recomendación ya no está disponible.",
+                error_code="upsell_catalog_unavailable",
+            )
+        labor += Decimal(str(tempario.estimated_hours)) * Decimal(str(settings.hourly_rate))
+        for part in tempario.parts:
+            if part.part_id:
+                quantities[part.part_id] = quantities.get(part.part_id, 0) + part.quantity
+    for part in finding.parts:
+        quantities[part.part_id] = quantities.get(part.part_id, 0) + part.quantity
+    costs = Decimal(0)
+    for part_id, quantity in quantities.items():
+        part = await service.db.get(Part, part_id)
+        if part is None:
+            raise ConflictError(
+                "Un repuesto ya no está disponible.", error_code="upsell_catalog_unavailable"
+            )
+        # Same FIFO preview used by creating a recommendation; estimate is not a reservation.
+        total_cost, _allocations, _shortfall = await service._fifo_preview_cost(
+            order.filial_id, part_id, quantity
+        )
+        costs += total_cost
+    parts = costs * Decimal(str(PARTS_MULTIPLIERS[DEFAULT_DISCOUNT]))
+    subtotal = labor + parts
+    iva = subtotal * Decimal(str(settings.iva_percentage)) / 100
+    return {
+        "upsell_id": finding.id,
+        "original_amount": finding.quoted_price_snapshot,
+        "has_work": bool(finding.tasks or finding.parts),
+        "labor": round(labor, 2),
+        "parts": round(parts, 2),
+        "subtotal": round(subtotal, 2),
+        "iva": round(iva, 2),
+        "total": round(subtotal + iva, 2),
+        "estimated_at": dt.datetime.now(dt.UTC),
+        "is_estimate": True,
+    }
+
+
+@router.post("/service-order-drafts", response_model=ServiceOrderRead, status_code=201)
+async def create_order_draft(
+    payload: ServiceOrderDraftCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.drafts import DraftService
+
+    await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    return await DraftService(service.db).create(payload, current_user)
+
+
+@router.patch("/service-order-drafts/{order_id}", response_model=ServiceOrderRead)
+async def update_order_draft(
+    order_id: uuid.UUID,
+    payload: ServiceOrderDraftUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.drafts import DraftService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await DraftService(service.db).update(order_id, payload)
+
+
+@router.post("/service-order-drafts/{order_id}/submit", response_model=ServiceOrderRead)
+async def submit_order_draft(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.drafts import DraftService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await DraftService(service.db).submit(order_id, current_user)
+
+
+@router.delete("/service-order-drafts/{order_id}", status_code=204)
+async def discard_order_draft(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.drafts import DraftService
+
+    order = await service.get_order(order_id)
+    await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    await DraftService(service.db).discard(order_id)
+
+
+@router.get("/service-orders/{order_id}/inspection-records")
+async def order_inspection_records(
+    order_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.detailed_inspections.service import DetailedInspectionService
+    from app.modules.inspections.schemas import InspectionRead
+    from app.modules.inspections.service import InspectionService
+
+    order = await service.get_order(order_id)
+    await _ensure_order_access(current_user, order, service.db)
+    preliminary = await InspectionService(service.db).get_for_order(order_id)
+    detailed_service = DetailedInspectionService(service.db)
+    detailed = await detailed_service.read(await detailed_service.get(order_id), order)
+    return {
+        "service_order_id": order.id,
+        "preliminary": InspectionRead.model_validate(preliminary) if preliminary else None,
+        "detailed": detailed,
+    }
+
+
+@router.post("/warranty-claims/{claim_id}/review", response_model=WarrantyClaimRead)
+async def review_claim(
+    claim_id: uuid.UUID,
+    payload: ClaimReviewInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.claims_workflow import ClaimsWorkflow
+
+    claim = await service.get_warranty_claim(claim_id)
+    await _ensure_claim_manager(current_user, claim.filial_id, service.db)
+    return await ClaimsWorkflow(service.db).review(claim_id, payload, current_user)
+
+
+@router.post("/warranty-claims/{claim_id}/brand-response", response_model=WarrantyClaimRead)
+async def record_brand_response(
+    claim_id: uuid.UUID,
+    payload: ClaimReviewInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from app.modules.service_orders.claims_workflow import ClaimsWorkflow
+
+    claim = await service.get_warranty_claim(claim_id)
+    await _ensure_claim_manager(current_user, claim.filial_id, service.db)
+    return await ClaimsWorkflow(service.db).review(claim_id, payload, current_user, brand=True)
+
+
+@router.get("/warranty-claims/{claim_id}/installed-parts")
+async def claim_installed_parts(
+    claim_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from sqlalchemy import select
+
+    from app.modules.parts.models import Part
+    from app.modules.service_orders.models import ServiceOrderTransfer, ServiceOrderTransferLine
+
+    claim = await service.get_warranty_claim(claim_id)
+    await _ensure_access(current_user, claim.filial_id, service.db)
+    rows = (
+        await service.db.execute(
+            select(Part.id, Part.name, Part.code)
+            .join(ServiceOrderTransferLine, ServiceOrderTransferLine.part_id == Part.id)
+            .join(
+                ServiceOrderTransfer,
+                ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+            )
+            .where(
+                ServiceOrderTransfer.service_order_id == claim.service_order_id,
+                ServiceOrderTransfer.stock_deducted.is_(True),
+            )
+            .distinct()
+        )
+    ).all()
+    return [{"id": str(row.id), "name": row.name, "code": row.code} for row in rows]
+
+
+@router.post("/warranty-claims/{claim_id}/supplier-claim", response_model=WarrantyClaimRead)
+async def create_claim_to_supplier(
+    claim_id: uuid.UUID,
+    part_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ServiceOrderService = Depends(get_service),
+):
+    from sqlalchemy import select
+
+    from app.core.exceptions import ConflictError
+    from app.modules.service_orders.models import WarrantyClaim
+
+    claim = (
+        await service.db.execute(
+            select(WarrantyClaim).where(WarrantyClaim.id == claim_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if claim is None:
+        return await service.get_warranty_claim(claim_id)
+    await _ensure_claim_manager(current_user, claim.filial_id, service.db)
+    if (
+        claim.claim_type != WarrantyClaimType.COMEBACK
+        or claim.status != WarrantyClaimStatus.CONVERTIDO_A_ODS
+    ):
+        raise ConflictError("Solo se puede reclamar al proveedor desde un comeback autorizado.")
+    original = await service.get_order(claim.service_order_id)
+    await service._auto_claim_defective_part(original, claim, part_id=part_id)
+    from app.modules.administracion.models import SupplierClaim
+
+    found = (
+        await service.db.execute(
+            select(SupplierClaim.id)
+            .where(SupplierClaim.warranty_claim_id == claim.id, SupplierClaim.part_id == part_id)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if found is None:
+        raise ConflictError(
+            "No hay un lote de compra despachado para este repuesto en la ODS de origen."
+        )
+    claim.part_id = part_id
+    await service.db.commit()
+    return await service.get_warranty_claim(claim_id)
