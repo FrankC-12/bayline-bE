@@ -283,6 +283,8 @@ class TransferLineRead(BaseModel):
 
 
 class TransferRead(BaseModel):
+    closed_at: datetime | None = None
+    closed_by_user_id: uuid.UUID | None = None
     receipt_incident: dict | None = None
     receipt_incident_history: list[dict] = Field(default_factory=list)
     id: uuid.UUID

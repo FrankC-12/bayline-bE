@@ -1,4 +1,3 @@
-from app.core.storage import pickup_photo_endpoint
 import uuid
 from datetime import UTC, datetime
 
@@ -7,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.idempotency import remember_operation, replay_operation
+from app.core.storage import pickup_photo_endpoint
 from app.modules.parts.models import Part
 from app.modules.parts.service import _sync_availability
 from app.modules.warehouse.enums import MovementReason, MovementType, TransferStatus
@@ -737,6 +737,27 @@ class AlmacenService:
         )
         transfer = await self._get_transfer_model(transfer_id)
         await self.db.refresh(transfer, attribute_names=["status"])
+        if transfer.workshop_request_id:
+            from app.modules.service_orders.enums import ServiceOrderStatus
+            from app.modules.service_orders.models import ServiceOrder, ServiceOrderTransfer
+
+            parent_status = (
+                await self.db.execute(
+                    select(ServiceOrder.status)
+                    .join(
+                        ServiceOrderTransfer,
+                        ServiceOrderTransfer.service_order_id == ServiceOrder.id,
+                    )
+                    .where(ServiceOrderTransfer.id == transfer.workshop_request_id)
+                )
+            ).scalar_one_or_none()
+            if parent_status in (ServiceOrderStatus.ORDEN_CERRADA, ServiceOrderStatus.CANCELADO):
+                from app.core.exceptions import ConflictError
+
+                raise ConflictError(
+                    "La ODS de este traslado ya está cerrada o cancelada.",
+                    error_code="transfer_parent_closed",
+                )
         if transfer.workshop_request_id and new_status == TransferStatus.CANCELADA:
             from app.core.exceptions import BadRequestError
 
@@ -1163,6 +1184,8 @@ class AlmacenService:
         """Dispatched ODTs ('Marcar como Pedido' from a service order) for
         this filial — how a parts request from an ODS reaches almacén staff
         in the 'Órdenes de Transferencia' screen."""
+        from sqlalchemy import or_
+
         from app.modules.clients.models import Vehicle
         from app.modules.service_orders.enums import TransferStatus as ServiceOrderTransferStatus
         from app.modules.service_orders.models import (
@@ -1182,11 +1205,20 @@ class AlmacenService:
             .join(Vehicle, Vehicle.id == ServiceOrder.vehicle_id)
             .where(
                 ServiceOrder.filial_id == filial_id,
-                ServiceOrderTransfer.status.in_(
-                    [ServiceOrderTransferStatus.PEDIDO, ServiceOrderTransferStatus.COMPLETADO]
+                or_(
+                    ServiceOrderTransfer.closed_at.is_not(None),
+                    ServiceOrderTransfer.status.in_(
+                        [ServiceOrderTransferStatus.PEDIDO, ServiceOrderTransferStatus.COMPLETADO]
+                    ),
                 ),
             )
-            .order_by(ServiceOrderTransfer.fulfilled_at.desc())
+            .order_by(
+                func.coalesce(
+                    ServiceOrderTransfer.closed_at,
+                    ServiceOrderTransfer.fulfilled_at,
+                    ServiceOrderTransfer.created_at,
+                ).desc()
+            )
         )
 
         request_rows = rows.all()
@@ -1279,6 +1311,8 @@ class AlmacenService:
                     status=transfer.status.value,
                     fulfilled_at=transfer.fulfilled_at,
                     completed_at=transfer.completed_at,
+                    closed_at=transfer.closed_at,
+                    closed_by_user_id=transfer.closed_by_user_id,
                     warehouse_seen=transfer.warehouse_seen,
                     warehouse_id=transfer.warehouse_id,
                     warehouse_name=warehouse_names.get(transfer.warehouse_id),
@@ -1289,7 +1323,9 @@ class AlmacenService:
                     backorder_notified_at=transfer.backorder_notified_at,
                     created_at=transfer.created_at,
                     stage=(
-                        ("completado" if transfer.picked_up_at else "por_retirar")
+                        "completado"
+                        if transfer.closed_at is not None
+                        else ("completado" if transfer.picked_up_at else "por_retirar")
                         if transfer.status.value == "completado"
                         else ("en_progreso" if transfer.preparation_started_at else "pendiente")
                     ),

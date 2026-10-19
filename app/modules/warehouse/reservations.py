@@ -31,7 +31,8 @@ async def reserved_by_lot(db, part_id, *, exclude_transfer_id=None, exclude_line
         .where(
             PartLot.part_id == part_id,
             Request.stock_deducted.is_(False),
-            ServiceOrder.status != ServiceOrderStatus.CANCELADO,
+            ServiceOrder.status.notin_([ServiceOrderStatus.CANCELADO, ServiceOrderStatus.ORDEN_CERRADA]),
+            Request.closed_at.is_(None),
             or_(
                 Request.status == TransferStatus.PEDIDO,
                 and_(

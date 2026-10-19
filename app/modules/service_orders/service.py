@@ -633,7 +633,9 @@ class ServiceOrderService:
         if payload.status == ServiceOrderStatus.ORDEN_CERRADA:
             if payload.model_fields_set != {"status"}:
                 raise BadRequestError("Cerrar la orden es una operación separada de la edición.")
-            return await self.close_order(order_id)
+            return await self.close_order(
+                order_id, closed_by_user_id=current_user.user_id if current_user else None
+            )
         if payload.status == ServiceOrderStatus.CANCELADO:
             raise BadRequestError(
                 "Cancelar la orden requiere confirmar un motivo; usa la acción de cancelar."
@@ -811,7 +813,17 @@ class ServiceOrderService:
         next_maintenance_due_at: date | None = None,
         next_maintenance_tempario_id: uuid.UUID | None = None,
         exit_mileage: int | None = None,
+        *,
+        closed_by_user_id: uuid.UUID | None = None,
     ) -> ServiceOrder:
+        from app.modules.filiales.models import Filial
+        from app.modules.service_orders.closure import close_order_transfers
+
+        snapshot = await self.get_order(order_id)
+        # Match dispatch's filial-first lock order, preventing close/dispatch races.
+        await self.db.execute(
+            select(Filial.id).where(Filial.id == snapshot.filial_id).with_for_update()
+        )
         order = await require_editable_order(self.db, order_id, allow_invoiced=True)
         if order.invoiced_at is None:
             raise BadRequestError(
@@ -836,6 +848,7 @@ class ServiceOrderService:
             self._stop_timer(task)
         order.status = ServiceOrderStatus.ORDEN_CERRADA
         order.closed_at = datetime.now(UTC)
+        await close_order_transfers(self.db, order, closed_by_user_id)
         if next_maintenance_due_at is not None or next_maintenance_tempario_id is not None:
             vehicle = await self.db.get(Vehicle, order.vehicle_id)
             if vehicle is not None:
@@ -1645,7 +1658,23 @@ class ServiceOrderService:
         order = await self.get_order(service_order_id)
         if order.invoiced_at is not None or order.status == ServiceOrderStatus.ORDEN_CERRADA:
             if order.pricing_snapshot is not None:
-                return OrderSummary.model_validate(order.pricing_snapshot)
+                summary = OrderSummary.model_validate(order.pricing_snapshot)
+                # Financial snapshots stay immutable. Closure is operational
+                # metadata recorded after invoicing, so overlay only those fields.
+                closures = (
+                    await self.db.execute(
+                        select(
+                            ServiceOrderTransfer.id,
+                            ServiceOrderTransfer.closed_at,
+                            ServiceOrderTransfer.closed_by_user_id,
+                        ).where(ServiceOrderTransfer.service_order_id == order.id)
+                    )
+                ).all()
+                by_id = {key: (closed_at, actor_id) for key, closed_at, actor_id in closures}
+                for transfer in summary.transfers:
+                    if transfer.id in by_id:
+                        transfer.closed_at, transfer.closed_by_user_id = by_id[transfer.id]
+                return summary
             # Older invoices stored only the final amount. Never reconstruct their
             # breakdown using current labor/tax rates or potentially edited ODTs.
             return OrderSummary(
@@ -1667,6 +1696,8 @@ class ServiceOrderService:
                         receipt_incident_history=tr.receipt_incident_history,
                         stock_deducted=tr.stock_deducted,
                         completed_at=tr.completed_at,
+                        closed_at=tr.closed_at,
+                        closed_by_user_id=tr.closed_by_user_id,
                         fulfilled_at=tr.fulfilled_at,
                         created_at=tr.created_at,
                         subtotal=None,
@@ -1797,6 +1828,8 @@ class ServiceOrderService:
                     receipt_incident_history=tr.receipt_incident_history,
                     stock_deducted=tr.stock_deducted,
                     completed_at=tr.completed_at,
+                    closed_at=tr.closed_at,
+                    closed_by_user_id=tr.closed_by_user_id,
                     fulfilled_at=tr.fulfilled_at,
                     created_at=tr.created_at,
                 )

@@ -1,12 +1,15 @@
 """Warranty-first web claims; mobile's existing contract remains supported."""
 
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TypedDict
 
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
-from app.core.venezuela_time import VENEZUELA_TZ, caracas_date, venezuela_today
+from app.core.venezuela_time import VENEZUELA_TZ, venezuela_today
 from app.modules.post_ventas.models import VehicleWarranty, WorkshopWarranty
 from app.modules.service_orders.enums import (
     ServiceOrderStatus,
@@ -25,8 +28,16 @@ from app.modules.service_orders.schemas import WarrantyClaimConvertInput, Warran
 from app.modules.service_orders.service import ServiceOrderService
 
 
+class ClaimsOverview(TypedDict):
+    pending: int
+    monthly_cost: float
+    monthly_reworks: int
+    monthly_closed: int
+    comeback_rate: float
+
+
 class ClaimsWorkflow:
-    def __init__(self, db):
+    def __init__(self, db: AsyncSession):
         self.db = db
         self.service = ServiceOrderService(db)
 
@@ -173,24 +184,38 @@ class ClaimsWorkflow:
         await self.db.commit()
         return await self.service.get_warranty_claim(claim.id)
 
-    async def overview(self, filial_id):
-        today = venezuela_today()
-        start = today.replace(day=1)
-        claims = list(
-            (
-                await self.db.execute(
-                    select(WarrantyClaim).where(WarrantyClaim.filial_id == filial_id)
+    async def overview(self, filial_id: uuid.UUID) -> ClaimsOverview:
+        """Aggregate dashboard data without loading the entire claim history.
+
+        The query count stays constant as the number of reworks grows. Parts
+        and labor are aggregated separately to avoid multiplying their totals
+        when an order has several tasks and several transfer lines.
+        """
+        month_start = datetime.combine(
+            venezuela_today().replace(day=1), datetime.min.time(), tzinfo=VENEZUELA_TZ
+        ).astimezone(UTC)
+        pending = (
+            await self.db.execute(
+                select(func.count())
+                .select_from(WarrantyClaim)
+                .where(
+                    WarrantyClaim.filial_id == filial_id,
+                    WarrantyClaim.status == WarrantyClaimStatus.SOLICITADO,
                 )
-            ).scalars()
-        )
-        reworks = [
-            c
-            for c in claims
-            if c.claim_type == WarrantyClaimType.COMEBACK
-            and c.resulting_service_order_id
-            and c.converted_at
-            and caracas_date(c.converted_at) >= start
-        ]
+            )
+        ).scalar_one()
+        reworks = (
+            await self.db.execute(
+                select(ServiceOrder.id, ServiceOrder.settings_snapshot)
+                .join(WarrantyClaim, WarrantyClaim.resulting_service_order_id == ServiceOrder.id)
+                .where(
+                    WarrantyClaim.filial_id == filial_id,
+                    ServiceOrder.filial_id == filial_id,
+                    WarrantyClaim.claim_type == WarrantyClaimType.COMEBACK,
+                    WarrantyClaim.converted_at >= month_start,
+                )
+            )
+        ).all()
         closed = (
             await self.db.execute(
                 select(func.count())
@@ -198,41 +223,56 @@ class ClaimsWorkflow:
                 .where(
                     ServiceOrder.filial_id == filial_id,
                     ServiceOrder.status == ServiceOrderStatus.ORDEN_CERRADA,
-                    ServiceOrder.closed_at
-                    >= datetime.combine(start, datetime.min.time(), tzinfo=VENEZUELA_TZ),
+                    ServiceOrder.closed_at >= month_start,
                 )
             )
-        ).scalar() or 0
+        ).scalar_one()
         cost = Decimal(0)
-        for claim in reworks:
-            order = await self.db.get(ServiceOrder, claim.resulting_service_order_id)
-            lines = (
-                await self.db.execute(
-                    select(ServiceOrderTransferLine)
-                    .join(
-                        ServiceOrderTransfer,
-                        ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+        if reworks:
+            order_ids = {order_id for order_id, _settings in reworks}
+            parts_by_order = dict(
+                (
+                    await self.db.execute(
+                        select(
+                            ServiceOrderTransfer.service_order_id,
+                            func.sum(ServiceOrderTransferLine.cost_total),
+                        )
+                        .join(
+                            ServiceOrderTransferLine,
+                            ServiceOrderTransferLine.transfer_id == ServiceOrderTransfer.id,
+                        )
+                        .where(
+                            ServiceOrderTransfer.service_order_id.in_(order_ids),
+                            ServiceOrderTransfer.stock_deducted.is_(True),
+                        )
+                        .group_by(ServiceOrderTransfer.service_order_id)
                     )
-                    .where(
-                        ServiceOrderTransfer.service_order_id == order.id,
-                        ServiceOrderTransfer.stock_deducted.is_(True),
+                ).all()
+            )
+            hours_by_order = dict(
+                (
+                    await self.db.execute(
+                        select(
+                            ServiceOrderTask.service_order_id,
+                            func.sum(ServiceOrderTask.hours_snapshot),
+                        )
+                        .where(
+                            ServiceOrderTask.service_order_id.in_(order_ids),
+                            ServiceOrderTask.status == TaskStatus.COMPLETADA,
+                        )
+                        .group_by(ServiceOrderTask.service_order_id)
                     )
-                )
-            ).scalars()
-            cost += sum((Decimal(str(line.cost_total)) for line in lines), Decimal(0))
-            # Only completed work is a cost; use the ODS rate snapshot, never the live catalog or retail margin.
-            tasks = (
-                await self.db.execute(
-                    select(ServiceOrderTask).where(
-                        ServiceOrderTask.service_order_id == order.id,
-                        ServiceOrderTask.status == TaskStatus.COMPLETADA,
-                    )
-                )
-            ).scalars()
-            rate = Decimal(str((order.settings_snapshot or {}).get("hourly_rate", 0)))
-            cost += sum((Decimal(str(t.hours_snapshot)) * rate for t in tasks), Decimal(0))
+                ).all()
+            )
+            for order_id, settings in reworks:
+                # Preserve the ODS rate snapshot; neither the live catalog nor
+                # the customer's retail margin changes historical direct costs.
+                parts_cost = Decimal(str(parts_by_order.get(order_id) or 0))
+                completed_hours = Decimal(str(hours_by_order.get(order_id) or 0))
+                rate = Decimal(str((settings or {}).get("hourly_rate", 0)))
+                cost += parts_cost + completed_hours * rate
         return {
-            "pending": sum(c.status == WarrantyClaimStatus.SOLICITADO for c in claims),
+            "pending": pending,
             "monthly_cost": float(cost),
             "monthly_reworks": len(reworks),
             "monthly_closed": closed,

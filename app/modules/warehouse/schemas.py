@@ -129,6 +129,8 @@ class ServiceOrderPartRequestRead(BaseModel):
     to the 'Órdenes de Transferencia' screen. `warehouse_seen` drives the
     unseen-count badge on that screen's nav item."""
 
+    closed_at: datetime | None = None
+    closed_by_user_id: uuid.UUID | None = None
     id: uuid.UUID
     code: str
     service_order_id: uuid.UUID

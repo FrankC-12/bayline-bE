@@ -914,6 +914,7 @@ async def close_service_order(
         payload.next_maintenance_due_at,
         payload.next_maintenance_tempario_id,
         exit_mileage=payload.exit_mileage,
+        closed_by_user_id=current_user.user_id,
     )
 
 

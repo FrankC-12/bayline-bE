@@ -125,3 +125,14 @@ El técnico solo modifica sus órdenes asignadas. Se rechazan cambios a órdenes
 ## 18. Fechas del portal
 
 Fechas `YYYY-MM-DD` se formatean como calendario con `formatEntryDate`, sin parsearlas como medianoche UTC. Se corrigieron los reclamos, sus vencimientos, garantías de fábrica, mantenimiento y la fecha de kilometraje de la ficha del vehículo. Los timestamps completos mantienen su conversión a la zona de Caracas.
+
+## Cierre automático de ODT al entregar la ODS
+
+Desde la revisión `d5e820b91c43`, cerrar/registrar entrega de una ODS cierra también todas sus ODT, en la misma transacción. El backend registra `closed_at` y `closed_by_user_id` en cada ODT. La fecha y el usuario se incluyen en el resumen de la ODS y en las solicitudes de Almacén.
+
+- `closed_at != null` identifica una ODT cerrada. La app debe detener su contador y deshabilitar acciones operativas; el backend también las rechaza.
+- Se mantienen los valores existentes de `status` para conservar compatibilidad y la evidencia del proceso físico. Cerrar no significa despachar ni retirar: `stock_deducted`, `completed_at`, `picked_up_at` y las fotografías conservan sus datos reales.
+- En la bandeja de Almacén una solicitud cerrada pasa al historial (`stage=completado`) y deja de contar como pendiente, aunque no hubiese sido despachada. La web muestra **Cerrada**.
+- Se liberan las reservas de stock no consumido y se cancelan los traslados vinculados que todavía no se habían recibido. No se crean salidas de inventario por el cierre.
+- La migración corrige también las ODT de ODS ya cerradas. No atribuye un usuario histórico que no estuviera registrado.
+- La instantánea de precios/factura permanece intacta; el resumen añade los metadatos operativos de cierre al consultar.

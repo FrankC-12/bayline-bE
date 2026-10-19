@@ -154,6 +154,8 @@ async def test_invoice_snapshot_survives_settings_and_catalog_changes(order_inve
 
     billing, accounts, _ = configure_billing(service, session, order, igtf=0)
     await billing.issue(order.id, await invoice_payload(billing, order, accounts), None)
+    import copy
+    invoice_snapshot = copy.deepcopy(order.pricing_snapshot)
     closed = await service.close_order(order.id)
     before = (await service.get_order_summary(order.id)).model_dump(mode="json")
     assert before["pricing_frozen"] is True
@@ -167,7 +169,7 @@ async def test_invoice_snapshot_survives_settings_and_catalog_changes(order_inve
     session.expire_all()
     after = (await service.get_order_summary(order.id)).model_dump(mode="json")
     assert before == after
-    assert (await service.get_order(order.id)).pricing_snapshot == before
+    assert (await service.get_order(order.id)).pricing_snapshot == invoice_snapshot
     with pytest.raises(ServiceOrderReadOnlyError):
         await service._get_or_create_pending_transfer(order.id)
     with pytest.raises(ServiceOrderReadOnlyError):
