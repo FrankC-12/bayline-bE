@@ -50,6 +50,14 @@ Se mantiene la política actual: el estado de trabajo de la ODS se deriva de las
 
 Una ODT pendiente que queda sin líneas se conserva internamente, pero se excluye de los listados y del resumen y no cuenta como pendiente. No se eliminan despachos ni se cambian existencias para ocultar la ODT.
 
+Flujo de estados compartido entre web y app:
+
+1. El técnico termina o cancela las tareas. `completado` significa **trabajo finalizado**, no entrega del vehículo. Las ODT conservan su proceso de preparación/retiro.
+2. El asesor gestiona la facturación y el cobro desde el portal. La entrega no exige usar la app.
+3. Registrar entrega llama a `POST /service-orders/{id}/close`. La ODS pasa a `orden_cerrada`, sus ODT reciben `closed_at` y se limpia `completed_with_pending_items`.
+
+Mientras la ODS siga editable, agregar o reabrir tareas recalcula su estado y limpia `completed_at` si vuelve a haber trabajo pendiente. Eliminar una tarea recalcula usando solamente las tareas restantes. Las órdenes facturadas o terminales mantienen sus restricciones de edición.
+
 ## 9–11. Técnico, inicio de tarea e incidencias de retiro
 
 - `GET /bays?filial_id=...` permite lectura al técnico de su filial. No autoriza crear o editar bahías.

@@ -925,7 +925,7 @@ async def force_complete_service_order(
     service: ServiceOrderService = Depends(get_service),
 ) -> ServiceOrderRead:
     """Manual override — normally the order completes on its own once every
-    task is done and every ODT dispatched (see ServiceOrderService._sync_status_from_tasks).
+    task is completed or cancelled (see ServiceOrderService._sync_status_from_tasks).
     This forces it anyway with something still pending."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)

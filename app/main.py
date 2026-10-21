@@ -14,6 +14,7 @@ from app.core.config import get_settings
 from app.core.telemetry import router as telemetry_router
 from app.core.database import AsyncSessionLocal
 from app.core.http_security import HttpSecurityMiddleware
+from app.core.rate_limiting import RateLimitMiddleware
 from app.core.request_tracking import RequestTrackingMiddleware
 from app.core.exception_handlers import register_exception_handlers
 from app.modules.notifications.router import router as notifications_router
@@ -85,13 +86,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
 
 app.add_middleware(HttpSecurityMiddleware)

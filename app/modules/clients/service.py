@@ -3,7 +3,7 @@ import re
 import uuid
 from datetime import UTC, date, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -157,6 +157,8 @@ class ClientService:
         await self.attach_vehicle_mileage([v for c in clients for v in c.vehicles])
 
     async def attach_vehicle_mileage(self, vehicles: list[Vehicle]) -> None:
+        if not vehicles:
+            return
         vehicle_ids = [v.id for v in vehicles]
         latest = await self._latest_mileage_inspections(vehicle_ids)
 
@@ -181,6 +183,22 @@ class ClientService:
         def utc(value):
             return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
+        ranked_departures = (
+            select(
+                ServiceOrder.id,
+                func.row_number().over(
+                    partition_by=ServiceOrder.vehicle_id,
+                    order_by=(ServiceOrder.closed_at.desc(), ServiceOrder.id),
+                ).label("position"),
+            )
+            .where(
+                ServiceOrder.vehicle_id.in_(vehicle_ids),
+                ServiceOrder.status == ServiceOrderStatus.ORDEN_CERRADA,
+                ServiceOrder.exit_mileage.is_not(None),
+                ServiceOrder.closed_at.is_not(None),
+            )
+            .subquery()
+        )
         closed_rows = (
             await self.db.execute(
                 select(
@@ -190,12 +208,8 @@ class ClientService:
                     ServiceOrder.closed_at,
                     ServiceOrder.sequence_number,
                 )
-                .where(
-                    ServiceOrder.vehicle_id.in_(vehicle_ids),
-                    ServiceOrder.status == ServiceOrderStatus.ORDEN_CERRADA,
-                    ServiceOrder.exit_mileage.is_not(None),
-                )
-                .order_by(ServiceOrder.closed_at.desc(), ServiceOrder.id)
+                .join(ranked_departures, ranked_departures.c.id == ServiceOrder.id)
+                .where(ranked_departures.c.position == 1)
             )
         ).all()
         closed_by_vehicle = {}
@@ -268,13 +282,24 @@ class ClientService:
     ) -> dict[uuid.UUID, PreliminaryInspection]:
         if not vehicle_ids:
             return {}
-        query = (
-            select(PreliminaryInspection)
+        ranked = (
+            select(
+                PreliminaryInspection.id,
+                func.row_number().over(
+                    partition_by=PreliminaryInspection.vehicle_id,
+                    order_by=(PreliminaryInspection.created_at.desc(), PreliminaryInspection.id),
+                ).label("position"),
+            )
             .where(
                 PreliminaryInspection.vehicle_id.in_(vehicle_ids),
                 PreliminaryInspection.mileage.isnot(None),
             )
-            .order_by(PreliminaryInspection.vehicle_id, PreliminaryInspection.created_at.desc())
+            .subquery()
+        )
+        query = (
+            select(PreliminaryInspection)
+            .join(ranked, ranked.c.id == PreliminaryInspection.id)
+            .where(ranked.c.position == 1)
         )
         result = await self.db.execute(query)
         latest: dict[uuid.UUID, PreliminaryInspection] = {}

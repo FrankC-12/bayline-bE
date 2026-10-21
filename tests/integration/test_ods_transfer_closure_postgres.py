@@ -36,7 +36,8 @@ async def test_delivery_api_closes_requests_and_pending_relocations_without_movi
         key = request.id
         await WorkshopDispatchService(db).submit(key, actor.user_id)
         assert await reserved_by_lot(db, part_id)
-        await service.force_complete_order(ctx.order_id, actor)
+        completed = await service.force_complete_order(ctx.order_id, actor)
+        assert completed.completed_with_pending_items is True
     payload = await invoice_input(ctx)
     async with ctx.sessions() as db:
         await BillingService(db).issue(ctx.order_id, payload, actor.user_id)
@@ -67,6 +68,7 @@ async def test_delivery_api_closes_requests_and_pending_relocations_without_movi
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
         response = await http.post(f"/api/v1/service-orders/{ctx.order_id}/close")
         assert response.status_code == 200, response.text
+        assert response.json()["completed_with_pending_items"] is False
         closed_at = response.json()["closed_at"]
         summary = await http.get(f"/api/v1/service-orders/{ctx.order_id}/summary")
         assert summary.status_code == 200, summary.text

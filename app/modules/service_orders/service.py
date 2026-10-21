@@ -748,7 +748,8 @@ class ServiceOrderService:
     ) -> ServiceOrder:
         """The one manual override left for completion — normally
         _sync_status_from_tasks completes an order on its own once every
-        task's done and every ODT dispatched. This lets an asesor complete
+        task is completed or cancelled, independently of dispatch/pickup.
+        This lets an asesor complete
         it anyway with something still pending (e.g. a part backordered
         indefinitely), recording who did it and leaving a visible flag on
         the order (completed_with_pending_items)."""
@@ -762,19 +763,16 @@ class ServiceOrderService:
             raise InvalidStatusTransitionError(
                 order.status.value, ServiceOrderStatus.COMPLETADO.value
             )
+        tasks = await self.list_tasks(order_id)
         pending_tasks = [
-            t
-            for t in await self.list_tasks(order_id)
-            if t.status not in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA)
+            t for t in tasks if t.status not in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA)
         ]
-        pending_transfers = [
-            t for t in await self.list_transfers(order_id) if t.picked_up_at is None
-        ]
+        pending_transfers = await self._has_pending_transfer_pickup(order_id)
         order.status = ServiceOrderStatus.COMPLETADO
         await queue_order_event(
             self.db, order, "orden_lista", f"{order.id}:{datetime.now(UTC).isoformat()}"
         )
-        for task in await self.list_tasks(order.id):
+        for task in tasks:
             self._stop_timer(task)
         order.completed_at = datetime.now(UTC)
         order.completed_with_pending_items = bool(pending_tasks or pending_transfers)
@@ -849,6 +847,10 @@ class ServiceOrderService:
         order.status = ServiceOrderStatus.ORDEN_CERRADA
         order.closed_at = datetime.now(UTC)
         await close_order_transfers(self.db, order, closed_by_user_id)
+        # Delivery administratively resolves outstanding requests. Keep the
+        # override audit and physical fulfillment evidence, but do not expose
+        # an actionable pending-work flag on a terminal order.
+        order.completed_with_pending_items = False
         if next_maintenance_due_at is not None or next_maintenance_tempario_id is not None:
             vehicle = await self.db.get(Vehicle, order.vehicle_id)
             if vehicle is not None:
@@ -1030,10 +1032,12 @@ class ServiceOrderService:
             target = ServiceOrderStatus.EN_PROGRESO
 
         if target == ServiceOrderStatus.COMPLETADO:
-            transfers = await self.list_transfers(order.id)
-            order.completed_with_pending_items = any(t.picked_up_at is None for t in transfers)
+            order.completed_with_pending_items = await self._has_pending_transfer_pickup(order.id)
         else:
             order.completed_with_pending_items = False
+            # This timestamp describes the current completion, not a previous
+            # cycle before tasks were added, reopened or removed.
+            order.completed_at = None
         if target == order.status:
             return
         if target == ServiceOrderStatus.COMPLETADO:
@@ -1327,10 +1331,35 @@ class ServiceOrderService:
                 )
             )
         await self.db.delete(task)
+        # Sessions disable autoflush. Exclude the deleted row from the task
+        # query before deriving the parent state, within the same transaction.
+        await self.db.flush()
         await self._sync_status_from_tasks(order)
         await self.db.commit()
 
     # Transfers (Órdenes de Transferencia / ODT)
+
+    async def _has_pending_transfer_pickup(self, service_order_id: uuid.UUID) -> bool:
+        """Check actionable requests without loading lines or FIFO allocations.
+
+        Empty ODT containers do not represent pending parts. Flush local edits
+        so a pickup or line removal in this transaction is visible to SQL.
+        """
+        await self.db.flush()
+        return (
+            await self.db.execute(
+                select(ServiceOrderTransferLine.id)
+                .join(
+                    ServiceOrderTransfer,
+                    ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+                )
+                .where(
+                    ServiceOrderTransfer.service_order_id == service_order_id,
+                    ServiceOrderTransfer.picked_up_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none() is not None
 
     async def list_transfers(self, service_order_id: uuid.UUID) -> list[ServiceOrderTransfer]:
         result = await self.db.execute(

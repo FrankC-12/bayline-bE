@@ -64,6 +64,7 @@ async def test_delivery_closes_all_odts_without_consuming_stock_and_keeps_receip
     )
     session.add_all([relocation, historical])
     order.status = ServiceOrderStatus.COMPLETADO
+    order.completed_with_pending_items = True
     session.commit()
     await billing.issue(order.id, await invoice_payload(billing, order, accounts), None)
     stock_before = list(session.execute(select(PartLot.id, PartLot.quantity_remaining)).all())
@@ -71,6 +72,7 @@ async def test_delivery_closes_all_odts_without_consuming_stock_and_keeps_receip
     actor = uuid.uuid4()
     closed = await service.close_order(order.id, closed_by_user_id=actor)
     assert closed.status == ServiceOrderStatus.ORDEN_CERRADA
+    assert closed.completed_with_pending_items is False
     for request in [pending, waiting, received, empty]:
         assert request.closed_at.replace(tzinfo=None) == closed.closed_at.replace(tzinfo=None)
         assert request.closed_by_user_id == actor
@@ -100,7 +102,10 @@ async def test_delivery_closes_all_odts_without_consuming_stock_and_keeps_receip
 async def test_rejected_delivery_does_not_close_child_requests(order_inventory):
     service, session, order, part_id, _ = order_inventory
     request = await service.add_transfer_line(order.id, part_id, 1)
+    order.completed_with_pending_items = True
+    session.commit()
     with pytest.raises(BadRequestError):
         await service.close_order(order.id)
     assert session.get(ServiceOrderTransfer, request.id).closed_at is None
     assert order.status != ServiceOrderStatus.ORDEN_CERRADA
+    assert order.completed_with_pending_items is True

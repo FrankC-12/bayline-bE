@@ -2,7 +2,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -15,6 +15,15 @@ class Settings(BaseSettings):
     app_env: Literal["development", "test", "staging", "production"] = "development"
     debug: bool = True
     api_v1_prefix: str = "/api/v1"
+
+    rate_limit_enabled: bool = True
+    rate_limit_ip_per_minute: int = Field(default=1200, ge=1, le=100000)
+    rate_limit_user_per_minute: int = Field(default=300, ge=1, le=100000)
+    rate_limit_anonymous_per_minute: int = Field(default=120, ge=1, le=100000)
+    rate_limit_read_per_minute: int = Field(default=120, ge=1, le=100000)
+    rate_limit_write_per_minute: int = Field(default=60, ge=1, le=100000)
+    rate_limit_expensive_per_minute: int = Field(default=20, ge=1, le=100000)
+    rate_limit_auth_per_minute: int = Field(default=30, ge=1, le=100000)
 
     allowed_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
