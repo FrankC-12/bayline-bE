@@ -10,9 +10,18 @@ post_ventas.service, only the access-control boundary moves here.
 import uuid
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.modules.ajustes.bulk import (
+    EXAMPLES,
+    HEADERS,
+    BulkInput,
+    CatalogBulkService,
+    CatalogKind,
+    template_csv,
+)
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.post_ventas.schemas import LaborSettingsRead, LaborSettingsUpdate, SettingsPatch
@@ -23,6 +32,90 @@ from app.modules.roles.permissions import ensure_module_access
 MODULE_ID = "ajustes"
 
 router = APIRouter(tags=["Ajustes"])
+
+
+@router.get("/settings/bulk/templates")
+async def bulk_templates(
+    filial_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_access(current_user, filial_id, db)
+    from typing import get_args
+
+    from app.modules.post_ventas.enums import TemparioCategory
+    from app.modules.vehicle_catalog.schemas import VehicleBodyType
+
+    return [
+        {
+            "kind": kind,
+            "columns": HEADERS[kind],
+            "example": EXAMPLES[kind],
+            "options": {
+                "activo": ["si", "no"],
+                **(
+                    {"tipo_vehiculo": list(get_args(VehicleBodyType))}
+                    if kind == CatalogKind.MODELS
+                    else {}
+                ),
+                **(
+                    {
+                        "categoria": [category.value for category in TemparioCategory],
+                        "garantia": ["standard", "custom", "none"],
+                    }
+                    if kind == CatalogKind.SERVICES
+                    else {}
+                ),
+            },
+        }
+        for kind in CatalogKind
+    ]
+
+
+@router.get("/settings/bulk/templates/{kind}")
+async def download_bulk_template(
+    kind: CatalogKind,
+    filial_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_access(current_user, filial_id, db)
+    return Response(
+        template_csv(kind).encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="plantilla-{kind}.csv"'},
+    )
+
+
+@router.post("/settings/bulk/{kind}/preview")
+async def preview_catalog_bulk(
+    kind: CatalogKind,
+    filial_id: uuid.UUID,
+    payload: BulkInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_access(current_user, filial_id, db, AccessLevel.EDITAR)
+    return await CatalogBulkService(db).prepare(kind, filial_id, current_user.user_id, payload.rows)
+
+
+@router.post("/settings/bulk/{kind}/import")
+async def import_catalog_bulk(
+    kind: CatalogKind,
+    filial_id: uuid.UUID,
+    payload: BulkInput,
+    current_user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _ensure_access(current_user, filial_id, db, AccessLevel.EDITAR)
+    return await CatalogBulkService(db).prepare(
+        kind,
+        filial_id,
+        current_user.user_id,
+        payload.rows,
+        commit=True,
+        review_hash=payload.review_hash,
+    )
 
 
 def get_service(db: AsyncSession = Depends(get_db)) -> PostVentasService:
@@ -99,7 +192,9 @@ async def patch_settings(
         if "workshop_warranty_km" in payload.model_fields_set
         else settings.workshop_warranty_km
     )
-    if {"workshop_warranty_days","workshop_warranty_km"}.intersection(payload.model_fields_set) and not (warranty_days > 0 or warranty_km > 0):
+    if {"workshop_warranty_days", "workshop_warranty_km"}.intersection(
+        payload.model_fields_set
+    ) and not (warranty_days > 0 or warranty_km > 0):
         raise BadRequestError("La garantía estándar necesita días o kilómetros de cobertura.")
     user = await service.db.get(User, current_user.user_id)
     changes = dict(settings.field_changes or {})

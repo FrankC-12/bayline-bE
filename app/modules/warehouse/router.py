@@ -150,7 +150,10 @@ async def list_lots(
 ) -> list[PartLotRead]:
     await _ensure_access(current_user, filial_id, service.db)
     lots = await service.list_lots(filial_id, part_id, warehouse_id, search)
-    return [_lot_to_read(lot) for lot in lots]
+    states = await service.lot_fifo_states(filial_id, {lot.part_id for lot in lots})
+    return [
+        _lot_to_read(lot).model_copy(update={"fifo_status": states.get(lot.id)}) for lot in lots
+    ]
 
 
 @router.get("/almacen/lots/{lot_id}", response_model=PartLotDetailRead)

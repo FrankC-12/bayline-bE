@@ -1055,6 +1055,7 @@ class ServiceOrderService:
         *,
         transfer: ServiceOrderTransfer | None = None,
         commit: bool = True,
+        expected_total: float | None = None,
     ) -> ServiceOrderTask:
         order = await require_editable_order(self.db, service_order_id)
         if order.is_draft and not order.vehicle_id:
@@ -1070,6 +1071,11 @@ class ServiceOrderService:
             raise BadRequestError("El tempario debe pertenecer a la filial de la orden.")
         if not tempario.is_active:
             raise BadRequestError("El tempario está inactivo.")
+        if any(not part.part_id for part in tempario.parts):
+            raise ConflictError(
+                "Vincula todos los repuestos del tempario al catálogo antes de agregarlo a la ODS.",
+                error_code="tempario_parts_unlinked",
+            )
         warranty_snapshot = {}
         from app.modules.ajustes.snapshots import order_settings
 
@@ -1141,17 +1147,54 @@ class ServiceOrderService:
         linked_parts = [p for p in tempario.parts if p.part_id is not None]
         if linked_parts:
             transfer = transfer or await self._get_or_create_pending_transfer(service_order_id)
+            grouped = {}
             for tp in linked_parts:
-                part = await self.db.get(Part, tp.part_id)
+                estimate, quantity = grouped.get(tp.part_id, (Decimal(0), 0))
+                grouped[tp.part_id] = (
+                    estimate + Decimal(str(tp.unit_cost)) * tp.quantity,
+                    quantity + tp.quantity,
+                )
+            for part_id, (estimate, quantity) in grouped.items():
+                part = await self.db.get(Part, part_id)
                 if part is not None:
                     warning = await self._add_line_to_transfer(
-                        transfer, part.id, tp.quantity, payer=payer, service_order_task_id=task.id
+                        transfer,
+                        part.id,
+                        quantity,
+                        payer=payer,
+                        service_order_task_id=task.id,
+                        fallback_unit_cost=estimate / quantity,
                     )
                     if warning:
                         warnings.append(warning)
 
         await self.db.flush()
         await self._sync_status_from_tasks(order)
+        if expected_total is not None:
+            from decimal import ROUND_HALF_UP
+
+            prices = (
+                await self.db.execute(
+                    select(ServiceOrderTransferLine.line_total).where(
+                        ServiceOrderTransferLine.service_order_task_id == task.id
+                    )
+                )
+            ).scalars()
+            subtotal = sum((Decimal(str(value)) for value in prices), Decimal(0))
+            subtotal += (
+                Decimal(str(task.hours_snapshot)) * Decimal(str(defaults.hourly_rate))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            quoted_total = subtotal + (
+                subtotal * Decimal(str(defaults.iva_percentage)) / 100
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if quoted_total != Decimal(str(expected_total)).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            ):
+                await self.db.rollback()
+                raise ConflictError(
+                    "El precio del servicio cambió. Revisa la cotización antes de agregarlo.",
+                    error_code="task_quote_changed",
+                )
         if commit:
             await self.db.commit()
             await self.db.refresh(task)
@@ -1248,6 +1291,9 @@ class ServiceOrderService:
             raise ConflictError("La tarea ya está finalizada.", error_code="task_finished")
         await self._require_task_parts_received(task)
         task.timer_started_at = datetime.now(UTC)
+        task.status = TaskStatus.EN_PROGRESO
+        await self.db.flush()
+        await self._sync_status_from_tasks(order)
         await self.db.commit()
         await self.db.refresh(task)
         return task
@@ -1525,6 +1571,7 @@ class ServiceOrderService:
         quantity: int,
         payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE,
         service_order_task_id: uuid.UUID | None = None,
+        fallback_unit_cost: Decimal | None = None,
     ) -> str | None:
         """Adds (or tops up) a line on the ODT. Never blocked by stock — a
         client may bring their own part, or the shop may request it from
@@ -1566,6 +1613,7 @@ class ServiceOrderService:
             part_id,
             new_quantity,
             exclude_line_id=existing.id if existing else None,
+            fallback_unit_cost=fallback_unit_cost,
         )
 
         warning: str | None = None
@@ -1623,6 +1671,7 @@ class ServiceOrderService:
         part_id: uuid.UUID,
         quantity: int,
         exclude_line_id: uuid.UUID | None = None,
+        fallback_unit_cost: Decimal | None = None,
     ) -> tuple[Decimal, list[tuple[_AvailableLot, int]], int]:
         """Total cost FIFO would actually charge for this quantity — oldest
         lots first, filial-wide, weighted across every lot it spans, net of
@@ -1660,15 +1709,21 @@ class ServiceOrderService:
         allocations, shortfall = allocate_fifo_preview(available_lots, quantity)
         cost = sum((Decimal(str(lot.unit_cost)) * take for lot, take in allocations), Decimal(0))
         if shortfall > 0:
+            if fallback_unit_cost is None and exclude_line_id is not None:
+                previous = await self.db.get(ServiceOrderTransferLine, exclude_line_id)
+                if previous is not None and previous.quantity:
+                    fallback_unit_cost = Decimal(str(previous.cost_total)) / previous.quantity
             fallback_cost = (
                 allocations[-1][0].unit_cost
                 if allocations
-                else await self._last_known_unit_cost(part_id)
+                else await self._last_known_unit_cost(
+                    part_id, fallback=fallback_unit_cost or Decimal(0)
+                )
             )
             cost += Decimal(str(fallback_cost)) * shortfall
         return cost, allocations, shortfall
 
-    async def _last_known_unit_cost(self, part_id: uuid.UUID) -> Decimal:
+    async def _last_known_unit_cost(self, part_id: uuid.UUID, *, fallback=Decimal(0)) -> Decimal:
         """The most recent cost this part was ever received at, regardless of
         whether that lot still has stock remaining — used only to price the
         shortfall portion of an add-time preview, never to block it."""
@@ -1679,7 +1734,7 @@ class ServiceOrderService:
             .limit(1)
         )
         cost = result.scalar_one_or_none()
-        return Decimal(str(cost)) if cost is not None else Decimal(0)
+        return Decimal(str(cost)) if cost is not None else fallback
 
     # Pricing summary
 
@@ -1768,33 +1823,48 @@ class ServiceOrderService:
         from app.modules.ajustes.snapshots import order_settings
 
         settings = order_settings(order, settings)
-        hourly_rate = float(settings.hourly_rate) if settings else 25.0
-        iva_percentage = float(settings.iva_percentage) if settings else 16.0
+        hourly_rate = Decimal(str(settings.hourly_rate)) if settings else Decimal("25")
+        iva_percentage = Decimal(str(settings.iva_percentage)) if settings else Decimal("16")
+        from decimal import ROUND_HALF_UP
+
+        def money(value):
+            return Decimal(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
         all_lines = [line for tr in transfers for line in tr.lines]
 
-        labor_subtotal = (
-            sum(float(t.hours_snapshot) for t in tasks if t.payer == ServiceOrderPayer.CLIENTE)
-            * hourly_rate
-        )
-        non_client_labor = (
-            sum(float(t.hours_snapshot) for t in tasks if t.payer != ServiceOrderPayer.CLIENTE)
-            * hourly_rate
-        )
-        parts_subtotal = sum(
-            float(line.line_total) for line in all_lines if line.payer == ServiceOrderPayer.CLIENTE
+        labor_by_payer = dict.fromkeys(ServiceOrderPayer, Decimal(0))
+        parts_by_payer = dict.fromkeys(ServiceOrderPayer, Decimal(0))
+        for task in tasks:
+            if task.status != TaskStatus.CANCELADA:
+                labor_by_payer[task.payer] += money(Decimal(str(task.hours_snapshot)) * hourly_rate)
+        for line in all_lines:
+            parts_by_payer[line.payer] += Decimal(str(line.line_total))
+        labor_subtotal = labor_by_payer[ServiceOrderPayer.CLIENTE]
+        parts_subtotal = parts_by_payer[ServiceOrderPayer.CLIENTE]
+        non_client_labor = sum(
+            (
+                amount
+                for payer, amount in labor_by_payer.items()
+                if payer != ServiceOrderPayer.CLIENTE
+            ),
+            Decimal(0),
         )
         non_client_parts = sum(
-            float(line.line_total) for line in all_lines if line.payer != ServiceOrderPayer.CLIENTE
+            (
+                amount
+                for payer, amount in parts_by_payer.items()
+                if payer != ServiceOrderPayer.CLIENTE
+            ),
+            Decimal(0),
         )
         non_client_subtotal = non_client_labor + non_client_parts
-        iva_amount = (labor_subtotal + parts_subtotal) * iva_percentage / 100
+        iva_amount = money((labor_subtotal + parts_subtotal) * iva_percentage / 100)
         total = labor_subtotal + parts_subtotal + iva_amount
 
         payer_breakdown = []
         for payer in ServiceOrderPayer:
-            labor = sum(float(t.hours_snapshot) for t in tasks if t.payer == payer) * hourly_rate
-            parts = sum(float(line.line_total) for line in all_lines if line.payer == payer)
+            labor = labor_by_payer[payer]
+            parts = parts_by_payer[payer]
             payer_breakdown.append(
                 {
                     "payer": payer,
@@ -1807,9 +1877,11 @@ class ServiceOrderService:
         return OrderSummary(
             hourly_rate=hourly_rate,
             commission_percentage=float(settings.commission_percentage),
-            technician_commission=(labor_subtotal + non_client_labor)
-            * float(settings.commission_percentage)
-            / 100,
+            technician_commission=money(
+                (labor_subtotal + non_client_labor)
+                * Decimal(str(settings.commission_percentage))
+                / 100
+            ),
             payer_breakdown=payer_breakdown,
             discount_label=order.discount_label,
             tasks=[
@@ -2262,7 +2334,17 @@ class ServiceOrderService:
             resulting_order = await self.db.get(ServiceOrder, claim.resulting_service_order_id)
             resulting_service_order_code = resulting_order.code if resulting_order else None
 
+        from app.modules.service_orders.claim_coverage import assess_coverage
+        source_order = await self.db.get(ServiceOrder, claim.service_order_id) if claim.service_order_id else None
+        from app.modules.users.models import User
+        source_technician = await self.db.get(User, source_order.technician_user_id) if source_order and source_order.technician_user_id else None
         return WarrantyClaimRead(
+            failure_confirmed=claim.failure_confirmed,
+            odometer_photo_url=claim.odometer_photo_url,
+            warranty_assessment=assess_coverage(claim.coverage_snapshot, claim.claimed_at, claim.reported_mileage),
+            source_order_closed_at=source_order.closed_at if source_order else None,
+            source_order_exit_mileage=source_order.exit_mileage if source_order else None,
+            source_technician_name=source_technician.full_name if source_technician else None,
             id=claim.id,
             code=claim.code,
             filial_id=claim.filial_id,
@@ -2560,6 +2642,7 @@ class ServiceOrderService:
             failure_category=payload.failure_category,
             failure_cause=payload.failure_cause,
             reported_symptom=payload.reported_symptom,
+            odometer_photo_url=payload.odometer_photo_url,
             reported_mileage=payload.reported_mileage,
             vehicle_mileage_at_claim=current_mileage,
             mileage_inconsistent=mileage_inconsistent,
@@ -2647,6 +2730,7 @@ class ServiceOrderService:
         converted_by_user_id: uuid.UUID | None,
         *,
         commit: bool = True,
+        as_draft: bool = False,
     ) -> WarrantyClaimRead:
         claim = await self.db.get(WarrantyClaim, claim_id)
         if claim is None:
@@ -2675,7 +2759,7 @@ class ServiceOrderService:
         intake_mileage = payload.intake_mileage
         if intake_mileage is None:
             intake_mileage = (
-                original_order.intake_mileage if original_order else claim.reported_mileage
+                claim.reported_mileage
             )
         cause_label = claim.failure_cause or claim.reported_symptom or claim.claim_type.value
         retrabajo_type = (
@@ -2685,7 +2769,7 @@ class ServiceOrderService:
                     ServiceOrderTypeCatalog.code
                     == (
                         SYSTEM_ORDER_TYPE_GARANTIA_FABRICA
-                        if claim.claim_type == WarrantyClaimType.FABRICA
+                        if claim.claim_type == WarrantyClaimType.FABRICA or (as_draft and claim.claim_type == WarrantyClaimType.CAMPANA_RECALL)
                         else (
                             SYSTEM_ORDER_TYPE_CAMPANA
                             if claim.claim_type == WarrantyClaimType.CAMPANA_RECALL
@@ -2696,13 +2780,14 @@ class ServiceOrderService:
             )
         ).scalar_one()
         new_order = ServiceOrder(
+            is_draft=as_draft,
             filial_id=claim.filial_id,
             vehicle_id=claim.vehicle_id,
             order_type_id=retrabajo_type.id,
             warranty_claim_id=claim.id,
-            advisor_user_id=original_order.advisor_user_id if original_order else None,
+            advisor_user_id=claim.recorded_by_user_id if as_draft else original_order.advisor_user_id if original_order else None,
             intake_mileage=intake_mileage,
-            customer_reason=f"Retrabajo de garantía — {cause_label}",
+            customer_reason=cause_label if as_draft else f"Retrabajo de garantía — {cause_label}",
             promised_at=payload.promised_at,
             sequence_number=next_seq,
         )
@@ -2716,7 +2801,15 @@ class ServiceOrderService:
         await self.db.flush()
 
         if claim.tempario_id is not None:
-            await self.add_task(new_order.id, claim.tempario_id, payer=payer, commit=False)
+            new_task = await self.add_task(new_order.id, claim.tempario_id, payer=payer, commit=False)
+            if as_draft and claim.workshop_warranty_id:
+                from app.modules.post_ventas.models import WorkshopWarranty
+                warranty = await self.db.get(WorkshopWarranty, claim.workshop_warranty_id)
+                source_task = await self.db.get(ServiceOrderTask, warranty.service_order_task_id) if warranty else None
+                if source_task:
+                    new_task.code_snapshot = source_task.code_snapshot
+                    new_task.name_snapshot = source_task.name_snapshot
+                    new_task.hours_snapshot = source_task.hours_snapshot
         if claim.part_id is not None:
             quantity = 1
             if original_order is not None:

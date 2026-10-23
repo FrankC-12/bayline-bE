@@ -655,6 +655,9 @@ class WarrantyClaim(Base):
     before the vehicle is physically back in the shop."""
 
     __tablename__ = "warranty_claims"
+    failure_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    odometer_photo_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(

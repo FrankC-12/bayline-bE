@@ -22,6 +22,7 @@ class LaborSettingsUpdate(BaseModel):
     iva_percentage: float = Field(ge=0, le=100)
     bcv_rate: float | None = Field(default=None, gt=0)
     part_warranty_days: int = Field(ge=0, default=90)
+    vehicle_warranty_default_km: int | None = Field(default=None, ge=0, le=2147483647)
     vehicle_warranty_default_months: int = Field(ge=0, default=36)
     workshop_warranty_days: int = Field(ge=0, default=90)
     workshop_warranty_km: int = Field(ge=0, default=5000)
@@ -46,6 +47,7 @@ class LaborSettingsRead(BaseModel):
     bcv_rate_date: date | None
     bcv_rate_is_stale: bool
     part_warranty_days: int
+    vehicle_warranty_default_km: int | None = None
     vehicle_warranty_default_months: int
     workshop_warranty_days: int
     workshop_warranty_km: int
@@ -65,6 +67,7 @@ class SettingsPatch(BaseModel):
     igtf_percentage: float | None = Field(default=None, ge=0, le=100)
     bcv_rate: float | None = Field(default=None, gt=0)
     part_warranty_days: int | None = Field(default=None, ge=0)
+    vehicle_warranty_default_km: int | None = Field(default=None, ge=0, le=2147483647)
     vehicle_warranty_default_months: int | None = Field(default=None, ge=0)
     workshop_warranty_days: int | None = Field(default=None, ge=0)
     workshop_warranty_km: int | None = Field(default=None, ge=0)
@@ -102,6 +105,13 @@ class TemparioPartRead(BaseModel):
     subtotal: float
 
 
+class TemparioPricingInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    filial_id: uuid.UUID
+    estimated_hours: float = Field(ge=0, le=9999.99)
+    parts: list[TemparioPartInput] = Field(default_factory=list, max_length=200)
+
+
 class TemparioCreate(BaseModel):
     warranty_mode: Literal["standard", "custom", "none"] = "standard"
     warranty_days: int | None = Field(default=None, ge=0)
@@ -113,8 +123,8 @@ class TemparioCreate(BaseModel):
     sequence_number: int | None = Field(default=None, ge=1)
     name: str = Field(min_length=2, max_length=150)
     estimated_hours: float = Field(ge=0)
-    year_from: int | None = None
-    year_to: int | None = None
+    year_from: int | None = Field(default=None, ge=1900, le=2100)
+    year_to: int | None = Field(default=None, ge=1900, le=2100)
     compatible_vehicles: list[CompatibleVehicle] = Field(default_factory=list)
     tools: list[str] = Field(default_factory=list)
     requires_parts: bool = True
@@ -130,8 +140,8 @@ class TemparioUpdate(BaseModel):
     parts_warranty_policy_id: uuid.UUID | None = None
     name: str | None = Field(default=None, min_length=2, max_length=150)
     estimated_hours: float | None = Field(default=None, ge=0)
-    year_from: int | None = None
-    year_to: int | None = None
+    year_from: int | None = Field(default=None, ge=1900, le=2100)
+    year_to: int | None = Field(default=None, ge=1900, le=2100)
     compatible_vehicles: list[CompatibleVehicle] | None = None
     tools: list[str] | None = None
     requires_parts: bool | None = None
@@ -139,6 +149,9 @@ class TemparioUpdate(BaseModel):
 
 
 class TemparioRead(BaseModel):
+    pricing_basis: str = "fifo"
+    pricing_notes: list[str] = Field(default_factory=list)
+    pricing_warnings: list[str] = Field(default_factory=list)
     legacy_warranty_label: str | None = None
     warranty_mode: Literal["standard", "custom", "none"] = "standard"
     warranty_days: int | None = Field(default=None, ge=0)

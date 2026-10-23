@@ -53,7 +53,10 @@ def order_inventory(inventory):
     # ODS snapshots the current catalog cost; changing margins must never read it again.
     lots[-1].unit_cost = 12
     order = ServiceOrder(
-        id=uuid.uuid4(), filial_id=data["filial_id"], vehicle_id=uuid.uuid4(), sequence_number=2001,
+        id=uuid.uuid4(),
+        filial_id=data["filial_id"],
+        vehicle_id=uuid.uuid4(),
+        sequence_number=2001,
         order_type_id=make_order_type(session, data["filial_id"]),
     )
     session.add(order)
@@ -92,8 +95,13 @@ async def test_ods_discount_persists_without_compounding_or_changing_labor(
         assert summary.discount_label == label
         assert summary.parts_subtotal == expected
         assert summary.labor_subtotal == labor_hours * 25
-        # Existing IVA calculation is unchanged, including its rounding/display contract.
-        assert summary.iva_amount == (expected + labor_hours * 25) * 16 / 100
+        # The API, invoice and displayed subtotal now share cent-rounded IVA.
+        from decimal import ROUND_HALF_UP
+
+        expected_iva = ((Decimal(str(expected)) + labor_hours * 25) * Decimal("0.16")).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        assert summary.iva_amount == float(expected_iva)
         assert round(summary.total, 2) == round((expected + labor_hours * 25) * 1.16, 2)
         assert summary.transfers[0].lines[0].unit_price == expected
         assert summary.transfers[0].subtotal == expected

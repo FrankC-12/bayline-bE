@@ -1014,6 +1014,32 @@ class AlmacenService:
         result = await self.db.execute(query)
         return list(result.scalars().all())
 
+    async def lot_fifo_states(self, filial_id, part_ids):
+        from app.modules.warehouse.reservations import reserved_by_lot
+
+        if not part_ids:
+            return {}
+        lots = (await self.db.execute(
+            select(PartLot).where(PartLot.filial_id == filial_id, PartLot.part_id.in_(part_ids))
+            .order_by(PartLot.received_at, PartLot.id)
+        )).scalars().all()
+        reserved = await reserved_by_lot(self.db, part_ids=part_ids)
+        heads = set()
+        states = {}
+        for lot in lots:
+            key = (lot.warehouse_id, lot.part_id)
+            if lot.quantity_remaining <= 0:
+                state = "agotado"
+            elif lot.quantity_remaining <= reserved.get(lot.id, 0):
+                state = "reservado"
+            elif key in heads:
+                state = "en_espera_fifo"
+            else:
+                state = "en_uso"
+                heads.add(key)
+            states[lot.id] = state
+        return states
+
     async def get_lot(self, lot_id: uuid.UUID) -> PartLot:
         lot = await self.db.get(PartLot, lot_id)
         if lot is None:
@@ -1160,7 +1186,9 @@ class AlmacenService:
 
         movements.sort(key=lambda m: m.occurred_at, reverse=True)
 
+        states = await self.lot_fifo_states(lot.filial_id, {lot.part_id})
         return PartLotDetailRead(
+            fifo_status=states[lot.id],
             origin=origin,
             id=lot.id,
             code=lot.code,

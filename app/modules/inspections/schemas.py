@@ -3,6 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.modules.detailed_inspections.schemas import FluidReading
 from app.modules.inspections.enums import InspectionStatus
 
 
@@ -29,6 +30,8 @@ class InspectionDamageRead(BaseModel):
 
 
 class InspectionCreate(BaseModel):
+    interior: dict = Field(default_factory=dict, max_length=100)
+    fluids: dict[str, FluidReading | str] = Field(default_factory=dict, max_length=30)
     filial_id: uuid.UUID
     vehicle_id: uuid.UUID
     mileage: int | None = Field(default=None, ge=0)
@@ -39,6 +42,8 @@ class InspectionCreate(BaseModel):
 
 
 class InspectionUpdate(BaseModel):
+    interior: dict | None = Field(default=None, max_length=100)
+    fluids: dict[str, FluidReading | str] | None = Field(default=None, max_length=30)
     mileage: int | None = Field(default=None, ge=0)
     mileage_correction_reason: str | None = Field(default=None, min_length=3, max_length=1000)
     notes: str | None = None
@@ -48,6 +53,8 @@ class InspectionUpdate(BaseModel):
 
 
 class InspectionRead(BaseModel):
+    interior: dict = Field(default_factory=dict)
+    fluids: dict[str, FluidReading | str] = Field(default_factory=dict)
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID

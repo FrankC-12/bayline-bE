@@ -6,7 +6,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import and_, func, or_, select
 
 
-async def reserved_by_lot(db, part_id, *, exclude_transfer_id=None, exclude_line_id=None):
+async def reserved_by_lot(
+    db, part_id=None, *, part_ids=None, exclude_transfer_id=None, exclude_line_id=None
+):
+    if part_ids is not None and not part_ids:
+        return {}
     from app.modules.service_orders.enums import ServiceOrderStatus, TransferStatus
     from app.modules.service_orders.models import (
         ServiceOrder,
@@ -29,9 +33,11 @@ async def reserved_by_lot(db, part_id, *, exclude_transfer_id=None, exclude_line
         .join(Request, Request.id == Line.transfer_id)
         .join(ServiceOrder, ServiceOrder.id == Request.service_order_id)
         .where(
-            PartLot.part_id == part_id,
+            PartLot.part_id.in_(part_ids) if part_ids is not None else PartLot.part_id == part_id,
             Request.stock_deducted.is_(False),
-            ServiceOrder.status.notin_([ServiceOrderStatus.CANCELADO, ServiceOrderStatus.ORDEN_CERRADA]),
+            ServiceOrder.status.notin_(
+                [ServiceOrderStatus.CANCELADO, ServiceOrderStatus.ORDEN_CERRADA]
+            ),
             Request.closed_at.is_(None),
             or_(
                 Request.status == TransferStatus.PEDIDO,

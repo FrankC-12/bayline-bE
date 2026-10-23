@@ -190,7 +190,8 @@ async def test_draft_task_removal_removes_its_auto_parts(visit_env):
 
 
 @pytest.mark.asyncio
-async def test_factory_claim_waits_for_brand_before_opening_order(visit_env):
+@pytest.mark.parametrize("campaign", [False, True])
+async def test_factory_approval_opens_draft_without_brand_stage(visit_env, campaign):
     from datetime import timedelta
 
     from app.core.venezuela_time import venezuela_today
@@ -224,7 +225,8 @@ async def test_factory_claim_waits_for_brand_before_opening_order(visit_env):
     claim = await flow.create(
         WarrantyClaimFromWarranty(
             vehicle_id=vehicle.id,
-            factory_warranty_id=coverage.id,
+            factory_warranty_id=None if campaign else coverage.id,
+            campaign=campaign,
             reported_mileage=500,
             symptom="No enfría el aire",
         ),
@@ -233,19 +235,14 @@ async def test_factory_claim_waits_for_brand_before_opening_order(visit_env):
         actor,
     )
     reviewed = await flow.review(claim.id, ClaimReviewInput(decision="aprobado"), actor)
-    assert reviewed.brand_status == "en_marca" and reviewed.resulting_service_order_id is None
-    from app.modules.service_orders.schemas import WarrantyClaimConvertInput
+    assert reviewed.brand_status is None and reviewed.resulting_service_order_id is not None
+    draft = await service.get_order(reviewed.resulting_service_order_id)
+    assert draft.is_draft and draft.intake_mileage == 500
+    assert (await service.get_order_type(draft.order_type_id)).code == "garantia_fabrica"
+    assert reviewed.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
+    with pytest.raises(ConflictError):
+        await flow.review(claim.id, ClaimReviewInput(decision="aprobado"), actor)
 
-    with pytest.raises(ConflictError):
-        await service.convert_warranty_claim_to_order(
-            claim.id, WarrantyClaimConvertInput(), actor.user_id
-        )
-    accepted = await flow.review(claim.id, ClaimReviewInput(decision="aprobado"), actor, brand=True)
-    assert accepted.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
-    assert accepted.resulting_service_order_id
-    assert accepted.brand_responded_by_user_id == actor.user_id
-    with pytest.raises(ConflictError):
-        await flow.review(claim.id, ClaimReviewInput(decision="aprobado"), actor, brand=True)
 
 
 @pytest.mark.asyncio
@@ -311,7 +308,7 @@ async def test_comeback_approval_opens_order_and_keeps_client_payer_zero(visit_e
     )
     assert claim.service_order_id == origin.id and claim.tempario_id == catalog.id
     result = await flow.review(
-        claim.id, ClaimReviewInput(decision="aprobado", failure_category="mano_de_obra"), actor
+        claim.id, ClaimReviewInput(decision="aprobado", failure_confirmed=True, failure_category="mano_de_obra"), actor
     )
     assert result.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
     tasks = await service.list_tasks(result.resulting_service_order_id)

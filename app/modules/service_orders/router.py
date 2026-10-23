@@ -1,6 +1,7 @@
 import datetime as dt
 import uuid
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from fastapi.exceptions import RequestValidationError
@@ -12,6 +13,7 @@ from app.core.database import get_db
 from app.core.pagination import Page
 from app.core.storage import save_upload_attachment, save_upload_image
 from app.modules.auth.dependencies import get_current_user
+from app.modules.auth.exceptions import InsufficientPermissionsError
 from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.schemas import ServiceVehicleRead
 from app.modules.roles.enums import AccessLevel
@@ -73,7 +75,6 @@ from app.modules.service_orders.schemas import (
     WarrantyClaimAuthorizationInput,
     WarrantyClaimContext,
     WarrantyClaimConvertInput,
-    WarrantyClaimCreate,
     WarrantyClaimRead,
 )
 from app.modules.service_orders.service import (
@@ -152,7 +153,10 @@ async def list_order_types(
     current_user: CurrentUser = Depends(get_current_user),
     service: ServiceOrderService = Depends(get_service),
 ) -> list[ServiceOrderTypeRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    try:
+        await _ensure_access(current_user, filial_id, service.db)
+    except InsufficientPermissionsError:
+        await _ensure_order_types_access(current_user, filial_id, service.db, AccessLevel.VER)
     return await service.list_order_types(filial_id)
 
 
@@ -443,7 +447,9 @@ async def add_task(
     (the tempario's linked parts may have just been added to a pending ODT)."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
-    task = await service.add_task(order_id, payload.tempario_id, payer=payload.payer)
+    task = await service.add_task(
+        order_id, payload.tempario_id, payer=payload.payer, expected_total=payload.expected_total
+    )
     summary = await service.get_order_summary(order_id)
     summary.warnings = getattr(task, "stock_warnings", [])
     return summary
@@ -884,6 +890,21 @@ async def list_receivables(
     return await AdministracionService(service.db).list_receivables(filial_id)
 
 
+@router.get("/receivables/{invoice_id}/collection-context")
+async def receivable_collection_context(
+    invoice_id: uuid.UUID,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ServiceOrderService, Depends(get_service)],
+):
+    from app.modules.service_orders.billing import BillingService
+
+    billing = BillingService(service.db)
+    invoice = await billing.get_invoice_by_id(invoice_id)
+    order = await service.get_order(invoice.service_order_id)
+    await _ensure_cobrar_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    return await billing.collection_context(invoice_id)
+
+
 @router.post("/receivables/{invoice_id}/collect", response_model=ReceivableRead)
 async def collect_receivable(
     invoice_id: uuid.UUID,
@@ -1016,6 +1037,7 @@ async def claims_overview(
 async def claim_from_warranty(
     vehicle_id: uuid.UUID = Form(...),
     reported_mileage: int = Form(...),
+    odometer_photo: UploadFile = File(...),
     symptom: str = Form(...),
     workshop_warranty_id: uuid.UUID | None = Form(None),
     factory_warranty_id: uuid.UUID | None = Form(None),
@@ -1039,7 +1061,10 @@ async def claim_from_warranty(
         factory_warranty_id=factory_warranty_id,
         campaign=campaign,
     )
+    from app.modules.clients.mileage import validate_mileage
+    await validate_mileage(service.db, vehicle_id, reported_mileage)
     settings = get_settings()
+    odometer_url = await save_upload_image(odometer_photo, directory=Path(settings.uploads_dir), subdir="warranty-claims/odometer", url_prefix=f"{settings.api_v1_prefix}/uploads", max_mb=settings.max_upload_mb)
     saved = []
     for files in [photos, documents]:
         saved.append(
@@ -1054,7 +1079,7 @@ async def claim_from_warranty(
                 for file in files
             ]
         )
-    return await ClaimsWorkflow(service.db).create(payload, saved[0], saved[1], current_user)
+    return await ClaimsWorkflow(service.db).create(payload, saved[0], saved[1], current_user, odometer_photo_url=odometer_url)
 
 
 @router.get("/warranty-claims/{claim_id}", response_model=WarrantyClaimRead)
@@ -1082,6 +1107,7 @@ async def create_warranty_claim(
     failure_cause: str | None = Form(default=None),
     reported_symptom: str | None = Form(default=None),
     reported_mileage: int = Form(...),
+    odometer_photo: UploadFile = File(...),
     claimed_at: dt.date = Form(default_factory=dt.date.today),
     note: str | None = Form(default=None),
     photos: list[UploadFile] = File(default=[]),
@@ -1092,7 +1118,10 @@ async def create_warranty_claim(
     filial_id = await service.get_vehicle_filial_id(vehicle_id)
     await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
 
+    from app.modules.clients.mileage import validate_mileage
+    await validate_mileage(service.db, vehicle_id, reported_mileage)
     settings = get_settings()
+    odometer_url = await save_upload_image(odometer_photo, directory=Path(settings.uploads_dir), subdir="warranty-claims/odometer", url_prefix=f"{settings.api_v1_prefix}/uploads", max_mb=settings.max_upload_mb)
     photo_urls = [
         await save_upload_attachment(
             photo,
@@ -1114,22 +1143,31 @@ async def create_warranty_claim(
         for document in documents
     ]
 
-    payload = WarrantyClaimCreate(
-        claim_type=claim_type,
-        vehicle_id=vehicle_id,
-        service_order_id=service_order_id,
-        tempario_id=tempario_id,
-        part_id=part_id,
-        failure_category=failure_category,
-        failure_cause=failure_cause,
-        reported_symptom=reported_symptom,
-        reported_mileage=reported_mileage,
-        claimed_at=claimed_at,
-        note=note,
-    )
-    return await service.create_warranty_claim(
-        payload, photo_urls, document_urls, current_user.user_id
-    )
+    from sqlalchemy import select
+
+    from app.core.exceptions import BadRequestError
+    from app.modules.post_ventas.models import VehicleWarranty, WorkshopWarranty
+    from app.modules.service_orders.claims_workflow import ClaimsWorkflow
+    from app.modules.service_orders.models import ServiceOrderTask
+    from app.modules.service_orders.schemas import WarrantyClaimFromWarranty
+
+    vehicle = await service._get_vehicle_with_client(vehicle_id)
+    factory_id = workshop_id = None
+    if claim_type == WarrantyClaimType.FABRICA:
+        factory_id = (await service.db.execute(select(VehicleWarranty.id).where(VehicleWarranty.filial_id == filial_id, VehicleWarranty.vin == vehicle.vin))).scalar_one_or_none() if vehicle.vin else None
+        if factory_id is None:
+            raise BadRequestError("Selecciona una garantía de fábrica vigente.")
+    elif claim_type == WarrantyClaimType.COMEBACK:
+        query = select(WorkshopWarranty.id).join(ServiceOrderTask, ServiceOrderTask.id == WorkshopWarranty.service_order_task_id).where(WorkshopWarranty.filial_id == filial_id, WorkshopWarranty.vin == vehicle.vin, WorkshopWarranty.service_order_id == service_order_id)
+        if tempario_id:
+            query = query.where(ServiceOrderTask.tempario_id == tempario_id)
+        workshop_id = (await service.db.execute(query.order_by(WorkshopWarranty.created_at.desc()).limit(1))).scalar_one_or_none()
+        if workshop_id is None:
+            raise BadRequestError("Selecciona una garantía vigente del trabajo reclamado.")
+    elif claim_type != WarrantyClaimType.CAMPANA_RECALL:
+        raise BadRequestError("El reclamo al proveedor se inicia desde un comeback autorizado.")
+    payload = _validated_form(WarrantyClaimFromWarranty, vehicle_id=vehicle_id, reported_mileage=reported_mileage, symptom=reported_symptom or failure_cause or "", workshop_warranty_id=workshop_id, factory_warranty_id=factory_id, campaign=claim_type == WarrantyClaimType.CAMPANA_RECALL)
+    return await ClaimsWorkflow(service.db).create(payload, photo_urls, document_urls, current_user, odometer_photo_url=odometer_url)
 
 
 @router.post("/warranty-claims/{claim_id}/authorize", response_model=WarrantyClaimRead)
@@ -1148,7 +1186,9 @@ async def authorize_warranty_claim(
     await ensure_module_access(
         service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR
     )
-    return await service.authorize_warranty_claim(claim_id, payload, current_user.user_id)
+    from app.modules.service_orders.claims_workflow import ClaimsWorkflow
+    review = _validated_form(ClaimReviewInput, decision=payload.decision, failure_category=payload.failure_category, failure_confirmed=payload.failure_confirmed, rejection_reason=payload.rejection_reason)
+    return await ClaimsWorkflow(service.db).review(claim_id, review, current_user)
 
 
 @router.post("/warranty-claims/{claim_id}/convert-to-order", response_model=WarrantyClaimRead)
@@ -1165,7 +1205,9 @@ async def convert_warranty_claim_to_order(
     await ensure_module_access(
         service.db, current_user, filial_id, "administracion", AccessLevel.EDITAR
     )
-    return await service.convert_warranty_claim_to_order(claim_id, payload, current_user.user_id)
+    if claim.resulting_service_order_id is not None:
+        return claim
+    return await service.convert_warranty_claim_to_order(claim_id, payload, current_user.user_id, as_draft=True)
 
 
 @router.get("/service-order-transfers/{transfer_id}/request-preview")
@@ -1496,6 +1538,34 @@ async def order_inspection_records(
         "preliminary": InspectionRead.model_validate(preliminary) if preliminary else None,
         "detailed": detailed,
     }
+
+
+@router.get("/service-orders/{order_id}/temparios/{tempario_id}/quote")
+async def quote_order_tempario(
+    order_id: uuid.UUID,
+    tempario_id: uuid.UUID,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[ServiceOrderService, Depends(get_service)],
+):
+    from app.core.exceptions import BadRequestError
+    from app.modules.post_ventas.schemas import TemparioPricingInput
+    from app.modules.post_ventas.service import PostVentasService
+
+    order = await service.get_order(order_id)
+    await _ensure_order_access(current_user, order, service.db)
+    catalog = PostVentasService(service.db)
+    tempario = await catalog._get_tempario_model(tempario_id)
+    if tempario.filial_id != order.filial_id or not tempario.is_active:
+        raise BadRequestError("El tempario no está disponible en esta filial.")
+    payload = TemparioPricingInput(
+        filial_id=order.filial_id,
+        estimated_hours=tempario.estimated_hours,
+        parts=[
+            {"part_id": p.part_id, "name": p.name, "quantity": p.quantity, "unit_cost": p.unit_cost}
+            for p in tempario.parts
+        ],
+    )
+    return await catalog.preview_tempario(payload, order=order)
 
 
 @router.post("/warranty-claims/{claim_id}/review", response_model=WarrantyClaimRead)

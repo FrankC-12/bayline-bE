@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.exceptions import BadRequestError
-from app.core.storage import save_upload_attachment
+from app.core.storage import ALLOWED_IMAGE_TYPES, save_upload_attachment, save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.detailed_inspections.schemas import DetailedInspectionRead, InspectionData
@@ -39,13 +39,15 @@ async def context(order_id, user, db, *, edit=False):
 @router.get("/template", summary="Consultar estructura y opciones del formulario móvil")
 async def template(user: UserDependency):
     return {
-        "version": 1,
+        "version": 2,
         "total_steps": 5,
         "sections": [
             {"key": "engine", "label": "Compartimiento del motor", "required": True},
             {"key": "underbody", "label": "Debajo del vehículo", "required": True},
             {"key": "tires", "label": "Presión y desgaste de neumáticos", "required": True},
             {"key": "brakes", "label": "Frenos", "required": True},
+            {"key": "fluids", "label": "Fluidos y niveles", "required": False},
+            {"key": "interior", "label": "Interior del vehículo", "required": False},
             {"key": "annexes", "label": "Anexos", "required": False},
             {"key": "completion", "label": "Culminación del trabajo", "required": True},
         ],
@@ -130,6 +132,40 @@ async def upload_annex(
     inspection = await service.add_annex(
         inspection, Path(file.filename or "diagnostico.pdf").name[:255], url, user.user_id
     )
+    return await service.read(inspection, order)
+
+
+@router.post("/by-order/{order_id}/photos", response_model=DetailedInspectionRead)
+async def upload_photos(
+    order_id: uuid.UUID,
+    photos: Annotated[list[UploadFile], File()],
+    user: UserDependency,
+    db: DatabaseDependency,
+):
+    order, service = await context(order_id, user, db, edit=True)
+    if not photos or len(photos) > 20:
+        raise BadRequestError("Adjunta entre 1 y 20 fotos por solicitud.")
+    if any(photo.content_type not in ALLOWED_IMAGE_TYPES for photo in photos):
+        raise BadRequestError("Solo se admiten fotos JPEG, PNG, WebP o HEIC.")
+    inspection = await service.draft(order_id, user.user_id)
+    settings = get_settings()
+    for photo in photos:
+        url = await save_upload_image(
+            photo,
+            directory=Path(settings.uploads_dir),
+            subdir="detailed-inspections",
+            url_prefix=f"{settings.api_v1_prefix}/uploads",
+            max_mb=settings.max_upload_mb,
+        )
+        await service.add_annex(
+            inspection,
+            Path(photo.filename or "foto.jpg").name[:255],
+            url,
+            user.user_id,
+            commit=False,
+        )
+    await db.commit()
+    await db.refresh(inspection)
     return await service.read(inspection, order)
 
 

@@ -1,5 +1,6 @@
 """Manual cronómetro on a ServiceOrderTask — start/pause, independent of the
-task's status. timer_started_at marks the currently-running segment (None
+task's lifecycle (starting also marks task and order in progress).
+timer_started_at marks the currently-running segment (None
 while paused); timer_accumulated_seconds sums every previously-closed
 segment, so pausing and resuming multiple times adds up correctly."""
 
@@ -42,6 +43,8 @@ async def test_starting_the_timer_sets_started_at(order_inventory):
     started = await service.start_task_timer(task.id)
     assert started.timer_started_at is not None
     assert started.timer_accumulated_seconds == 0
+    assert started.status.value == "en_progreso"
+    assert order.status == ServiceOrderStatus.EN_PROGRESO
 
 
 @pytest.mark.asyncio

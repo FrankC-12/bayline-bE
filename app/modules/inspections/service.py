@@ -67,6 +67,8 @@ class InspectionService:
             raise VehicleNotFoundError(str(payload.vehicle_id))
         await validate_mileage(self.db, payload.vehicle_id, payload.mileage, payload.mileage_correction_reason)
         inspection = PreliminaryInspection(
+            interior=payload.model_dump(mode="json")["interior"],
+            fluids=payload.model_dump(mode="json")["fluids"],
             mileage_correction_reason=payload.mileage_correction_reason,
             filial_id=payload.filial_id,
             vehicle_id=payload.vehicle_id,
@@ -100,6 +102,10 @@ class InspectionService:
         # before this rule existed (and so has no notes) can still have its
         # other fields (mileage, service_order_id, ...) updated freely.
         was_already_completada = inspection.status == InspectionStatus.COMPLETADA
+        if payload.interior is not None:
+            inspection.interior = payload.model_dump(mode="json")["interior"]
+        if payload.fluids is not None:
+            inspection.fluids = payload.model_dump(mode="json")["fluids"]
 
         if payload.mileage is not None:
             await validate_mileage(self.db, inspection.vehicle_id, payload.mileage, payload.mileage_correction_reason, inspection.id)

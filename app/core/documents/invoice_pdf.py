@@ -223,14 +223,28 @@ def from_service_invoice(document: dict) -> dict:
             ]
         )
     warranty_notes = []
+    grouped_warranties = {}
     for warranty in document.get("warranties", []):
+        key = (
+            warranty["task"],
+            warranty["name"],
+            warranty.get("duration_days"),
+            warranty.get("duration_km"),
+        )
+        entry = grouped_warranties.setdefault(key, {**warranty, "coverages": set()})
+        entry["coverages"].add(warranty["coverage"])
+    for warranty in grouped_warranties.values():
         durations = []
         if warranty.get("duration_days") is not None:
             durations.append(f'{warranty["duration_days"]} días')
         if warranty.get("duration_km") is not None:
-            durations.append(f'{warranty["duration_km"]:,} km')
+            durations.append(f'{warranty["duration_km"]:,} km'.replace(",", "."))
         term = " / ".join(durations) if durations else "Sin vencimiento"
-        coverage = "Mano de obra" if warranty["coverage"] == "labor" else "Repuestos"
+        coverage = (
+            "Mano de obra y repuestos"
+            if warranty["coverages"] == {"labor", "parts"}
+            else "Mano de obra" if "labor" in warranty["coverages"] else "Repuestos"
+        )
         warranty_notes.append(
             f'Garantía {warranty["task"]} · {coverage}: {warranty["name"]} · {term}'
             + (" (lo que ocurra primero)" if len(durations) == 2 else "")

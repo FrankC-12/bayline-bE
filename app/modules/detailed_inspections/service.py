@@ -100,7 +100,7 @@ class DetailedInspectionService:
         await self.db.refresh(inspection)
         return inspection
 
-    async def add_annex(self, inspection, filename, url, user_id):
+    async def add_annex(self, inspection, filename, url, user_id, *, commit=True):
         inspection.annexes = [
             *inspection.annexes,
             {
@@ -112,8 +112,9 @@ class DetailedInspectionService:
             },
         ]
         inspection.updated_by_user_id = user_id
-        await self.db.commit()
-        await self.db.refresh(inspection)
+        if commit:
+            await self.db.commit()
+            await self.db.refresh(inspection)
         return inspection
 
     async def delete_annex(self, order_id, annex_id, user_id):

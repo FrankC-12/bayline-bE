@@ -200,6 +200,7 @@ def _reject_manual_proveedor_payer(cls, value: ServiceOrderPayer) -> ServiceOrde
 
 
 class TaskCreate(BaseModel):
+    expected_total: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     tempario_id: uuid.UUID
     payer: ServiceOrderPayer = ServiceOrderPayer.CLIENTE
 
@@ -444,6 +445,7 @@ class PendingUpsellRead(UpsellRead):
 
 
 class WarrantyClaimCreate(BaseModel):
+    odometer_photo_url: str | None = None
     claim_type: WarrantyClaimType
     vehicle_id: uuid.UUID
     # Mandatory for claim_type=comeback (enforced below), optional otherwise.
@@ -473,6 +475,8 @@ class WarrantyClaimCreate(BaseModel):
 
 
 class WarrantyClaimAuthorizationInput(BaseModel):
+    failure_confirmed: bool = False
+    rejection_reason: str | None = Field(default=None, max_length=2000)
     decision: Literal["aprobado", "rechazado"]
     # Only meaningful for claim_type in (fabrica, campana_recall) — the
     # explicit, recorded exception to authorize without a vigente factory
@@ -511,6 +515,7 @@ class WarrantyClaimFromWarranty(BaseModel):
 
 
 class ClaimReviewInput(BaseModel):
+    failure_confirmed: bool = False
     decision: Literal["aprobado", "rechazado"]
     rejection_reason: str | None = Field(default=None, max_length=2000)
     failure_category: ReworkFailureCategory | None = None
@@ -523,6 +528,12 @@ class ClaimReviewInput(BaseModel):
 
 
 class WarrantyClaimRead(BaseModel):
+    failure_confirmed: bool = False
+    odometer_photo_url: str | None = None
+    warranty_assessment: dict = Field(default_factory=dict)
+    source_order_closed_at: datetime | None = None
+    source_order_exit_mileage: int | None = None
+    source_technician_name: str | None = None
     vehicle_label: str | None = None
     coverage_snapshot: dict | None = None
     brand_responded_by_user_id: uuid.UUID | None = None

@@ -219,3 +219,29 @@ async def test_vehicle_pdf_retains_mileage_at_sale(vehicle_env):
     text = "\n".join(page.extract_text() for page in PdfReader(BytesIO(response.body)).pages)
     assert "65,000 km" in text
     assert "99,000 km" not in text
+
+
+@pytest.mark.asyncio
+async def test_identical_warranty_coverages_share_one_pdf_note_but_different_terms_survive(ready):
+    await prepare(ready)
+    _, _, order, _, _, billing, accounts, _ = ready
+    invoice = await billing.issue(order.id, await invoice_payload(billing, order, accounts), None)
+    document = deepcopy(invoice.document)
+    common = {"task": "MP-1", "name": "Estándar", "duration_days": 90, "duration_km": 5000}
+    document["warranties"] = [
+        {**common, "coverage": "labor"},
+        {**common, "coverage": "parts"},
+        {**common, "coverage": "parts"},
+    ]
+    original = deepcopy(document)
+    notes = [
+        note for note in from_service_invoice(document)["notes"] if note.startswith("Garantía")
+    ]
+    assert len(notes) == 1 and "Mano de obra y repuestos" in notes[0]
+    assert "5.000 km" in notes[0]
+    assert document == original
+    document["warranties"][1]["duration_days"] = 180
+    notes = [
+        note for note in from_service_invoice(document)["notes"] if note.startswith("Garantía")
+    ]
+    assert len(notes) == 2  # distinct terms are never hidden

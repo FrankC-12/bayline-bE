@@ -159,6 +159,7 @@ class PartSaleQuoteLine(BaseModel):
 
 
 class PartSaleQuoteRead(BaseModel):
+    quote_hash: str
     lines: list[PartSaleQuoteLine]
     total: float
     iva_percentage: float
@@ -210,6 +211,7 @@ class PartSaleLineDispatch(BaseModel):
 
 
 class PartSaleCreate(PartSaleQuoteInput):
+    quote_hash: str | None = Field(default=None, min_length=64, max_length=64)
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None
     discount_label: DiscountLabel = DEFAULT_DISCOUNT

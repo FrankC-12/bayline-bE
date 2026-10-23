@@ -1,11 +1,11 @@
-"""Warranty-first web claims; mobile's existing contract remains supported."""
+"""Warranty-first claims and local approval, shared by web and mobile."""
 
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TypedDict
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
@@ -41,8 +41,11 @@ class ClaimsWorkflow:
         self.db = db
         self.service = ServiceOrderService(db)
 
-    async def create(self, payload, photos, documents, actor):
+    async def create(self, payload, photos, documents, actor, *, odometer_photo_url=None):
         vehicle = await self.service._get_vehicle_with_client(payload.vehicle_id)
+        from app.modules.clients.mileage import validate_mileage
+
+        await validate_mileage(self.db, payload.vehicle_id, payload.reported_mileage)
         today = venezuela_today()
         source = task_id = None
         coverage = {"label": "Campaña o recall", "kind": "campaign"}
@@ -75,6 +78,11 @@ class ClaimsWorkflow:
                 "expires_at": warranty.expires_at.isoformat() if warranty.expires_at else None,
                 "expiration_mileage": warranty.expiration_mileage,
                 "coverage_type": warranty.coverage_type.value,
+                "start_mileage": (
+                    warranty.expiration_mileage - warranty.duration_km
+                    if warranty.expiration_mileage is not None and warranty.duration_km is not None
+                    else None
+                ),
             }
             task = await self.db.get(ServiceOrderTask, warranty.service_order_task_id)
             task_id, source, kind = (
@@ -105,6 +113,8 @@ class ClaimsWorkflow:
                 "label": "Garantía de fábrica",
                 "kind": "factory",
                 "duration_months": warranty.duration_months,
+                "start_mileage": 0,
+                "expiration_mileage": warranty.duration_km,
                 "duration_km": warranty.duration_km,
                 "starts_at": warranty.starts_at.isoformat(),
                 "expires_at": warranty.expires_at.isoformat() if warranty.expires_at else None,
@@ -112,6 +122,7 @@ class ClaimsWorkflow:
             kind = WarrantyClaimType.FABRICA
         result = await self.service.create_warranty_claim(
             WarrantyClaimCreate(
+                odometer_photo_url=odometer_photo_url,
                 vehicle_id=vehicle.id,
                 claim_type=kind,
                 service_order_id=source,
@@ -130,7 +141,7 @@ class ClaimsWorkflow:
         claim.coverage_snapshot = coverage
         claim.workshop_warranty_id = payload.workshop_warranty_id
         claim.factory_warranty_id = payload.factory_warranty_id
-        claim.brand_status = "pendiente" if kind != WarrantyClaimType.COMEBACK else None
+        claim.brand_status = None
         await self.db.commit()
         return await self.service.get_warranty_claim(claim.id)
 
@@ -145,42 +156,42 @@ class ClaimsWorkflow:
         ).scalar_one_or_none()
         if claim is None:
             raise NotFoundError("Reclamo no encontrado.")
-        if brand:
-            if claim.brand_status != "en_marca" or claim.status != WarrantyClaimStatus.AUTORIZADO:
-                raise ConflictError("El reclamo no está pendiente de respuesta de la marca.")
-            claim.brand_response_at = datetime.now(UTC)
-            claim.brand_responded_by_user_id = actor.user_id
-            claim.brand_status = "autorizado" if payload.decision == "aprobado" else "rechazado"
-        elif claim.status != WarrantyClaimStatus.SOLICITADO:
+        # Old en_marca records can be decided through the same local review; no new brand state.
+        if (
+            claim.status not in (WarrantyClaimStatus.SOLICITADO, WarrantyClaimStatus.AUTORIZADO)
+            or claim.resulting_service_order_id is not None
+        ):
             raise ConflictError("Este reclamo ya fue revisado.")
-        if not brand:
-            claim.authorized_at = datetime.now(UTC)
-            claim.authorized_by_user_id = actor.user_id
+        if payload.decision == "aprobado" and claim.claim_type == WarrantyClaimType.COMEBACK:
+            if not payload.failure_confirmed:
+                raise BadRequestError(
+                    "Confirma que la falla está relacionada con el trabajo reclamado."
+                )
+            if payload.failure_category is None:
+                raise BadRequestError("Selecciona la causa de la falla.")
+        claim.authorized_at = datetime.now(UTC)
+        claim.authorized_by_user_id = actor.user_id
+        claim.brand_status = None
         if payload.decision == "rechazado":
             claim.status = WarrantyClaimStatus.RECHAZADO
             claim.rejection_reason = payload.rejection_reason.strip()
         else:
             claim.status = WarrantyClaimStatus.AUTORIZADO
+            claim.failure_confirmed = (
+                payload.failure_confirmed
+                if claim.claim_type == WarrantyClaimType.COMEBACK
+                else False
+            )
             if claim.claim_type == WarrantyClaimType.COMEBACK:
-                if payload.failure_category is None:
-                    raise BadRequestError("Selecciona la causa de la falla.")
                 claim.failure_category = payload.failure_category
-                await self.service.convert_warranty_claim_to_order(
-                    claim.id,
-                    WarrantyClaimConvertInput(intake_mileage=claim.reported_mileage),
-                    actor.user_id,
-                    commit=False,
-                )
-            elif brand:
-                await self.service.convert_warranty_claim_to_order(
-                    claim.id,
-                    WarrantyClaimConvertInput(intake_mileage=claim.reported_mileage),
-                    actor.user_id,
-                    commit=False,
-                )
-            else:
-                claim.brand_status = "en_marca"
-                claim.brand_sent_at = datetime.now(UTC)
+            await self.db.flush()
+            await self.service.convert_warranty_claim_to_order(
+                claim.id,
+                WarrantyClaimConvertInput(intake_mileage=claim.reported_mileage),
+                actor.user_id,
+                commit=False,
+                as_draft=True,
+            )
         await self.db.commit()
         return await self.service.get_warranty_claim(claim.id)
 
@@ -200,7 +211,13 @@ class ClaimsWorkflow:
                 .select_from(WarrantyClaim)
                 .where(
                     WarrantyClaim.filial_id == filial_id,
-                    WarrantyClaim.status == WarrantyClaimStatus.SOLICITADO,
+                    or_(
+                        WarrantyClaim.status == WarrantyClaimStatus.SOLICITADO,
+                        and_(
+                            WarrantyClaim.status == WarrantyClaimStatus.AUTORIZADO,
+                            WarrantyClaim.brand_status == "en_marca",
+                        ),
+                    ),
                 )
             )
         ).scalar_one()

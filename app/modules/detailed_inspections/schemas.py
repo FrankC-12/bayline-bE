@@ -24,7 +24,7 @@ class BatteryStatus(StrEnum):
 
 
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class Engine(StrictModel):
@@ -70,7 +70,18 @@ class Brakes(StrictModel):
     rear_shoes: BrakeCondition | None = None
 
 
+class FluidReading(StrictModel):
+    level: str | float | None = None
+    condition: str | None = Field(None, max_length=100)
+    color: str | None = Field(None, max_length=100)
+    notes: str | None = Field(None, max_length=5000)
+    photo_urls: list[str] = Field(default_factory=list, max_length=20)
+
+
 class InspectionData(StrictModel):
+    interior: dict = Field(default_factory=dict, max_length=100)
+    fluids: dict[str, FluidReading | str] = Field(default_factory=dict, max_length=30)
+    photo_urls: list[str] = Field(default_factory=list, max_length=50)
     engine: Engine = Field(default_factory=Engine)
     underbody: Underbody = Field(default_factory=Underbody)
     tires: Tires = Field(default_factory=Tires)

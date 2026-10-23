@@ -1,4 +1,5 @@
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +13,7 @@ from app.modules.post_ventas.schemas import (
     MaintenancePlanRead,
     MaintenancePlanUpdate,
     TemparioCreate,
+    TemparioPricingInput,
     TemparioRead,
     TemparioUpdate,
     VehicleWarrantyBulkCreate,
@@ -36,6 +38,16 @@ def get_service(db: AsyncSession = Depends(get_db)) -> PostVentasService:
     return PostVentasService(db)
 
 
+@router.post("/temparios/quote")
+async def quote_tempario(
+    payload: TemparioPricingInput,
+    current_user: Annotated[CurrentUser, Depends(get_current_user)],
+    service: Annotated[PostVentasService, Depends(get_service)],
+):
+    await _ensure_tempario_read_access(current_user, payload.filial_id, service.db)
+    return await service.preview_tempario(payload)
+
+
 async def _ensure_access(
     current_user: CurrentUser,
     filial_id: uuid.UUID,
@@ -53,7 +65,12 @@ async def _ensure_tempario_read_access(
     try:
         await _ensure_access(current_user, filial_id, db)
     except InsufficientPermissionsError:
-        await ensure_module_access(db, current_user, filial_id, "asesor-servicios", AccessLevel.VER)
+        try:
+            await ensure_module_access(
+                db, current_user, filial_id, "asesor-servicios", AccessLevel.VER
+            )
+        except InsufficientPermissionsError:
+            await ensure_module_access(db, current_user, filial_id, "repuestos", AccessLevel.VER)
 
 
 @router.get("/temparios", response_model=list[TemparioRead])
@@ -61,11 +78,12 @@ async def list_temparios(
     filial_id: uuid.UUID = Query(...),
     search: str | None = Query(default=None),
     include_inactive: bool = False,
+    part_id: uuid.UUID | None = None,
     current_user: CurrentUser = Depends(get_current_user),
     service: PostVentasService = Depends(get_service),
 ) -> list[TemparioRead]:
     await _ensure_tempario_read_access(current_user, filial_id, service.db)
-    return await service.list_temparios(filial_id, search, include_inactive)
+    return await service.list_temparios(filial_id, search, include_inactive, part_id=part_id)
 
 
 @router.get("/temparios/{tempario_id}", response_model=TemparioRead)

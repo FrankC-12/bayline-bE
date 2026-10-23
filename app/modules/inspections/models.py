@@ -14,6 +14,8 @@ class PreliminaryInspection(Base):
     Optionally links to a ServiceOrder once one is created for it."""
 
     __tablename__ = "preliminary_inspections"
+    interior: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default="{}")
+    fluids: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict, server_default="{}")
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     filial_id: Mapped[uuid.UUID] = mapped_column(

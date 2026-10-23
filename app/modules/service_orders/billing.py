@@ -683,6 +683,24 @@ class BillingService:
             for invoice, order, client in result.all()
         ]
 
+    async def collection_context(self, invoice_id):
+        invoice = await self.get_invoice_by_id(invoice_id)
+        rate_row = (
+            await self.db.execute(
+                select(ExchangeRate).where(
+                    ExchangeRate.currency == "USD", ExchangeRate.value_date == billing_day()
+                )
+            )
+        ).scalar_one_or_none()
+        rate = Decimal(str(rate_row.rate_ves)) if rate_row else None
+        pending = money(self._pending_amount(invoice))
+        return {
+            "pending_usd": float(pending),
+            "bcv_rate": float(rate) if rate and rate > 0 else None,
+            "bcv_date": rate_row.value_date if rate_row else None,
+            "pending_bs": float(money(pending * rate)) if rate and rate > 0 else None,
+        }
+
     async def collect_invoice(
         self,
         invoice_id: uuid.UUID,
@@ -717,7 +735,10 @@ class BillingService:
         ).scalar_one_or_none()
         if invoice is None:
             raise InvoiceNotFoundError(str(invoice_id))
-        request_hash = digest(payload.model_dump(mode="json"))
+        request_payload = payload.model_dump(mode="json")
+        if payload.expected_bcv_rate is None:
+            request_payload.pop("expected_bcv_rate", None)
+        request_hash = digest(request_payload)
         if payload.request_id is not None:
             existing = await self.db.get(ServiceOrderCollectionRequest, payload.request_id)
             if existing is not None:
@@ -750,6 +771,15 @@ class BillingService:
         if account.currency == AccountCurrency.BS and (rate is None or rate <= 0):
             raise BadRequestError(
                 "No hay tasa BCV del día para cobrar en Bs.", error_code="bcv_rate_required"
+            )
+        if (
+            account.currency == AccountCurrency.BS
+            and payload.expected_bcv_rate is not None
+            and payload.expected_bcv_rate != rate
+        ):
+            raise ConflictError(
+                "La tasa BCV cambió. Revisa el desglose antes de registrar el cobro.",
+                error_code="collection_rate_changed",
             )
         amount_usd = money(
             payload.net_collected_amount

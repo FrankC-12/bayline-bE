@@ -77,6 +77,7 @@ class LaborSettings(Base):
     # Default factory-warranty term (months) applied when a vehicle sale
     # auto-creates its VehicleWarranty and no more specific term was given.
     # A manual/bulk warranty entry can always override this per vehicle.
+    vehicle_warranty_default_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
     vehicle_warranty_default_months: Mapped[int] = mapped_column(
         Integer, nullable=False, default=36, server_default="36"
     )

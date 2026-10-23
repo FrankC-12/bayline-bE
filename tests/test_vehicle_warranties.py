@@ -183,6 +183,9 @@ async def test_create_or_renew_from_sale_restarts_an_existing_warranty(env):
 @pytest.mark.asyncio
 async def test_marking_a_dealership_vehicle_sold_auto_creates_the_warranty(env):
     service, session, filial_id = env
+    settings = await service.get_labor_settings(filial_id)
+    settings.vehicle_warranty_default_km = 100000
+    session.commit()
     concesionario = ConcesionarioService(service.db)
 
     dealership_vehicle = DealershipVehicle(
@@ -215,6 +218,7 @@ async def test_marking_a_dealership_vehicle_sold_auto_creates_the_warranty(env):
     assert warranty.brand == "Kia"
     assert warranty.dealership_vehicle_id == dealership_vehicle.id
     assert warranty.duration_months == 36
+    assert warranty.duration_km == 100000
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 import calendar
 import uuid
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,7 +11,7 @@ from app.core.exceptions import BadRequestError
 from app.core.venezuela_time import venezuela_today
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.parts.models import Part
-from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
+from app.modules.parts.pricing import DEFAULT_DISCOUNT, price_parts_cost
 from app.modules.post_ventas.enums import (
     CATEGORY_PREFIXES,
     TemparioCategory,
@@ -38,6 +39,7 @@ from app.modules.post_ventas.models import (
     WarrantyPolicyTempario,
     WorkshopWarranty,
 )
+from app.modules.post_ventas.pricing import catalog_fifo_costs
 from app.modules.post_ventas.schemas import (
     CompatibleVehicle,
     LaborSettingsUpdate,
@@ -61,21 +63,51 @@ from app.modules.post_ventas.schemas import (
 )
 
 
-def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) -> TemparioRead:
+def _tempario_to_read(
+    t: Tempario,
+    hourly_rate: float,
+    iva_percentage: float,
+    fifo_costs=None,
+    discount_label=DEFAULT_DISCOUNT,
+) -> TemparioRead:
+    price_notes = fifo_costs.notes if fifo_costs is not None else []
+    fifo_costs = fifo_costs.costs if fifo_costs is not None else None
     # Same formula a real ODS uses (price_parts_cost/PARTS_MULTIPLIERS in
     # app.modules.parts.pricing): margin applied once, on the true parts
     # cost, using the same default margin tier an order starts on — so a
     # tempario's preview total matches exactly what the ODS that uses it
     # will charge, as long as the order keeps the default discount.
-    parts_cost = sum(p.quantity * float(p.unit_cost) for p in t.parts)
-    parts_price = parts_cost * float(PARTS_MULTIPLIERS[DEFAULT_DISCOUNT])
+    groups = {}
+    for p in t.parts:
+        key = p.part_id or p.id
+        cost, quantity = groups.get(key, (Decimal(0), 0))
+        groups[key] = (cost + Decimal(str(p.unit_cost)) * p.quantity, quantity + p.quantity)
+    if fifo_costs is not None:
+        groups = {
+            key: (fifo_costs.get(key, cost), quantity) for key, (cost, quantity) in groups.items()
+        }
+    parts_cost = sum((cost for cost, _ in groups.values()), Decimal(0))
+    parts_price = sum(
+        (price_parts_cost(cost, quantity, discount_label)[1] for cost, quantity in groups.values()),
+        Decimal(0),
+    )
     parts_margin = parts_price - parts_cost
-    labor_cost = float(t.estimated_hours) * hourly_rate
+    cent = Decimal("0.01")
+    hours = Decimal(str(t.estimated_hours)).quantize(cent, rounding=ROUND_HALF_UP)
+    labor_cost = (hours * Decimal(str(hourly_rate))).quantize(cent, rounding=ROUND_HALF_UP)
     total_price = parts_cost + parts_margin + labor_cost
-    iva_amount = (labor_cost + parts_price) * iva_percentage / 100
+    iva_amount = ((labor_cost + parts_price) * Decimal(str(iva_percentage)) / 100).quantize(
+        cent, rounding=ROUND_HALF_UP
+    )
     total_with_iva = labor_cost + parts_price + iva_amount
 
     return TemparioRead(
+        pricing_notes=price_notes,
+        pricing_warnings=[
+            f"Vincula el repuesto «{p.name}» al catálogo antes de usar este tempario en una ODS."
+            for p in t.parts
+            if not p.part_id
+        ],
         warranty_mode=t.warranty_mode,
         warranty_days=t.warranty_days,
         warranty_km=t.warranty_km,
@@ -86,7 +118,7 @@ def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) ->
         code=t.code,
         category=t.category,
         name=t.name,
-        estimated_hours=float(t.estimated_hours),
+        estimated_hours=float(hours),
         year_from=t.year_from,
         year_to=t.year_to,
         compatible_vehicles=[CompatibleVehicle(**v) for v in t.compatible_vehicles],
@@ -100,8 +132,10 @@ def _tempario_to_read(t: Tempario, hourly_rate: float, iva_percentage: float) ->
                 part_id=p.part_id,
                 name=p.name,
                 quantity=p.quantity,
-                unit_cost=float(p.unit_cost),
-                subtotal=p.quantity * float(p.unit_cost),
+                unit_cost=float(groups[p.part_id or p.id][0] / groups[p.part_id or p.id][1]),
+                subtotal=float(
+                    groups[p.part_id or p.id][0] / groups[p.part_id or p.id][1] * p.quantity
+                ),
             )
             for p in t.parts
         ],
@@ -184,6 +218,62 @@ class PostVentasService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def preview_tempario(self, payload, order=None):
+        from datetime import UTC, datetime
+
+        from app.modules.warehouse.service import AlmacenService
+
+        await AlmacenService(self.db).ensure_inventory_scope(
+            payload.filial_id, [], [p.part_id for p in payload.parts if p.part_id]
+        )
+        now = datetime.now(UTC)
+        draft = Tempario(
+            id=uuid.uuid4(),
+            filial_id=payload.filial_id,
+            category=TemparioCategory.OTRO,
+            sequence_number=1,
+            name="Vista previa",
+            estimated_hours=payload.estimated_hours,
+            warranty_mode="standard",
+            is_active=True,
+            compatible_vehicles=[],
+            tools=[],
+            requires_parts=bool(payload.parts),
+            parts=[TemparioPart(id=uuid.uuid4(), **p.model_dump()) for p in payload.parts],
+            created_at=now,
+            updated_at=now,
+        )
+        settings = await self.get_labor_settings(payload.filial_id, commit=False)
+        if order is not None:
+            from app.modules.ajustes.snapshots import order_settings
+
+            settings = order_settings(order, settings)
+        costs = await catalog_fifo_costs(self.db, payload.filial_id, [draft])
+        read = _tempario_to_read(
+            draft,
+            float(settings.hourly_rate),
+            float(settings.iva_percentage),
+            costs.get(draft.id),
+            order.discount_label if order is not None else DEFAULT_DISCOUNT,
+        )
+        return {
+            **read.model_dump(
+                include={
+                    "parts_cost",
+                    "parts_margin",
+                    "labor_cost",
+                    "total_price",
+                    "iva_percentage",
+                    "iva_amount",
+                    "total_with_iva",
+                    "pricing_warnings",
+                    "pricing_notes",
+                    "parts",
+                }
+            ),
+            "hourly_rate": float(settings.hourly_rate),
+        }
+
     # Labor settings
 
     async def get_labor_settings(
@@ -235,6 +325,8 @@ class PostVentasService:
         settings.iva_percentage = payload.iva_percentage
         settings.part_warranty_days = payload.part_warranty_days
         settings.vehicle_warranty_default_months = payload.vehicle_warranty_default_months
+        if "vehicle_warranty_default_km" in payload.model_fields_set:
+            settings.vehicle_warranty_default_km = payload.vehicle_warranty_default_km or None
         settings.workshop_warranty_days = payload.workshop_warranty_days
         settings.workshop_warranty_km = payload.workshop_warranty_km
         settings.workshop_parts_warranty_days = payload.workshop_parts_warranty_days
@@ -255,7 +347,10 @@ class PostVentasService:
 
     async def _get_tempario_model(self, tempario_id: uuid.UUID) -> Tempario:
         query = (
-            select(Tempario).options(selectinload(Tempario.parts)).where(Tempario.id == tempario_id)
+            select(Tempario)
+            .options(selectinload(Tempario.parts))
+            .where(Tempario.id == tempario_id)
+            .execution_options(populate_existing=True)
         )
         result = await self.db.execute(query)
         tempario = result.scalar_one_or_none()
@@ -311,7 +406,11 @@ class PostVentasService:
                 read.legacy_warranty_label = " · ".join(terms)
 
     async def list_temparios(
-        self, filial_id: uuid.UUID, search: str | None = None, include_inactive: bool = False
+        self,
+        filial_id: uuid.UUID,
+        search: str | None = None,
+        include_inactive: bool = False,
+        part_id: uuid.UUID | None = None,
     ) -> list[TemparioRead]:
         query = (
             select(Tempario)
@@ -319,6 +418,8 @@ class PostVentasService:
             .where(Tempario.filial_id == filial_id)
             .order_by(Tempario.category, Tempario.sequence_number)
         )
+        if part_id:
+            query = query.where(Tempario.parts.any(TemparioPart.part_id == part_id))
         if not include_inactive:
             query = query.where(Tempario.is_active.is_(True))
         result = await self.db.execute(query)
@@ -347,7 +448,8 @@ class PostVentasService:
             .all()
         )
         names = {user.id: user.full_name for user in users}
-        reads = [_tempario_to_read(t, rate, iva_percentage) for t in temparios]
+        costs = await catalog_fifo_costs(self.db, filial_id, temparios)
+        reads = [_tempario_to_read(t, rate, iva_percentage, costs.get(t.id)) for t in temparios]
         for read in reads:
             read.updated_by_name = names.get(read.updated_by_user_id)
         await self._attach_legacy_warranty_labels(reads)
@@ -359,7 +461,10 @@ class PostVentasService:
         from app.modules.users.models import User
 
         user = await self.db.get(User, t.updated_by_user_id) if t.updated_by_user_id else None
-        read = _tempario_to_read(t, float(settings.hourly_rate), float(settings.iva_percentage))
+        costs = await catalog_fifo_costs(self.db, t.filial_id, [t])
+        read = _tempario_to_read(
+            t, float(settings.hourly_rate), float(settings.iva_percentage), costs.get(t.id)
+        )
         read.updated_by_name = user.full_name if user else None
         await self._attach_legacy_warranty_labels([read])
         return read
@@ -406,6 +511,33 @@ class PostVentasService:
             if policy.applies_to not in (coverage, WarrantyPolicyAppliesTo.AMBAS):
                 raise BadRequestError("La garantía no corresponde a esta cobertura.")
 
+    async def _catalog_part_costs(self, filial_id, parts, existing=()):
+        """The editor cannot override purchase costs or existing initial estimates."""
+        from app.modules.warehouse.models import PartLot
+
+        ids = {p.part_id for p in parts if p.part_id}
+        lots = (
+            (
+                await self.db.execute(
+                    select(PartLot)
+                    .where(PartLot.filial_id == filial_id, PartLot.part_id.in_(ids))
+                    .order_by(PartLot.received_at, PartLot.id)
+                )
+            )
+            .scalars()
+            .all()
+            if ids
+            else []
+        )
+        latest = {lot.part_id: lot.unit_cost for lot in lots}
+        stored = {p.part_id or p.name: p.unit_cost for p in existing}
+        return [
+            p.model_copy(
+                update={"unit_cost": latest.get(p.part_id, stored.get(p.part_id or p.name, 0))}
+            )
+            for p in parts
+        ]
+
     async def create_tempario(self, payload: TemparioCreate, user_id=None) -> TemparioRead:
         from app.modules.filiales.models import Filial
 
@@ -445,7 +577,7 @@ class PostVentasService:
         self.db.add(t)
         await self.db.flush()
 
-        for part in payload.parts:
+        for part in await self._catalog_part_costs(payload.filial_id, payload.parts):
             self.db.add(
                 TemparioPart(
                     tempario_id=t.id,
@@ -507,10 +639,11 @@ class PostVentasService:
             t.requires_parts = payload.requires_parts
 
         if payload.parts is not None:
+            normalized_parts = await self._catalog_part_costs(t.filial_id, payload.parts, t.parts)
             for existing in list(t.parts):
                 await self.db.delete(existing)
             await self.db.flush()
-            for part in payload.parts:
+            for part in normalized_parts:
                 self.db.add(
                     TemparioPart(
                         tempario_id=t.id,
@@ -666,9 +799,7 @@ class PostVentasService:
         self, w: VehicleWarranty, current_mileage: int | None = None
     ) -> VehicleWarrantyRead:
         today = venezuela_today()
-        status = (
-            "vencida" if w.expires_at is not None and w.expires_at < today else "vigente"
-        )
+        status = "vencida" if w.expires_at is not None and w.expires_at < today else "vigente"
         days_remaining = max((w.expires_at - today).days, 0) if w.expires_at else None
         km_remaining = (
             max(w.duration_km - current_mileage, 0)
@@ -676,11 +807,16 @@ class PostVentasService:
             else None
         )
         expiration_reason = "fecha" if status == "vencida" else None
-        if w.duration_km is not None and current_mileage is not None and current_mileage >= w.duration_km:
+        if (
+            w.duration_km is not None
+            and current_mileage is not None
+            and current_mileage >= w.duration_km
+        ):
             status = "vencida"
             expiration_reason = "fecha_y_kilometraje" if expiration_reason else "kilometraje"
         return VehicleWarrantyRead(
-            current_mileage=current_mileage, expiration_reason=expiration_reason,
+            current_mileage=current_mileage,
+            expiration_reason=expiration_reason,
             certificate_photo_url=w.certificate_photo_url,
             id=w.id,
             filial_id=w.filial_id,
@@ -733,10 +869,18 @@ class PostVentasService:
     async def _current_mileage_by_vin(self, filial_id, vin):
         from app.modules.clients.models import Client, Vehicle
         from app.modules.clients.service import ClientService
-        vehicle = (await self.db.execute(
-            select(Vehicle).join(Client, Client.id == Vehicle.client_id)
-            .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
-        )).scalars().first()
+
+        vehicle = (
+            (
+                await self.db.execute(
+                    select(Vehicle)
+                    .join(Client, Client.id == Vehicle.client_id)
+                    .where(Client.filial_id == filial_id, Vehicle.vin == vin.strip().upper())
+                )
+            )
+            .scalars()
+            .first()
+        )
         if vehicle is None:
             return None
         return await ClientService(self.db).get_current_mileage(vehicle.id)
@@ -876,7 +1020,7 @@ class PostVentasService:
         warranty.model = model
         warranty.starts_at = sale_date
         warranty.duration_months = default_months
-        warranty.duration_km = None
+        warranty.duration_km = settings.vehicle_warranty_default_km or None
         warranty.expires_at = self._expires_at(sale_date, default_months)
         warranty.source = VehicleWarrantySource.VENTA
         warranty.dealership_vehicle_id = dealership_vehicle_id
@@ -894,23 +1038,32 @@ class PostVentasService:
     ) -> WorkshopWarrantyRead:
         # expires_at is null for a "sin vencimiento" policy — never expires.
         today = venezuela_today()
-        status = (
-            "vencida" if w.expires_at is not None and w.expires_at < today else "vigente"
-        )
+        status = "vencida" if w.expires_at is not None and w.expires_at < today else "vigente"
         if (
             current_mileage is not None
             and w.expiration_mileage is not None
             and current_mileage >= w.expiration_mileage
         ):
             status = "vencida"
-        days_remaining = (
-            max((w.expires_at - today).days, 0) if w.expires_at is not None else None
-        )
+        days_remaining = max((w.expires_at - today).days, 0) if w.expires_at is not None else None
         date_expired = w.expires_at is not None and w.expires_at < today
-        km_expired = current_mileage is not None and w.expiration_mileage is not None and current_mileage >= w.expiration_mileage
-        expiration_reason = "fecha_y_kilometraje" if date_expired and km_expired else "fecha" if date_expired else "kilometraje" if km_expired else None
+        km_expired = (
+            current_mileage is not None
+            and w.expiration_mileage is not None
+            and current_mileage >= w.expiration_mileage
+        )
+        expiration_reason = (
+            "fecha_y_kilometraje"
+            if date_expired and km_expired
+            else "fecha"
+            if date_expired
+            else "kilometraje"
+            if km_expired
+            else None
+        )
         return WorkshopWarrantyRead(
-            current_mileage=current_mileage, expiration_reason=expiration_reason,
+            current_mileage=current_mileage,
+            expiration_reason=expiration_reason,
             id=w.id,
             filial_id=w.filial_id,
             vin=w.vin,

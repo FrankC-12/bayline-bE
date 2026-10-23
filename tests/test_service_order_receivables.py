@@ -17,7 +17,11 @@ from app.modules.administracion.models import Account, IncomeEntry
 from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client
 from app.modules.filiales.models import Filial
-from app.modules.service_orders.billing_schemas import BillingInput, CollectInvoicePaymentInput, InvoiceCreate
+from app.modules.service_orders.billing_schemas import (
+    BillingInput,
+    CollectInvoicePaymentInput,
+    InvoiceCreate,
+)
 from app.modules.service_orders.enums import ServiceOrderStatus
 
 inventory = fifo_inventory
@@ -180,8 +184,9 @@ async def test_collect_invoice_accepts_bs_account_and_reduces_pending(ready):
     session.add(bs_account)
     session.commit()
 
-    from app.modules.exchange_rates.models import ExchangeRate
     from sqlalchemy import select
+
+    from app.modules.exchange_rates.models import ExchangeRate
 
     rate = session.scalars(select(ExchangeRate)).one()
     result = await billing.collect_invoice(
@@ -353,3 +358,55 @@ async def test_invoice_two_abonos_close_only_when_fully_settled(ready):
     assert result.pending_amount == 0
     assert invoice.collected_at is not None
     assert await billing.list_receivables(order.filial_id) == []
+
+
+@pytest.mark.asyncio
+async def test_bs_collection_uses_displayed_rate_and_rejects_changed_rate_without_income(ready):
+    from sqlalchemy import func, select
+
+    from app.core.exceptions import ConflictError
+    from app.modules.exchange_rates.models import ExchangeRate
+    from app.modules.service_orders.billing import billing_day
+
+    await prepare(ready)
+    _, session, order, _, _, billing, accounts, _ = ready
+    payload = (await invoice_payload(billing, order, accounts)).model_copy(
+        update={"paid_usd": Decimal(0), "paid_bs": Decimal(0)}
+    )
+    invoice = await billing.issue(order.id, payload, None)
+    context = await billing.collection_context(invoice.id)
+    assert context["bcv_rate"] == 50
+    assert context["pending_bs"] == float(Decimal(str(context["pending_usd"])) * 50)
+    before = session.scalar(select(func.count(IncomeEntry.id)))
+    rate = session.scalar(
+        select(ExchangeRate).where(
+            ExchangeRate.value_date == billing_day(), ExchangeRate.currency == "USD"
+        )
+    )
+    rate.rate_ves = 55
+    session.commit()
+    with pytest.raises(ConflictError) as error:
+        await billing.collect_invoice(
+            invoice.id,
+            CollectInvoicePaymentInput(
+                account_id=accounts[1].id,
+                expected_bcv_rate=50,
+                withholding_amount=0,
+                net_collected_amount=100,
+            ),
+            None,
+        )
+    assert error.value.error_code == "collection_rate_changed"
+    assert session.scalar(select(func.count(IncomeEntry.id))) == before
+    context = await billing.collection_context(invoice.id)
+    result = await billing.collect_invoice(
+        invoice.id,
+        CollectInvoicePaymentInput(
+            account_id=accounts[1].id,
+            expected_bcv_rate=context["bcv_rate"],
+            withholding_amount=0,
+            net_collected_amount=context["pending_bs"],
+        ),
+        None,
+    )
+    assert result.pending_amount == 0

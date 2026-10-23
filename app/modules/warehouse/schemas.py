@@ -63,6 +63,7 @@ class StockInCreate(BaseModel):
 
 
 class PartLotRead(BaseModel):
+    fifo_status: str | None = None
     id: uuid.UUID
     code: str
     warehouse_id: uuid.UUID

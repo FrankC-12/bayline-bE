@@ -45,11 +45,11 @@ from app.modules.parts.schemas import (
     PartRead,
     PartReturnCreate,
     PartSaleCreate,
-    PartSaleRead,
     PartSaleLineDispatch,
     PartSalePaymentCreate,
     PartSalePaymentQuote,
     PartSalePaymentQuoteInput,
+    PartSaleRead,
     PartUpdate,
 )
 from app.modules.post_ventas.models import LaborSettings
@@ -735,6 +735,7 @@ class PartsService:
             payload.filial_id, subtotal
         )
         return {
+            "quote_hash": self._sale_quote_digest(payload, plans, iva_percentage, igtf_percentage),
             "lines": [
                 dict(
                     part_id=part.id,
@@ -758,6 +759,24 @@ class PartsService:
             "total_with_taxes": subtotal + iva_amount + igtf_amount,
         }
 
+    @staticmethod
+    def _sale_quote_digest(payload, plans, iva_percentage, igtf_percentage):
+        import hashlib
+        import json
+
+        content = [
+            str(payload.filial_id),
+            str(payload.warehouse_id),
+            payload.discount_label,
+            str(iva_percentage),
+            str(igtf_percentage),
+            sorted(
+                (str(part.id), quantity, str(price), str(total))
+                for part, quantity, _, _, price, total in plans
+            ),
+        ]
+        return hashlib.sha256(json.dumps(content).encode()).hexdigest()
+
     async def create_sale(
         self, payload: PartSaleCreate, responsible_user_id: uuid.UUID | None = None
     ) -> PartSale:
@@ -767,6 +786,15 @@ class PartsService:
             iva_percentage, iva_amount, igtf_percentage, igtf_amount = await self._tax_breakdown(
                 payload.filial_id, subtotal
             )
+            if payload.quote_hash is not None and payload.quote_hash != self._sale_quote_digest(
+                payload, plans, iva_percentage, igtf_percentage
+            ):
+                from app.core.exceptions import ConflictError
+
+                raise ConflictError(
+                    "La cotización cambió. Revisa los nuevos precios antes de confirmar la venta.",
+                    error_code="sale_quote_changed",
+                )
             sale = PartSale(
                 filial_id=payload.filial_id,
                 client_name=payload.client_name,
@@ -1101,7 +1129,9 @@ class PartsService:
                     amount_bs=(
                         float(money(amount * rate))
                         if currency == AccountCurrency.USD and rate
-                        else float(amount) if currency == AccountCurrency.BS else None
+                        else float(amount)
+                        if currency == AccountCurrency.BS
+                        else None
                     ),
                     description=f"Cobro {sale.code} · {sale.client_name}",
                     amount=float(amount),
