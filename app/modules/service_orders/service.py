@@ -314,12 +314,18 @@ class ServiceOrderService:
         scheduled_date: date | None = None,
         technician_user_id: uuid.UUID | None = None,
         include_drafts: bool = False,
+        drafts_only: bool = False,
     ) -> list[ServiceOrder]:
         """`technician_user_id` restricts the list to orders assigned to that
         técnico — used when the caller doesn't have general asesor-servicios
         access but may still see their own assigned work (see router._ensure_access)."""
         query = select(ServiceOrder).where(ServiceOrder.filial_id == filial_id)
-        if not include_drafts or technician_user_id is not None:
+        from sqlalchemy import or_
+        if drafts_only:
+            query = query.where(ServiceOrder.is_draft.is_(True), ServiceOrder.status == ServiceOrderStatus.PENDIENTE)
+        elif not include_drafts:
+            query = query.where(or_(ServiceOrder.is_draft.is_(False), ServiceOrder.status == ServiceOrderStatus.CANCELADO))
+        if technician_user_id is not None:
             query = query.where(ServiceOrder.is_draft.is_(False))
         if statuses:
             query = query.where(ServiceOrder.status.in_(statuses))
@@ -378,7 +384,11 @@ class ServiceOrderService:
         statuses = (
             ACTIVE_STATUSES if view == "active" else HISTORY_STATUSES if view == "history" else None
         )
-        if not include_drafts or technician_user_id is not None:
+        if view == "drafts":
+            query = query.where(ServiceOrder.is_draft.is_(True), ServiceOrder.status == ServiceOrderStatus.PENDIENTE)
+        elif not include_drafts:
+            query = query.where(or_(ServiceOrder.is_draft.is_(False), ServiceOrder.status == ServiceOrderStatus.CANCELADO))
+        if technician_user_id is not None:
             query = query.where(ServiceOrder.is_draft.is_(False))
         if statuses:
             query = query.where(ServiceOrder.status.in_(statuses))
@@ -461,7 +471,7 @@ class ServiceOrderService:
             scheduled = order.scheduled_at
             if scheduled and scheduled.tzinfo is None:
                 scheduled = scheduled.replace(tzinfo=UTC)
-            if order.is_draft:
+            if order.is_draft and order.status != ServiceOrderStatus.CANCELADO:
                 stage = "agendada" if scheduled else "borrador"
             elif order.status == ServiceOrderStatus.CANCELADO:
                 stage = "cancelada"
@@ -866,11 +876,6 @@ class ServiceOrderService:
         self, order_id: uuid.UUID, reason: str, cancelled_by_user_id: uuid.UUID
     ) -> ServiceOrder:
         order = await require_editable_order(self.db, order_id)
-        if order.is_draft:
-            raise ConflictError(
-                "Descarta el borrador en lugar de cancelar una orden no enviada.",
-                error_code="order_is_draft",
-            )
         if ServiceOrderStatus.CANCELADO not in ALLOWED_TRANSITIONS.get(order.status, set()):
             raise InvalidStatusTransitionError(
                 order.status.value, ServiceOrderStatus.CANCELADO.value
@@ -887,6 +892,7 @@ class ServiceOrderService:
         order.reopened_at = None
         await self.db.commit()
         await self.db.refresh(order)
+        await self.attach_workflow([order])
         return order
 
     async def reopen_order(
@@ -908,6 +914,7 @@ class ServiceOrderService:
         order.reopened_at = datetime.now(UTC)
         await self.db.commit()
         await self.db.refresh(order)
+        await self.attach_workflow([order])
         return order
 
     async def delete_order(self, order_id: uuid.UUID) -> None:

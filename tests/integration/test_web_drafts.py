@@ -307,3 +307,68 @@ async def test_inspection_records_remain_readable_after_order_is_closed(billing_
         assert data["preliminary"]["photo_urls"]
         assert data["detailed"]["data"]["engine"]["battery_voltage"] == 12.6
         assert data["detailed"]["annexes"][0]["filename"] == "fuga.jpg"
+
+
+@pytest.mark.asyncio
+async def test_draft_tab_cancellation_history_and_deletion_are_scoped(billing_db):
+    ctx = billing_db
+    mobile = await technician(ctx)
+    advisor = mobile.model_copy(update={"role_slug": "filial-admin"})
+    active = advisor
+    app = FastAPI()
+    register_exception_handlers(app)
+    app.include_router(router, prefix="/api/v1")
+    app.dependency_overrides[get_current_user] = lambda: active
+
+    async def session():
+        async with ctx.sessions() as db:
+            yield db
+
+    app.dependency_overrides[get_db] = session
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
+        keys = []
+        for _ in range(2):
+            result = await http.post(
+                "/api/v1/service-order-drafts", json={"filial_id": str(ctx.filial_id)}
+            )
+            assert result.status_code == 201, result.text
+            keys.append(result.json()["id"])
+        drafts = await http.get(
+            "/api/v1/service-orders/page",
+            params={"filial_id": str(ctx.filial_id), "view": "drafts"},
+        )
+        assert drafts.status_code == 200, drafts.text
+        assert set(keys).issubset({o["id"] for o in drafts.json()["items"]})
+        normal = await http.get(
+            "/api/v1/service-orders", params={"filial_id": str(ctx.filial_id), "view": "active"}
+        )
+        assert not set(keys) & {o["id"] for o in normal.json()}
+        active = mobile
+        hidden = await http.get(
+            "/api/v1/service-orders/page",
+            params={"filial_id": str(ctx.filial_id), "view": "drafts"},
+        )
+        assert hidden.status_code == 200 and hidden.json()["items"] == []
+        denied = await http.delete(f"/api/v1/service-order-drafts/{keys[1]}")
+        assert denied.status_code == 403
+        active = advisor
+        cancelled = await http.post(
+            f"/api/v1/service-orders/{keys[0]}/cancel", json={"reason": "El cliente no continuará"}
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["status"] == "cancelado"
+        assert cancelled.json()["workshop_stage"] == "cancelada"
+        history = await http.get(
+            "/api/v1/service-orders/page",
+            params={"filial_id": str(ctx.filial_id), "view": "history"},
+        )
+        assert keys[0] in {o["id"] for o in history.json()["items"]}
+        removed = await http.delete(f"/api/v1/service-order-drafts/{keys[1]}")
+        assert removed.status_code == 204, removed.text
+        drafts = await http.get(
+            "/api/v1/service-orders/page",
+            params={"filial_id": str(ctx.filial_id), "view": "drafts"},
+        )
+        assert not set(keys) & {o["id"] for o in drafts.json()["items"]}
+        protected = await http.delete(f"/api/v1/service-order-drafts/{ctx.order_id}")
+        assert protected.status_code == 409

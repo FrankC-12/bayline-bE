@@ -35,3 +35,15 @@ Crear una ODS desde una recomendación aplazada copia su trabajo al borrador. No
 - Los endpoints anteriores se conservan para contratos existentes. El nuevo flujo web utiliza las rutas de selección de garantía, revisión y respuesta de marca.
 
 Bahías se administran en **Ajustes > Taller > Bahías**, con permisos de Ajustes. Asesores y técnicos mantienen acceso de lectura al calendario.
+
+## Bandeja de borradores
+
+La web separa «Órdenes activas», «Borradores» e «Historial». La bandeja nueva está en `/dashboard/servicios/borradores` y consulta `/service-orders/page?view=drafts` con paginación y búsqueda. `view=drafts` también está disponible en el listado sin paginar; solo devuelve borradores pendientes de la filial autorizada. Los listados técnicos no incluyen borradores, aun solicitando ese filtro.
+
+Desde la bandeja se puede continuar la edición, cancelar con motivo o eliminar con confirmación:
+
+- Cancelar conserva `is_draft=true`, asigna estado `cancelado`, motivo, usuario y fecha, y lo muestra en el historial. Si un usuario autorizado lo recupera, vuelve a ser borrador y no se publica en mobile.
+- Eliminar utiliza el endpoint protegido de borradores. Una ODS enviada al taller no puede eliminarse mediante esta acción.
+- Las órdenes activas ya no mezclan borradores al pie del tablero. La consulta `view=all` conserva la posibilidad de incluirlos para el calendario.
+
+No requiere migración adicional; se deben desplegar backend y frontend de esta versión juntos.

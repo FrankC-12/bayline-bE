@@ -200,7 +200,7 @@ async def update_order_type(
 @router.get("/service-orders", response_model=list[ServiceOrderRead])
 async def list_service_orders(
     filial_id: uuid.UUID = Query(...),
-    view: str = Query(default="active", pattern="^(active|history|all)$"),
+    view: str = Query(default="active", pattern="^(active|drafts|history|all)$"),
     date: dt.date | None = Query(default=None),
     include_drafts: bool = Query(False),
     current_user: CurrentUser = Depends(get_current_user),
@@ -219,7 +219,8 @@ async def list_service_orders(
     else:
         statuses = None
     return await service.list_orders(
-        filial_id, statuses, date, technician_user_id, include_drafts=include_drafts
+        filial_id, statuses, date, technician_user_id, include_drafts=include_drafts,
+        drafts_only=view == "drafts",
     )
 
 
@@ -230,7 +231,7 @@ async def list_service_orders(
 )
 async def page_service_orders(
     filial_id: uuid.UUID = Query(...),
-    view: str = Query("active", pattern="^(active|history|all)$"),
+    view: str = Query("active", pattern="^(active|drafts|history|all)$"),
     status: ServiceOrderStatus | None = Query(None),
     search: str | None = Query(None, max_length=150),
     date_from: dt.date | None = Query(None),

@@ -244,7 +244,6 @@ async def test_factory_approval_opens_draft_without_brand_stage(visit_env, campa
         await flow.review(claim.id, ClaimReviewInput(decision="aprobado"), actor)
 
 
-
 @pytest.mark.asyncio
 async def test_comeback_approval_opens_order_and_keeps_client_payer_zero(visit_env):
     from datetime import UTC, datetime, timedelta
@@ -308,7 +307,11 @@ async def test_comeback_approval_opens_order_and_keeps_client_payer_zero(visit_e
     )
     assert claim.service_order_id == origin.id and claim.tempario_id == catalog.id
     result = await flow.review(
-        claim.id, ClaimReviewInput(decision="aprobado", failure_confirmed=True, failure_category="mano_de_obra"), actor
+        claim.id,
+        ClaimReviewInput(
+            decision="aprobado", failure_confirmed=True, failure_category="mano_de_obra"
+        ),
+        actor,
     )
     assert result.status == WarrantyClaimStatus.CONVERTIDO_A_ODS
     tasks = await service.list_tasks(result.resulting_service_order_id)
@@ -363,3 +366,37 @@ async def test_calendar_cannot_double_book_a_bay_when_creating_or_moving_drafts(
     with pytest.raises(ConflictError):
         await flow.update(adjacent.id, ServiceOrderDraftUpdate(scheduled_at=when))
     assert first.is_draft and adjacent.is_draft
+
+
+@pytest.mark.asyncio
+async def test_drafts_have_their_own_view_and_cancelled_drafts_go_to_history(visit_env):
+    service, session, _, origin, _, _, _ = visit_env
+    drafts = DraftService(service.db)
+    actor = SimpleNamespace(user_id=origin.advisor_user_id)
+    draft = await drafts.create(ServiceOrderDraftCreate(filial_id=origin.filial_id), actor)
+    listed = await service.list_orders(origin.filial_id, drafts_only=True)
+    assert draft.id in {o.id for o in listed}
+    assert all(o.is_draft and o.status == ServiceOrderStatus.PENDIENTE for o in listed)
+    page = await service.page_orders(origin.filial_id, view="drafts")
+    assert draft.id in {o.id for o in page.items}
+    cancelled = await service.cancel_order(draft.id, "El cliente no continuará", actor.user_id)
+    assert cancelled.is_draft and cancelled.status == ServiceOrderStatus.CANCELADO
+    assert cancelled.workshop_stage == "cancelada"
+    assert cancelled.cancel_reason == "El cliente no continuará"
+    assert cancelled.cancelled_by_user_id == actor.user_id
+    assert draft.id not in {
+        o.id for o in await service.list_orders(origin.filial_id, drafts_only=True)
+    }
+    history = await service.page_orders(origin.filial_id, view="history")
+    assert draft.id in {o.id for o in history.items}
+    # Restoring a cancelled draft returns to draft editing, never to mobile work.
+    await service.reopen_order(draft.id, actor.user_id)
+    assert draft.id in {o.id for o in await service.list_orders(origin.filial_id, drafts_only=True)}
+    assert draft.id not in {
+        o.id
+        for o in await service.list_orders(
+            origin.filial_id, technician_user_id=actor.user_id, include_drafts=True
+        )
+    }
+    await drafts.discard(draft.id)
+    assert session.get(ServiceOrder, draft.id) is None
