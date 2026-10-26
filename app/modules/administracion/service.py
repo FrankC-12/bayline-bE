@@ -9,7 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.venezuela_time import aging_bucket, venezuela_today
+from app.core.venezuela_time import aging_bucket, venezuela_today, business_period_bounds
 from app.modules.administracion.enums import (
     AccountCurrency,
     ClaimResolution,
@@ -1687,8 +1687,8 @@ class AdministracionService:
             .join(DealershipVehicle, DealershipVehicle.id == VehicleSale.vehicle_id)
             .where(
                 VehicleSale.filial_id.in_(filial_ids),
-                VehicleSale.created_at >= date_from,
-                VehicleSale.created_at <= date_to,
+                VehicleSale.created_at >= business_period_bounds(date_from, date_to)[0],
+                VehicleSale.created_at < business_period_bounds(date_from, date_to)[1],
                 DealershipVehicle.condition == condition,
             )
         )
@@ -1742,8 +1742,8 @@ class AdministracionService:
             .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
             .where(
                 PartSale.filial_id.in_(filial_ids),
-                PartSale.created_at >= date_from,
-                PartSale.created_at <= date_to,
+                PartSale.created_at >= business_period_bounds(date_from, date_to)[0],
+                PartSale.created_at < business_period_bounds(date_from, date_to)[1],
                 PartSale.status != PartSaleStatus.CANCELADO,
             )
         )
@@ -1793,8 +1793,8 @@ class AdministracionService:
             .join(ServiceOrder, ServiceOrder.id == ServiceOrderInvoice.service_order_id)
             .where(
                 ServiceOrder.filial_id.in_(filial_ids),
-                ServiceOrderInvoice.issued_at >= date_from,
-                ServiceOrderInvoice.issued_at <= date_to,
+                ServiceOrderInvoice.issued_at >= business_period_bounds(date_from, date_to)[0],
+                ServiceOrderInvoice.issued_at < business_period_bounds(date_from, date_to)[1],
             )
         )
         pairs = result.all()
@@ -2089,8 +2089,8 @@ class AdministracionService:
             select(StockMovement).where(
                 StockMovement.filial_id.in_(filial_ids),
                 StockMovement.movement_type == MovementType.DEVOLUCION,
-                StockMovement.created_at >= date_from,
-                StockMovement.created_at <= date_to,
+                StockMovement.created_at >= business_period_bounds(date_from, date_to)[0],
+                StockMovement.created_at < business_period_bounds(date_from, date_to)[1],
             )
         )
         shrinkage_losses = sum(

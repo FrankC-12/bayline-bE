@@ -80,7 +80,7 @@ def request_budgets(request: Request, settings) -> list[Budget]:
     segments = set(request.url.path.lower().split("/"))
     if (
         content_type.startswith("multipart/")
-        or bool(segments & {"export", "bulk"})
+        or bool(segments & {"export", "bulk", "control"})
         or (not read and bool(segments & {"upload", "uploads", "photos", "annex"}))
     ):
         budgets.append(Budget(f"expensive:{identity}", settings.rate_limit_expensive_per_minute))

@@ -63,6 +63,8 @@ async def _refresh_bcv_rate_loop() -> None:
 async def lifespan(app: FastAPI):
     log_runtime = AuditLogRuntime(settings.logs_dir, settings.logs_timezone).start()
     register_database_audit()
+    from app.modules.holdings.audit import register_holding_audit
+    register_holding_audit()
     record_event(audit_logger, "application_started")
     push_task = asyncio.create_task(push_worker())
     task = asyncio.create_task(_refresh_bcv_rate_loop())

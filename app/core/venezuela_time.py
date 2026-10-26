@@ -33,3 +33,12 @@ def caracas_date(value: datetime) -> date:
     """A persisted UTC timestamp's calendar day in Caracas (SQLite omits tzinfo)."""
     from datetime import UTC
     return (value if value.tzinfo else value.replace(tzinfo=UTC)).astimezone(VENEZUELA_TZ).date()
+
+
+def business_period_bounds(date_from: date, date_to: date) -> tuple[datetime, datetime]:
+    """UTC half-open bounds for complete Venezuelan calendar days."""
+    from datetime import UTC, time, timedelta
+    return (
+        datetime.combine(date_from, time.min, VENEZUELA_TZ).astimezone(UTC),
+        datetime.combine(date_to + timedelta(days=1), time.min, VENEZUELA_TZ).astimezone(UTC),
+    )

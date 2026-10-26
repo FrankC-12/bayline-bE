@@ -138,4 +138,46 @@ async def get_holding_profitability(
     from app.modules.administracion.service import AdministracionService
 
     _ensure_owns_holding(current_user, holding_id)
-    return await AdministracionService(db).get_profitability_for_holding(holding_id, date_from, date_to)
+    return await AdministracionService(db).get_profitability_for_holding(
+        holding_id, date_from, date_to
+    )
+
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from app.modules.holdings.control import HoldingControlService
+from app.modules.holdings.control_schemas import (
+    ControlReport,
+    RegisterCreate,
+    RegisterRead,
+    Section,
+)
+
+
+@router.get("/{holding_id}/control/{section}", response_model=ControlReport)
+async def get_control_report(
+    holding_id: uuid.UUID,
+    section: Section,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    filial_id: uuid.UUID | None = None,
+    current_user: CurrentUser = Depends(require_holding_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _ensure_owns_holding(current_user, holding_id)
+    today = datetime.now(ZoneInfo("America/Caracas")).date()
+    return await HoldingControlService(db).report(
+        holding_id, section, date_from or today, date_to or today, filial_id
+    )
+
+
+@router.post("/{holding_id}/registers", response_model=RegisterRead, status_code=201)
+async def create_control_register(
+    holding_id: uuid.UUID,
+    payload: RegisterCreate,
+    current_user: CurrentUser = Depends(require_holding_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _ensure_owns_holding(current_user, holding_id)
+    return await HoldingControlService(db).register(holding_id, current_user.user_id, payload)

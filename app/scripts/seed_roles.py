@@ -65,7 +65,6 @@ ROLES_SEED = [
         "permissions": [
             {"module_id": "administracion", "access": AccessLevel.EDITAR},
             {"module_id": "compras", "access": AccessLevel.EDITAR},
-            {"module_id": "access": AccessLevel.EDITAR},
             {"module_id": "ajustes", "access": AccessLevel.EDITAR},
             {"module_id": "kpis", "access": AccessLevel.VER},
         ],

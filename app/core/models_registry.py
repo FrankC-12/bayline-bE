@@ -46,3 +46,5 @@ from app.core.rate_limiting import ApiRateBucket  # noqa: F401
 from app.modules.auth.models import RefreshSession, LoginBucket  # noqa: F401
 
 from app.modules.notifications.models import Device, Notification  # noqa: F401
+
+from app.modules.holdings.control_models import HoldingRegister, HoldingAuditEvent  # noqa: F401

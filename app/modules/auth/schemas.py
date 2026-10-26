@@ -1,12 +1,23 @@
 import uuid
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, TypeAdapter, field_validator
 
 from app.modules.roles.enums import RoleScope
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr = Field(max_length=254)
+    email: str = Field(max_length=254)
+
+    @field_validator("email")
+    @classmethod
+    def login_identifier(cls, value):
+        from app.core.config import get_settings
+
+        normalized = value.strip().casefold()
+        if normalized == "motrixadmin":
+            return str(TypeAdapter(EmailStr).validate_python(get_settings().platform_admin_email))
+        return str(TypeAdapter(EmailStr).validate_python(normalized))
+
     password: str = Field(min_length=1, max_length=72)
 
     @field_validator("password")
