@@ -32,3 +32,17 @@ def price_parts_cost(cost: Decimal, quantity: int, discount_label: DiscountLabel
         raise NegativeMarginPriceError(cost, total)
     unit_price = (total / quantity).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
     return unit_price, total
+
+
+def price_catalog(list_price, cost, quantity, discount_label):
+    """A configured PVP is independent of FIFO. Legacy unconfigured catalogs
+    retain their old preview until an administrator sets a list price."""
+    if list_price is None:
+        return price_parts_cost(cost, quantity, discount_label)
+    unit = (
+        Decimal(str(list_price))
+        * PARTS_MULTIPLIERS[discount_label]
+        / PARTS_MULTIPLIERS[DEFAULT_DISCOUNT]
+    )
+    total = (unit * quantity).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return (total / quantity).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP), total

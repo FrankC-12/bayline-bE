@@ -94,17 +94,16 @@ async def test_create_fabrica_claim_stays_solicitado_no_order(env):
 
 
 @pytest.mark.asyncio
-async def test_reported_mileage_below_current_flags_inconsistency_but_saves(env):
+async def test_reported_mileage_below_current_is_rejected(env):
+    from app.core.exceptions import ConflictError
+
     service, session, filial_id, vehicle = env
     make_inspection(session, filial_id, vehicle.id, mileage=5000)
-
-    result = await service.create_warranty_claim(
-        fabrica_payload(vehicle.id, reported_mileage=3000), [], [], None
-    )
-
-    assert result.vehicle_mileage_at_claim == 5000
-    assert result.mileage_inconsistent is True
-    assert result.status == WarrantyClaimStatus.SOLICITADO
+    with pytest.raises(ConflictError) as error:
+        await service.create_warranty_claim(
+            fabrica_payload(vehicle.id, reported_mileage=3000), [], [], None
+        )
+    assert error.value.error_code == "mileage_inconsistent"
 
 
 @pytest.mark.asyncio

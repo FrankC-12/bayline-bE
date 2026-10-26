@@ -67,6 +67,13 @@ def register_holding_audit():
                         action=action,
                         entity=entity,
                         resource_id=str(getattr(obj, "id", "")) or None,
+                        resource_label=str(
+                            getattr(obj, "code", None)
+                            or getattr(obj, "full_name", None)
+                            or getattr(obj, "name", None)
+                            or ""
+                        )[:200]
+                        or None,
                         changed_fields=fields,
                     )
                 )

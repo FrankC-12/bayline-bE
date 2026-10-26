@@ -238,7 +238,11 @@ class ServiceOrder(Base):
     @property
     def code(self) -> str:
         """Human-facing code, e.g. 'ODS-2041'. Computed, not stored."""
-        return f"ODS-{self.sequence_number}"
+        return (
+            f"BOR-{abs(self.sequence_number)}"
+            if self.sequence_number < 0
+            else f"ODS-{self.sequence_number}"
+        )
 
 
 class ServiceOrderTask(Base):
@@ -483,6 +487,7 @@ class Upsell(Base):
     # Frozen at creation from the tempario/labor rate/FIFO cost in effect
     # that moment — the historical "precio cotizado", never recalculated on
     # read. Null only for rows created before this field existed.
+    approved_amount_snapshot: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     quoted_price_snapshot: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
     photo_urls: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     status: Mapped[UpsellStatus] = mapped_column(
@@ -570,6 +575,7 @@ class UpsellPart(Base):
     )
     name_snapshot: Mapped[str] = mapped_column(String(150), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    unit_price_snapshot: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
     unit_cost_snapshot: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
 
 

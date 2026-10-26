@@ -9,6 +9,7 @@ which leaves who forced it and when."""
 import uuid
 
 import pytest
+from workshop_ready import inspections_ready, task_ready
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from test_part_sales_fifo import AsyncAdapter, make_order_type
@@ -110,6 +111,7 @@ async def test_a_task_en_progreso_moves_the_order_to_en_progreso(env):
     await service.complete_transfer(transfer.id, _user.user_id)
     transfer.picked_up_at = datetime.now(UTC)
     await service.db.commit()
+    await task_ready(service, order, task)
     await service.update_task_status(task.id, TaskStatus.EN_PROGRESO)
     assert order.status == ServiceOrderStatus.EN_PROGRESO
 
@@ -123,18 +125,22 @@ async def test_a_task_en_espera_de_repuestos_moves_the_order_to_en_progreso(env)
 
 
 @pytest.mark.asyncio
-async def test_all_tasks_completed_with_pending_odt_completes_order(env):
+async def test_task_cannot_complete_with_pending_odt(env):
+    from app.core.exceptions import ConflictError
+
     service, order, tempario, _user = env
     task = await service.add_task(order.id, tempario.id)
-    await service.update_task_status(task.id, TaskStatus.COMPLETADA)
-    assert order.status == ServiceOrderStatus.COMPLETADO
-    assert (await service.list_transfers(order.id))[0].status.value == "pendiente"
+    with pytest.raises(ConflictError) as error:
+        await service.update_task_status(task.id, TaskStatus.COMPLETADA)
+    assert error.value.error_code == "task_parts_not_received"
+    assert order.status == ServiceOrderStatus.PENDIENTE
 
 
 @pytest.mark.asyncio
 async def test_all_tasks_completed_and_odt_dispatched_auto_completes_the_order(env):
     service, order, tempario, _user = env
     task = await service.add_task(order.id, tempario.id)
+    await task_ready(service, order, task)
     await service.update_task_status(task.id, TaskStatus.COMPLETADA)
     transfer = (await service.list_transfers(order.id))[0]
 
@@ -142,7 +148,7 @@ async def test_all_tasks_completed_and_odt_dispatched_auto_completes_the_order(e
 
     assert order.status == ServiceOrderStatus.COMPLETADO
     assert order.completed_at is not None
-    assert order.completed_with_pending_items is True
+    assert order.completed_with_pending_items is False
 
 
 @pytest.mark.asyncio
@@ -152,6 +158,7 @@ async def test_an_odt_already_marked_completado_by_almacen_also_auto_completes(e
     it further along and must not re-block completion."""
     service, order, tempario, user = env
     task = await service.add_task(order.id, tempario.id)
+    await task_ready(service, order, task)
     await service.update_task_status(task.id, TaskStatus.COMPLETADA)
     transfer = (await service.list_transfers(order.id))[0]
     await service.mark_transfer_ordered(transfer.id)
@@ -228,6 +235,7 @@ async def test_force_complete_works_directly_from_pendiente(env):
 async def test_force_complete_cannot_be_called_on_an_already_completed_order(env):
     service, order, tempario, user = env
     task = await service.add_task(order.id, tempario.id)
+    await task_ready(service, order, task)
     await service.update_task_status(task.id, TaskStatus.COMPLETADA)
     transfer = (await service.list_transfers(order.id))[0]
     await service.mark_transfer_ordered(transfer.id)

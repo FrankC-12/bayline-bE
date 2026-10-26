@@ -94,6 +94,9 @@ class AsyncAdapter:
     def __init__(self, session):
         self.session = session
 
+    def get_bind(self):
+        return self.session.get_bind()
+
     async def execute(self, query):
         return self.session.execute(query)
 

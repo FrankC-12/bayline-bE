@@ -10,7 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError, ConflictError
 from app.core.search import fold_search
-from app.core.venezuela_time import venezuela_today, caracas_date
+from app.core.venezuela_time import caracas_date, venezuela_today
 from app.modules.administracion.exceptions import SupplierNotFoundError
 from app.modules.administracion.models import Supplier
 from app.modules.clients.enums import ClientType, DocumentType, MaintenancePlanEntryStatus
@@ -427,6 +427,7 @@ class ClientService:
             self.db.add(client)
             await self.db.flush()
 
+            await self._validate_vehicle_identities(payload.filial_id, payload.vehicles)
             for v in payload.vehicles:
                 self.db.add(self._build_vehicle(client.id, v))
 
@@ -490,6 +491,7 @@ class ClientService:
                 setattr(client, field, value)
 
         if payload.vehicles is not None:
+            await self._validate_vehicle_identities(client.filial_id, payload.vehicles)
             await self._reconcile_vehicles(client, payload.vehicles)
         # Vehicle-only changes also advance the parent version.
         client.updated_at = datetime.now(UTC)
@@ -505,6 +507,38 @@ class ClientService:
         client = await self.get_client(client_id)
         await self.db.delete(client)
         await self.db.commit()
+
+    async def _validate_vehicle_identities(self, filial_id, vehicles):
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
+        seen = {"vin": set(), "plate": set()}
+        for incoming in vehicles:
+            for field, label in (("vin", "VIN"), ("plate", "placa")):
+                value = getattr(incoming, field)
+                if not value:
+                    continue
+                if value in seen[field]:
+                    raise ConflictError(
+                        f"La {label} está repetida en los vehículos del cliente.",
+                        error_code="duplicate_vehicle_identity",
+                    )
+                seen[field].add(value)
+                normalized = func.upper(
+                    func.replace(func.replace(getattr(Vehicle, field), " ", ""), "-", "")
+                )
+                query = (
+                    select(Vehicle.id)
+                    .join(Client, Client.id == Vehicle.client_id)
+                    .where(Client.filial_id == filial_id, normalized == value)
+                )
+                if incoming.id:
+                    query = query.where(Vehicle.id != incoming.id)
+                if (await self.db.execute(query.limit(1))).scalar_one_or_none():
+                    raise ConflictError(
+                        f"Ya existe un vehículo con esta {label} en el concesionario.",
+                        error_code="duplicate_vehicle_identity",
+                    )
 
     async def _reconcile_vehicles(self, client: Client, vehicles: list[VehicleInput]) -> None:
         """Diffs the incoming vehicle list against what's stored: deletes the ones
@@ -523,6 +557,10 @@ class ClientService:
                 vehicle.model = v.model
                 vehicle.year = v.year
                 vehicle.vin = v.vin
+                if v.mileage is not None:
+                    from app.modules.clients.mileage import validate_mileage
+
+                    await validate_mileage(self.db, vehicle.id, v.mileage)
                 vehicle.mileage = v.mileage
                 vehicle.purchase_date = v.purchase_date
                 vehicle.body_type = v.body_type

@@ -48,6 +48,7 @@ class HoldingAuditEvent(Base):
     )
     action: Mapped[str] = mapped_column(String(30))
     entity: Mapped[str] = mapped_column(String(100))
+    resource_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     resource_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     changed_fields: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

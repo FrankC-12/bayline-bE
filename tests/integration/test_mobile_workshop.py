@@ -96,6 +96,29 @@ async def test_parallel_timer_start_serializes_across_a_technicians_orders(billi
             hours_snapshot=task.hours_snapshot,
         )
         db.add(other)
+        from app.modules.inspections.models import PreliminaryInspection
+        from app.modules.inspections.enums import InspectionStatus
+        from app.modules.detailed_inspections.models import DetailedInspection
+
+        for order in (first, second):
+            db.add(
+                PreliminaryInspection(
+                    filial_id=order.filial_id,
+                    vehicle_id=order.vehicle_id,
+                    service_order_id=order.id,
+                    inspector_user_id=user.user_id,
+                    status=InspectionStatus.COMPLETADA,
+                    notes="Recepción verificada",
+                )
+            )
+            db.add(
+                DetailedInspection(
+                    service_order_id=order.id,
+                    status="completada",
+                    created_by_user_id=user.user_id,
+                    updated_by_user_id=user.user_id,
+                )
+            )
         await db.commit()
         ids = task.id, other.id
 
@@ -210,6 +233,8 @@ async def test_create_order_rolls_back_all_accepted_recommendations_on_any_failu
             [],
         )
         finding_id = finding.id
+        origin.status = ServiceOrderStatus.ORDEN_CERRADA
+        await db.commit()
         payload = {
             "filial_id": str(ctx.filial_id),
             "vehicle_id": str(origin.vehicle_id),

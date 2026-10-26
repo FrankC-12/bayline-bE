@@ -162,6 +162,7 @@ class PartsService:
         return [
             PartRead(
                 id=part.id,
+                list_price=float(part.list_price) if part.list_price is not None else None,
                 image_url=part.image_url,
                 filial_id=part.filial_id,
                 code=part.code,
@@ -185,7 +186,11 @@ class PartsService:
                 min_stock=part.min_stock,
                 is_active=part.is_active,
                 stock_total=int(total),
-                reference_price=round(float(cost) * 1.30, 2) if cost is not None else None,
+                reference_price=(
+                    float(part.list_price)
+                    if part.list_price is not None
+                    else round(float(cost) * 1.30, 2) if cost is not None else None
+                ),
                 latest_cost=float(cost) if cost is not None else None,
                 location=location,
                 created_at=part.created_at,
@@ -197,7 +202,11 @@ class PartsService:
     async def _part_to_read(self, part: Part) -> PartRead:
         stock_total = await self._stock_total(part.id)
         latest_cost = await self.get_latest_cost(part.id)
-        reference_price = round(latest_cost * 1.30, 2) if latest_cost is not None else 0.0
+        reference_price = (
+            float(part.list_price)
+            if part.list_price is not None
+            else round(latest_cost * 1.30, 2) if latest_cost is not None else 0.0
+        )
         location = await self.get_latest_location(part.id)
         return (await self._parts_to_read([(part, stock_total, None, location)]))[0].model_copy(
             update={"reference_price": reference_price, "latest_cost": latest_cost}
@@ -325,6 +334,7 @@ class PartsService:
             unit=payload.unit,
             min_stock=payload.min_stock,
             price=0,
+            list_price=payload.list_price,
             stock_quantity=0,
         )
         _sync_availability(part)
@@ -375,7 +385,7 @@ class PartsService:
             part.vehicle_brand_id, part.vehicle_model_id, part.year_from, part.year_to
         )
 
-        for field in ("code", "name", "unit", "min_stock"):
+        for field in ("code", "name", "unit", "min_stock", "list_price"):
             value = getattr(payload, field)
             if value is not None:
                 setattr(part, field, value)
@@ -725,6 +735,11 @@ class PartsService:
             cost, price, total = price_allocations(
                 allocations, quantity, PARTS_MULTIPLIERS[payload.discount_label]
             )
+            from app.modules.parts.pricing import price_catalog
+
+            price, total = price_catalog(
+                part.list_price, cost * quantity, quantity, payload.discount_label
+            )
             plans.append((part, quantity, allocations, cost, price, total))
         return plans
 
@@ -955,6 +970,7 @@ class PartsService:
                         _sync_availability(part)
 
             if new_status == PartSaleStatus.COMPLETADO:
+                sale.completed_at = datetime.now(timezone.utc)
                 # Confirming at the counter only means the part was handed
                 # over — it no longer silently posts income on its own.
                 # Payment is now its own step (see collect_sale_payment),

@@ -9,7 +9,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.core.venezuela_time import aging_bucket, venezuela_today, business_period_bounds
+from app.core.exceptions import BadRequestError
+from app.core.venezuela_time import aging_bucket, business_period_bounds, venezuela_today
 from app.modules.administracion.enums import (
     AccountCurrency,
     ClaimResolution,
@@ -101,7 +102,7 @@ from app.modules.parts.enums import PartSaleStatus
 from app.modules.parts.models import Part, PartSale, PartSaleLine
 from app.modules.post_ventas.models import Tempario
 from app.modules.post_ventas.service import PostVentasService
-from app.modules.service_orders.enums import TransferStatus, WarrantyClaimType
+from app.modules.service_orders.enums import WarrantyClaimType
 from app.modules.service_orders.models import (
     ServiceOrder,
     ServiceOrderInvoice,
@@ -413,6 +414,11 @@ class AdministracionService:
         ):
             raise ConflictError("Esta compra tiene mercancía recibida; registra una devolución.")
         if new_status != request.status:
+            if new_status in (PurchaseRequestStatus.PAGADA, PurchaseRequestStatus.CONCILIADA):
+                raise ConflictError(
+                    "Usa la conciliación con factura o el registro de pago; cambiar el estado no registra una operación financiera.",
+                    error_code="purchase_financial_workflow_required",
+                )
             if new_status not in PURCHASE_TRANSITIONS.get(request.status, set()):
                 raise InvalidPurchaseStatusTransitionError(request.status.value, new_status.value)
 
@@ -1295,6 +1301,14 @@ class AdministracionService:
         if account.currency != payload.currency:
             raise AccountCurrencyMismatchError()
 
+        if (
+            payload.category == ExpenseCategory.COMPRAS_PROVEEDORES
+            and not payload.purchase_request_ids
+        ):
+            raise BadRequestError(
+                "Selecciona la cuenta por pagar que cancela este egreso. Registra los anticipos por separado.",
+                error_code="supplier_payment_requires_payable",
+            )
         if payload.purchase_request_ids:
             from app.modules.filiales.models import Filial
 
@@ -1695,14 +1709,16 @@ class AdministracionService:
         pairs = result.all()
         net_sales = sum(float(sale.final_price) for sale, _ in pairs)
         direct_cost = sum(
-            float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0
-            for _, vehicle in pairs
+            float(sale.cost_snapshot if sale.cost_snapshot is not None else vehicle.cost_price or 0)
+            for sale, vehicle in pairs
         )
         estimated_count = sum(1 for _, vehicle in pairs if vehicle.cost_is_estimated)
 
         negative_lines = []
         for sale, vehicle in pairs:
-            cost = float(vehicle.cost_price) if vehicle.cost_price is not None else 0.0
+            cost = float(
+                sale.cost_snapshot if sale.cost_snapshot is not None else vehicle.cost_price or 0
+            )
             margin = float(sale.final_price) - cost
             if margin < 0:
                 negative_lines.append(
@@ -1732,19 +1748,18 @@ class AdministracionService:
     async def _parts_department(
         self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
     ) -> tuple[ProfitabilityDepartmentRow, list[ProfitabilityLineItem]]:
-        # Mostrador only (parts consumed by a service order are folded into
-        # "Taller · mano de obra" instead, matching the shop's actual
-        # one-document-per-order billing). Cancelled sales are excluded from
-        # both sides — the existing cost calc didn't exclude them either,
-        # a real (low-risk) fix bundled in here.
+        # Delivered counter sales only. Workshop parts are added separately
+        # from the immutable invoice breakdown, without attributing them to labor.
         result = await self.db.execute(
             select(PartSaleLine, PartSale)
             .join(PartSale, PartSale.id == PartSaleLine.part_sale_id)
             .where(
                 PartSale.filial_id.in_(filial_ids),
-                PartSale.created_at >= business_period_bounds(date_from, date_to)[0],
-                PartSale.created_at < business_period_bounds(date_from, date_to)[1],
-                PartSale.status != PartSaleStatus.CANCELADO,
+                func.coalesce(PartSale.completed_at, PartSale.created_at)
+                >= business_period_bounds(date_from, date_to)[0],
+                func.coalesce(PartSale.completed_at, PartSale.created_at)
+                < business_period_bounds(date_from, date_to)[1],
+                PartSale.status == PartSaleStatus.COMPLETADO,
             )
         )
         pairs = result.all()
@@ -1770,7 +1785,7 @@ class AdministracionService:
                         document_id=sale.id,
                         document_code=sale.code,
                         description=part.name if part else "Repuesto",
-                        date=sale.created_at.date(),
+                        date=(sale.completed_at or sale.created_at).date(),
                         net_sales=float(line.line_total),
                         direct_cost=line_cost,
                         margin=margin,
@@ -1783,7 +1798,7 @@ class AdministracionService:
 
     async def _taller_department(
         self, filial_ids: list[uuid.UUID], date_from: date, date_to: date
-    ) -> tuple[ProfitabilityDepartmentRow, list[ProfitabilityLineItem]]:
+    ) -> tuple[ProfitabilityDepartmentRow, list[ProfitabilityLineItem], ProfitabilityDepartmentRow]:
         # Revenue = the full invoiced total at issuance — accrual, not cash
         # collected — so a pending receivable still counts in the period it
         # was actually billed in. ServiceOrderInvoice has no filial_id of its
@@ -1798,7 +1813,23 @@ class AdministracionService:
             )
         )
         pairs = result.all()
-        net_sales = sum(float(invoice.total_usd) for invoice, _ in pairs)
+        # Use the immutable invoice breakdown, excluding IVA/IGTF. A legacy
+        # invoice without a breakdown stays grouped instead of inventing a split.
+        breakdowns = {order.id: invoice.document.get("summary", {}) for invoice, order in pairs}
+        structured = {
+            key
+            for key, data in breakdowns.items()
+            if "labor_subtotal" in data and "parts_subtotal" in data
+        }
+        parts_sales = sum(float(breakdowns[key]["parts_subtotal"]) for key in structured)
+        net_sales = sum(
+            (
+                float(breakdowns[order.id]["labor_subtotal"])
+                if order.id in structured
+                else float(invoice.total_usd)
+            )
+            for invoice, order in pairs
+        )
 
         # Cost is bucketed per order — includes every dispatched line
         # regardless of payer, since a comeback/warranty-covered part still
@@ -1819,9 +1850,7 @@ class AdministracionService:
                     # PEDIDO or COMPLETADO — both were actually dispatched
                     # and cost the shop; COMPLETADO just confirms the same
                     # dispatch was physically handed over.
-                    ServiceOrderTransfer.status.in_(
-                        [TransferStatus.PEDIDO, TransferStatus.COMPLETADO]
-                    ),
+                    ServiceOrderTransfer.stock_deducted.is_(True),
                 )
             )
             transfer_lines = lines_result.all()
@@ -1848,22 +1877,32 @@ class AdministracionService:
                     cost_by_order.get(service_order_id, 0.0) + line_cost
                 )
 
-        direct_cost = sum(cost_by_order.values())
+        parts_cost = sum(cost for order_id, cost in cost_by_order.items() if order_id in structured)
+        direct_cost = sum(
+            cost for order_id, cost in cost_by_order.items() if order_id not in structured
+        )
 
         negative_lines = []
         for invoice, order in pairs:
             cost = cost_by_order.get(order.id, 0.0)
-            margin = float(invoice.total_usd) - cost
+            revenue = (
+                float(breakdowns[order.id]["parts_subtotal"])
+                if order.id in structured
+                else float(invoice.total_usd)
+            )
+            margin = revenue - cost
             if margin < 0:
                 negative_lines.append(
                     ProfitabilityLineItem(
-                        department_key="taller_mano_obra",
+                        department_key=(
+                            "repuestos" if order.id in structured else "taller_mano_obra"
+                        ),
                         document_type="service_order_invoice",
                         document_id=order.id,
                         document_code=order.code,
                         description=f"Factura {invoice.code}",
                         date=invoice.issued_at.date(),
-                        net_sales=float(invoice.total_usd),
+                        net_sales=revenue,
                         direct_cost=cost,
                         margin=margin,
                     )
@@ -1874,6 +1913,7 @@ class AdministracionService:
                 "taller_mano_obra", "Taller · mano de obra", net_sales, direct_cost
             ),
             negative_lines,
+            _profitability_department_row("repuestos", "Repuestos", parts_sales, parts_cost),
         )
 
     async def _manual_income_department(
@@ -1939,7 +1979,7 @@ class AdministracionService:
         return income_diff - expense_diff
 
     async def list_receivables(self, filial_id: uuid.UUID) -> list["ReceivableRead"]:
-        """Outstanding invoices and non-cancelled parts sales, including partial payments."""
+        """Outstanding invoices and delivered parts sales, including partial payments."""
         from app.modules.service_orders.billing import BillingService
         from app.modules.service_orders.billing_schemas import ReceivableRead
 
@@ -1950,7 +1990,7 @@ class AdministracionService:
             .options(selectinload(PartSale.lines))
             .where(
                 PartSale.filial_id == filial_id,
-                PartSale.status != PartSaleStatus.CANCELADO,
+                PartSale.status == PartSaleStatus.COMPLETADO,
             )
         )
         today = venezuela_today()
@@ -1960,7 +2000,10 @@ class AdministracionService:
         collected = await PartsService(self.db)._collected_amounts([sale.id for sale in sales])
         part_sale_receivables = []
         for sale in sales:
-            days_outstanding = (today - sale.created_at.date()).days
+            from app.core.venezuela_time import caracas_date
+
+            issued_at = sale.completed_at or sale.created_at
+            days_outstanding = max(0, (today - caracas_date(issued_at)).days)
             total = sale.total_with_taxes
             paid = collected.get(sale.id, 0.0)
             pending = max(0.0, round(total - paid, 2))
@@ -1979,7 +2022,7 @@ class AdministracionService:
                     net_expected=total,
                     amount_paid_at_issuance=0.0,
                     pending_amount=pending,
-                    issued_at=sale.created_at,
+                    issued_at=issued_at,
                     days_outstanding=days_outstanding,
                     aging_bucket=aging_bucket(days_outstanding),
                 )
@@ -2021,7 +2064,15 @@ class AdministracionService:
         repuestos_row, repuestos_negative = await self._parts_department(
             filial_ids, date_from, date_to
         )
-        taller_row, taller_negative = await self._taller_department(filial_ids, date_from, date_to)
+        taller_row, taller_negative, workshop_parts = await self._taller_department(
+            filial_ids, date_from, date_to
+        )
+        repuestos_row = _profitability_department_row(
+            "repuestos",
+            "Repuestos",
+            repuestos_row.net_sales + workshop_parts.net_sales,
+            repuestos_row.direct_cost + workshop_parts.direct_cost,
+        )
         garantia_marca_row = await self._manual_income_department(
             filial_ids,
             date_from,

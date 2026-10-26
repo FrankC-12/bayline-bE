@@ -3,7 +3,7 @@
 from collections import defaultdict
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.modules.clients.models import Vehicle
 from app.modules.holdings.control_common import ReportContext, aware, table, value
@@ -11,7 +11,6 @@ from app.modules.service_orders.models import (
     Bay,
     ServiceOrder,
     ServiceOrderTask,
-    ServiceOrderTransfer,
 )
 
 
@@ -37,9 +36,29 @@ async def render(self, ctx: ReportContext):
         .scalars()
         .all()
     )
+    from app.modules.inspections.enums import InspectionStatus
+    from app.modules.inspections.models import PreliminaryInspection
+
+    received = set(
+        (
+            await self.db.execute(
+                select(PreliminaryInspection.service_order_id).where(
+                    PreliminaryInspection.service_order_id.in_([order.id for order, _ in active]),
+                    PreliminaryInspection.status == InspectionStatus.COMPLETADA,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    active_bays = {bay.id for bay in bays}
     counts = defaultdict(set)
     for o, _vehicle in active:
-        if o.bay_id and o.status.value != "completado" and o.vehicle_received_at:
+        if (
+            o.bay_id in active_bays
+            and o.status.value != "completado"
+            and (o.vehicle_received_at or o.id in received)
+        ):
             counts[o.filial_id].add(o.bay_id)
     ctx.report.tables.append(
         table(
@@ -66,45 +85,12 @@ async def render(self, ctx: ReportContext):
         )
     )
     order_ids = [o.id for o, v in active]
-    waiting = set(
-        (
-            await self.db.execute(
-                select(ServiceOrderTask.service_order_id).where(
-                    ServiceOrderTask.service_order_id.in_(order_ids),
-                    ServiceOrderTask.status == "EN_ESPERA_DE_REPUESTOS",
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    outstanding = set(
-        (
-            await self.db.execute(
-                select(ServiceOrderTransfer.service_order_id).where(
-                    ServiceOrderTransfer.service_order_id.in_(order_ids),
-                    ServiceOrderTransfer.status != "COMPLETADO",
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    from app.modules.service_orders.service import ServiceOrderService
+
+    await ServiceOrderService(self.db).attach_workflow([order for order, _ in active])
     board = []
     for o, v in active:
-        phase = (
-            "entrega"
-            if o.invoiced_at
-            else (
-                "control_calidad"
-                if value(o.status) == "completado"
-                else (
-                    "repuestos"
-                    if o.id in waiting or o.id in outstanding
-                    else "taller" if value(o.status) == "en_progreso" else "recepcion"
-                )
-            )
-        )
+        phase = o.workshop_stage
         hours = (datetime.now(UTC) - aware(o.created_at)).total_seconds() / 3600
         board.append(
             dict(
@@ -118,10 +104,69 @@ async def render(self, ctx: ReportContext):
                 status=value(o.status),
             )
         )
+    from app.modules.users.models import User
+
+    technicians = {
+        user.id: user.full_name
+        for user in (
+            await self.db.execute(
+                select(User).where(
+                    User.id.in_(
+                        {
+                            order.technician_user_id
+                            for order, _ in active
+                            if order.technician_user_id
+                        }
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+    workloads = defaultdict(lambda: {"orders": 0, "hours": 0.0})
+    for order, _ in active:
+        if order.technician_user_id:
+            workloads[order.technician_user_id]["orders"] += 1
+    for technician_id, hours in (
+        await self.db.execute(
+            select(ServiceOrder.technician_user_id, func.sum(ServiceOrderTask.hours_snapshot))
+            .join(ServiceOrderTask, ServiceOrderTask.service_order_id == ServiceOrder.id)
+            .where(
+                ServiceOrder.id.in_(order_ids),
+                ServiceOrderTask.status.notin_(["COMPLETADA", "CANCELADA"]),
+            )
+            .group_by(ServiceOrder.technician_user_id)
+        )
+    ).all():
+        if technician_id:
+            workloads[technician_id]["hours"] = float(hours or 0)
+    ctx.report.tables.append(
+        table(
+            "Carga por técnico",
+            [
+                ("technician", "Técnico"),
+                ("orders", "Órdenes activas", "number"),
+                ("hours", "Horas pendientes del tempario", "number"),
+            ],
+            [
+                dict(technician=technicians.get(key, "Sin registrar"), **load)
+                for key, load in workloads.items()
+            ],
+            "La agenda impide solapamientos de técnico y bahía. La cola de órdenes sin horario no se interpreta como trabajo simultáneo.",
+        )
+    )
     policies = [record for record in ctx.records if record.kind == "risk_policy"]
     warning_hours = policies[-1].payload["input"]["workshop_warning_hours"] if policies else 48
     ctx.metric("Órdenes activas", len(board))
     ctx.metric("Sin bahía", sum((not o.bay_id for o, v in active)))
+    ctx.metric(
+        "Asignadas sin recepción confirmada",
+        sum(
+            bool(o.bay_id) and not o.vehicle_received_at and o.id not in received for o, _ in active
+        ),
+        note="Asignación y ocupación física son indicadores diferentes",
+    )
     ctx.metric(
         f"Con más de {warning_hours} h",
         sum(x["hours"] > warning_hours for x in board),
@@ -140,8 +185,8 @@ async def render(self, ctx: ReportContext):
             ],
             board,
             (
-                "Control de calidad agrupa trabajos completados sin facturar; no certifica "
-                "una revisión física adicional."
+                "Pendiente de facturar agrupa trabajos completados sin factura. "
+                "La ocupación requiere recepción registrada o inspección preliminar completada y una bahía activa."
             ),
         )
     )

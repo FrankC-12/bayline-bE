@@ -15,6 +15,9 @@ async def render(self, ctx: ReportContext):
         if ctx.filial_id
         else await svc.get_profitability_for_holding(ctx.holding_id, ctx.start, ctx.end)
     )
+    ctx.report.notes.append(
+        "Los márgenes son utilidad / ventas × 100. Una pérdida puede superar el 100 % de las ventas; no se limita artificialmente el indicador."
+    )
     ctx.metric("Ventas netas operativas", p.net_sales_total, "money")
     ctx.metric("Utilidad bruta operativa", p.gross_profit_total, "money")
     ctx.metric("Resultado operativo", p.net_profit, "money")
@@ -27,7 +30,7 @@ async def render(self, ctx: ReportContext):
                 ("net_sales", "Ventas netas", "money"),
                 ("direct_cost", "Costo directo", "money"),
                 ("gross_profit", "Utilidad bruta", "money"),
-                ("margin", "Margen %", "number"),
+                ("margin", "Margen", "percent"),
             ],
             [{**r.model_dump(), "margin": r.margin * 100} for r in p.departments],
         )

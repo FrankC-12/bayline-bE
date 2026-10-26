@@ -49,10 +49,11 @@ class ConcesionarioService:
 
     def _sales_advisors_query(self, filial_id):
         from sqlalchemy import and_
-        from app.modules.roles.models import Role, RoleModulePermission
-        from app.modules.users.models import User, UserModulePermission
-        from app.modules.users.enums import UserStatus
+
         from app.modules.roles.enums import RoleScope
+        from app.modules.roles.models import Role, RoleModulePermission
+        from app.modules.users.enums import UserStatus
+        from app.modules.users.models import User, UserModulePermission
 
         return (
             select(User)
@@ -319,6 +320,26 @@ class ConcesionarioService:
 
         vehicle = await self._require_vehicle_for_update(vehicle_id)
         self._ensure_not_reserved_by_someone_else(vehicle, current_user)
+        price_changes = any(
+            getattr(payload, field) is not None
+            and Decimal(str(getattr(payload, field))) != Decimal(str(getattr(vehicle, field)))
+            for field in ("price_cash", "price_financed", "cost_price")
+            if getattr(vehicle, field) is not None
+        )
+        if price_changes and payload.status == VehicleStatus.VENDIDO:
+            raise BadRequestError(
+                "Actualiza y revisa el precio de lista antes de confirmar la venta.",
+                error_code="vehicle_price_change_with_sale",
+            )
+        if price_changes:
+            if not (payload.status_reason and len(payload.status_reason.strip()) >= 3):
+                raise BadRequestError(
+                    "Indica el motivo para cambiar los precios de lista o el costo.",
+                    error_code="vehicle_price_change_reason_required",
+                )
+            await ensure_module_access(
+                self.db, current_user, vehicle.filial_id, "administracion", AccessLevel.EDITAR
+            )
 
         effective_condition = (
             payload.condition if payload.condition is not None else vehicle.condition
@@ -448,10 +469,11 @@ class ConcesionarioService:
                     igtf_amount=igtf_amount,
                     bcv_rate=bcv_rate,
                     final_price=final_price,
+                    cost_snapshot=vehicle.cost_price,
                     below_cost_override=is_below_cost,
-                    below_cost_override_note=payload.sale.below_cost_override_note
-                    if is_below_cost
-                    else None,
+                    below_cost_override_note=(
+                        payload.sale.below_cost_override_note if is_below_cost else None
+                    ),
                     authorized_by_user_id=authorized_by_user_id,
                     authorized_at=authorized_at,
                 )
@@ -484,7 +506,14 @@ class ConcesionarioService:
                     commit=False,
                 )
 
-
+        if price_changes and not status_changing:
+            self._record_status_change(
+                vehicle,
+                vehicle.status,
+                vehicle.status,
+                current_user,
+                f"Actualización de precios: {payload.status_reason}",
+            )
         if status_changing:
             reason = (payload.status_reason or "").strip()
             if becoming_sold and len(reason) < 3:

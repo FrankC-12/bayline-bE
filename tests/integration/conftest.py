@@ -63,7 +63,13 @@ async def billing_db():
         )
         db.add(client)
         await db.flush()
-        vehicle = Vehicle(client_id=client.id, brand="Toyota", model="Hilux", plate="AB123CD")
+        vehicle = Vehicle(
+            client_id=client.id,
+            brand="Toyota",
+            model="Hilux",
+            plate="AB123CD",
+            vin="1HGCM82633A004352",
+        )
         kind = ServiceOrderTypeCatalog(
             filial_id=filial.id,
             code="regular",

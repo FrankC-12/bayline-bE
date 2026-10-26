@@ -29,9 +29,9 @@ async def render(self, ctx: ReportContext):
             await self.db.execute(
                 select(func.count(PartSale.id)).where(
                     PartSale.filial_id == f.id,
-                    PartSale.status != "CANCELADO",
-                    PartSale.created_at >= ctx.lower,
-                    PartSale.created_at < ctx.upper,
+                    PartSale.status == "COMPLETADO",
+                    func.coalesce(PartSale.completed_at, PartSale.created_at) >= ctx.lower,
+                    func.coalesce(PartSale.completed_at, PartSale.created_at) < ctx.upper,
                 )
             )
         ).scalar() or 0
@@ -64,6 +64,7 @@ async def render(self, ctx: ReportContext):
                 margin=p.gross_margin * 100,
                 vehicles=sales_count,
                 estimated=p.vehicles_with_estimated_cost_count,
+                direct_cost=p.direct_cost_total,
             )
         )
     ctx.metric("Ventas netas del período", sum(D(r["sales"]) for r in rows), "money")
@@ -83,9 +84,10 @@ async def render(self, ctx: ReportContext):
                 ("target", "Meta", "money"),
                 ("achievement", "Cumplimiento %", "number"),
                 ("ticket", "Ticket neto", "money"),
-                ("margin", "Margen bruto %", "number"),
+                ("margin", "Margen bruto", "percent"),
+                ("direct_cost", "Costo directo", "money"),
                 ("vehicles", "Vehículos", "number"),
-                ("estimated", "Costos estimados", "number"),
+                ("estimated", "Vehículos con costo estimado", "number"),
             ],
             rows,
         )

@@ -167,7 +167,7 @@ class Metric(BaseModel):
 class Column(BaseModel):
     key: str
     label: str
-    format: Literal["money", "number", "date", "datetime", "text", "status"] = "text"
+    format: Literal["money", "number", "percent", "date", "datetime", "text", "status"] = "text"
 
 
 class ReportTable(BaseModel):

@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.core.storage import save_upload_image
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.concesionario.financing import FinancingService, FinancingSnapshot
 from app.modules.concesionario.schemas import (
     VehicleCreate,
     VehiclePhotoRemoveInput,
@@ -19,10 +20,9 @@ from app.modules.concesionario.schemas import (
     VehicleUpdate,
 )
 from app.modules.concesionario.service import ConcesionarioService
-from app.modules.users.schemas import UserDirectoryEntry
-from app.modules.concesionario.financing import FinancingService, FinancingSnapshot
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
+from app.modules.users.schemas import UserDirectoryEntry
 
 MODULE_ID = "concesionario"
 
@@ -94,6 +94,9 @@ async def create_vehicle(
     service: ConcesionarioService = Depends(get_service),
 ) -> VehicleRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    await ensure_module_access(
+        service.db, current_user, payload.filial_id, "administracion", AccessLevel.EDITAR
+    )
     return await service.create_vehicle(payload, current_user)
 
 
@@ -209,6 +212,7 @@ async def vehicle_sale_invoice_pdf(
     service: ConcesionarioService = Depends(get_service),
 ):
     from fastapi.responses import Response
+
     from app.core.documents.invoice_pdf import render_invoice_pdf
     from app.modules.filiales.models import Filial
 

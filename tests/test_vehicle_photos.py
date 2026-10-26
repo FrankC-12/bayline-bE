@@ -33,9 +33,17 @@ def env():
 
 def _create_payload(filial_id, **overrides) -> VehicleCreate:
     data = dict(
-        filial_id=filial_id, condition=VehicleCondition.NUEVO, location=VehicleLocation.PATIO,
-        brand="Toyota", model="Corolla", year=2026, vin=str(uuid.uuid4())[:17], sku="SKU-1",
-        price_cash=10_000, price_financed=11_000, cost_price=8_000,
+        filial_id=filial_id,
+        condition=VehicleCondition.NUEVO,
+        location=VehicleLocation.PATIO,
+        brand="Toyota",
+        model="Corolla",
+        year=2026,
+        vin="1HGCM82633A004352",
+        sku="SKU-1",
+        price_cash=10_000,
+        price_financed=11_000,
+        cost_price=8_000,
     )
     data.update(overrides)
     return VehicleCreate(**data)

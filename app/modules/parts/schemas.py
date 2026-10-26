@@ -44,6 +44,7 @@ class PartMeasureRead(BaseModel):
 
 
 class PartCreate(BaseModel):
+    list_price: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
     filial_id: uuid.UUID
     code: str = Field(min_length=1, max_length=40)
     manufacturer_part_number: str | None = Field(default=None, max_length=80)
@@ -61,6 +62,7 @@ class PartCreate(BaseModel):
 
 
 class PartUpdate(BaseModel):
+    list_price: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
     code: str | None = Field(default=None, min_length=1, max_length=40)
     manufacturer_part_number: str | None = None
     name: str | None = Field(default=None, min_length=1, max_length=150)
@@ -82,6 +84,7 @@ class PartUpdate(BaseModel):
 
 
 class PartRead(BaseModel):
+    list_price: float | None = None
     model_config = ConfigDict(from_attributes=True)
 
     image_url: str | None = None
@@ -224,6 +227,7 @@ class PartSaleUpdate(BaseModel):
 
 
 class PartSaleRead(BaseModel):
+    completed_at: datetime | None = None
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID

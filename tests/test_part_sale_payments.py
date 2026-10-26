@@ -69,7 +69,7 @@ async def test_50_dollar_payment_leaves_80_and_full_payment_clears_receivable(co
 @pytest.mark.asyncio
 async def test_bs_uses_frozen_rate_and_no_igtf(collection_env):
     admin, session, filial_id = collection_env
-    sale = make_part_sale(session, filial_id, 5001, PartSaleStatus.PEDIDO, 100)
+    sale = make_part_sale(session, filial_id, 5001, PartSaleStatus.COMPLETADO, 100)
     sale.iva_amount = 16
     sale.igtf_percentage = 3
     rate = ExchangeRate(currency="USD", value_date=venezuela_today(), rate_ves=40)

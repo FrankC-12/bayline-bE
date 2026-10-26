@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.core.exceptions import BadRequestError, ConflictError, NotFoundError
 from app.modules.clients.models import Client, Vehicle
@@ -44,8 +44,8 @@ class DraftService:
             if bay is None or bay.filial_id != filial_id or not bay.is_active:
                 raise BadRequestError("Selecciona una bahía activa de esta filial.")
 
-    async def _schedule(self, filial_id, bay_id, scheduled_at, exclude_id=None):
-        if not bay_id or not scheduled_at:
+    async def _schedule(self, filial_id, bay_id, scheduled_at, exclude_id=None, technician_id=None):
+        if not (bay_id or technician_id) or not scheduled_at:
             return
         # Serialize free-slot selection across web sessions. Existing overlapping
         # visits remain readable in the calendar, but cannot be newly double-booked.
@@ -63,7 +63,14 @@ class DraftService:
                 .outerjoin(grouped, grouped.c.service_order_id == ServiceOrder.id)
                 .where(
                     ServiceOrder.filial_id == filial_id,
-                    ServiceOrder.bay_id == bay_id,
+                    or_(
+                        ServiceOrder.bay_id == bay_id if bay_id else False,
+                        (
+                            ServiceOrder.technician_user_id == technician_id
+                            if technician_id
+                            else False
+                        ),
+                    ),
                     ServiceOrder.scheduled_at.is_not(None),
                     ServiceOrder.status.notin_(
                         [ServiceOrderStatus.CANCELADO, ServiceOrderStatus.ORDEN_CERRADA]
@@ -95,7 +102,7 @@ class DraftService:
                 and end > other_start
             ):
                 raise ConflictError(
-                    "La bahía ya tiene una visita en ese horario.",
+                    "La bahía o el técnico ya tienen una visita en ese horario.",
                     error_code="bay_schedule_conflict",
                 )
 
@@ -121,7 +128,7 @@ class DraftService:
             creation_source="web",
             scheduled_at=payload.scheduled_at,
             bay_id=payload.bay_id,
-            sequence_number=await service._next_sequence_number(payload.filial_id),
+            sequence_number=await service._next_draft_number(payload.filial_id),
             settings_snapshot=settings_snapshot(
                 await PostVentasService(self.db).get_labor_settings(payload.filial_id, commit=False)
             ),
@@ -212,8 +219,22 @@ class DraftService:
             await self._technician(payload.technician_user_id, order.filial_id)
         new_bay = payload.bay_id if "bay_id" in fields else order.bay_id
         new_date = payload.scheduled_at if "scheduled_at" in fields else order.scheduled_at
-        if new_bay != order.bay_id or new_date != order.scheduled_at:
-            await self._schedule(order.filial_id, new_bay, new_date, order.id)
+        if (
+            new_bay != order.bay_id
+            or new_date != order.scheduled_at
+            or "technician_user_id" in fields
+        ):
+            await self._schedule(
+                order.filial_id,
+                new_bay,
+                new_date,
+                order.id,
+                (
+                    payload.technician_user_id
+                    if "technician_user_id" in fields
+                    else order.technician_user_id
+                ),
+            )
         for key in fields:
             setattr(order, key, getattr(payload, key))
         order.draft_revision += 1
@@ -251,6 +272,11 @@ class DraftService:
         from app.modules.notifications.service import queue_order_event
         from app.modules.service_orders.service import ServiceOrderService
 
+        snapshot = await self.db.get(ServiceOrder, order_id)
+        if snapshot is not None:
+            await self.db.execute(
+                select(Filial.id).where(Filial.id == snapshot.filial_id).with_for_update()
+            )
         order = await self.editable(order_id)
         service = ServiceOrderService(self.db)
         tasks = await service.list_tasks(order.id)
@@ -264,7 +290,13 @@ class DraftService:
                 error_code="draft_incomplete",
             )
         await self._vehicle(order.vehicle_id, order.filial_id)
+        from app.modules.service_orders.guards import require_no_active_visit
+
+        await require_no_active_visit(self.db, order.vehicle_id, order.filial_id, order.id)
         await self._technician(order.technician_user_id, order.filial_id)
+        await self._schedule(
+            order.filial_id, order.bay_id, order.scheduled_at, order.id, order.technician_user_id
+        )
         for reference in order.draft_upsells or []:
             finding = (
                 await self.db.execute(
@@ -298,6 +330,34 @@ class DraftService:
                 continue
             if not reference["task_ids"] and not reference["line_ids"]:
                 continue  # Legacy free-text recommendation has no work to approve.
+            from decimal import ROUND_HALF_UP, Decimal
+
+            task_ids = {uuid.UUID(value) for value in reference["task_ids"]}
+            hourly = Decimal(str(await service._hourly_rate(order.filial_id, order)))
+            labor = sum(
+                (
+                    Decimal(str(task.hours_snapshot)) * hourly
+                    for task in tasks
+                    if task.id in task_ids
+                ),
+                Decimal(0),
+            )
+            prices = (
+                (
+                    await self.db.execute(
+                        select(ServiceOrderTransferLine.line_total).where(
+                            ServiceOrderTransferLine.id.in_(
+                                [uuid.UUID(value) for value in reference["line_ids"]]
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            finding.approved_amount_snapshot = (
+                labor + sum((Decimal(str(value)) for value in prices), Decimal(0))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             finding.status = UpsellStatus.APROBADO
             finding.applied_to_service_order_id = order.id
             finding.approved_by_user_id = actor.user_id
@@ -306,6 +366,8 @@ class DraftService:
             finding.approval_channel = UpsellApprovalChannel.PRESENCIAL
             finding.resolved_by_user_id = actor.user_id
             finding.resolved_at = datetime.now(UTC)
+        if order.sequence_number < 0:
+            order.sequence_number = await service._next_sequence_number(order.filial_id)
         order.is_draft = False
         order.submitted_at = datetime.now(UTC)
         await queue_order_event(

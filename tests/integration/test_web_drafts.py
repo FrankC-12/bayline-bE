@@ -27,6 +27,10 @@ async def test_web_draft_roundtrip_hides_from_mobile_then_submit_appears(billing
     async with ctx.sessions() as db:
         source = await db.get(ServiceOrder, ctx.order_id)
         vehicle_id = str(source.vehicle_id)
+        from app.modules.service_orders.enums import ServiceOrderStatus
+
+        source.status = ServiceOrderStatus.ORDEN_CERRADA
+        await db.commit()
         catalog_id = str(
             (
                 await db.execute(

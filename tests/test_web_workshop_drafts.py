@@ -78,6 +78,10 @@ async def test_autosave_checks_revision_and_sending_requires_task_and_actual_tec
     monkeypatch.setattr(drafts, "_technician", technician)
     draft.technician_user_id = uuid.uuid4()
     session.commit()
+    for existing in await service.list_orders(origin.filial_id):
+        if existing.vehicle_id == origin.vehicle_id:
+            existing.status = ServiceOrderStatus.ORDEN_CERRADA
+    await service.db.commit()
     submitted = await drafts.submit(draft.id, actor)
     assert not submitted.is_draft and submitted.submitted_at
     assert submitted.id in {o.id for o in await service.list_orders(origin.filial_id)}
@@ -115,6 +119,10 @@ async def test_postponed_finding_is_not_approved_until_draft_is_sent(visit_env, 
     monkeypatch.setattr(drafts, "_technician", technician)
     draft.technician_user_id = uuid.uuid4()
     session.commit()
+    for existing in await service.list_orders(origin.filial_id):
+        if existing.vehicle_id == origin.vehicle_id:
+            existing.status = ServiceOrderStatus.ORDEN_CERRADA
+    await service.db.commit()
     await drafts.submit(draft.id, actor)
     resolved = await service.get_upsell(finding.id)
     assert resolved.status == UpsellStatus.APROBADO

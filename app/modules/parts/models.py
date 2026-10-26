@@ -1,12 +1,27 @@
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 from app.modules.parts.enums import PartAvailability, PartSaleStatus, ReturnCondition, ReturnReason
+
+if TYPE_CHECKING:
+    from app.modules.warehouse.models import PartLot, Warehouse
 
 
 class PartCategory(Base):
@@ -58,6 +73,7 @@ class Part(Base):
         index=True,
     )
     code: Mapped[str] = mapped_column(String(40), nullable=False)
+    list_price: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     image_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     # The manufacturer's own part number — distinct from `code`, our internal
     # catalog code. Optional: not every part (e.g. a locally-made item) has one.
@@ -137,6 +153,7 @@ class PartSale(Base):
     iva_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
     igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0, server_default="0")
     igtf_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

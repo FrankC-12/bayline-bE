@@ -1,8 +1,9 @@
 """Holding actividad report."""
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
-from app.modules.concesionario.models import VehicleSale
+from app.modules.concesionario.models import DealershipVehicle, VehicleSale
+from app.modules.holdings.audit_labels import field_labels, order_references
 from app.modules.holdings.control_common import ReportContext, table
 from app.modules.holdings.control_models import HoldingAuditEvent
 from app.modules.users.models import User
@@ -23,6 +24,7 @@ async def render(self, ctx: ReportContext):
             .limit(200)
         )
     ).all()
+    references = await order_references(self.db, events, ctx.ids)
     ctx.metric("Eventos visibles", len(events), note="Últimos 200 del período")
     ctx.report.tables.append(
         table(
@@ -57,9 +59,14 @@ async def render(self, ctx: ReportContext):
                         "users": "Usuario",
                         "warehouse_transfers": "Transferencia de almacén",
                         "service_order_transfers": "Despacho de taller",
-                    }.get(e.entity, e.entity),
-                    resource=e.resource_id or "—",
-                    fields=", ".join(e.changed_fields),
+                        "service_order_transfer_lines": "Repuesto de orden de servicio",
+                        "service_order_tasks": "Tarea de orden de servicio",
+                    }.get(e.entity, "Registro del sistema"),
+                    resource=e.resource_label
+                    or references.get(
+                        e.resource_id, f"Registro {e.resource_id[:8]}" if e.resource_id else "—"
+                    ),
+                    fields=field_labels(e.changed_fields),
                 )
                 for e, u in events
             ],
@@ -70,22 +77,25 @@ async def render(self, ctx: ReportContext):
         )
     )
     risk_sales = (
-        (
-            await self.db.execute(
-                select(VehicleSale)
-                .where(
-                    VehicleSale.filial_id.in_(ctx.ids),
-                    VehicleSale.below_cost_override.is_(True),
-                    VehicleSale.created_at >= ctx.lower,
-                    VehicleSale.created_at < ctx.upper,
-                )
-                .order_by(VehicleSale.created_at.desc())
-                .limit(100)
+        await self.db.execute(
+            select(
+                VehicleSale, func.coalesce(VehicleSale.cost_snapshot, DealershipVehicle.cost_price)
             )
+            .join(DealershipVehicle, DealershipVehicle.id == VehicleSale.vehicle_id)
+            .where(
+                VehicleSale.filial_id.in_(ctx.ids),
+                or_(
+                    VehicleSale.below_cost_override.is_(True),
+                    VehicleSale.final_price
+                    < func.coalesce(VehicleSale.cost_snapshot, DealershipVehicle.cost_price),
+                ),
+                VehicleSale.created_at >= ctx.lower,
+                VehicleSale.created_at < ctx.upper,
+            )
+            .order_by(VehicleSale.created_at.desc())
+            .limit(100)
         )
-        .scalars()
-        .all()
-    )
+    ).all()
     ctx.report.tables.append(
         table(
             "Alertas: ventas bajo costo",
@@ -94,6 +104,9 @@ async def render(self, ctx: ReportContext):
                 ("filial", "Filial"),
                 ("code", "Venta"),
                 ("description", "Justificación"),
+                ("authorization", "Autorización"),
+                ("cost", "Costo registrado", "money"),
+                ("loss", "Resultado", "money"),
                 ("amount", "Total", "money"),
             ],
             [
@@ -102,13 +115,21 @@ async def render(self, ctx: ReportContext):
                     filial=ctx.names[s.filial_id],
                     code=s.code,
                     description=s.below_cost_override_note or "Sin nota",
+                    authorization=(
+                        "Autorización registrada"
+                        if s.below_cost_override and s.authorized_by_user_id and s.authorized_at
+                        else "Sin autorización registrada: revisar"
+                    ),
+                    cost=float(cost) if cost is not None else None,
+                    loss=float(s.final_price - cost) if cost is not None else None,
                     amount=float(s.final_price),
                 )
-                for s in risk_sales
+                for s, cost in risk_sales
             ],
             (
-                "Excepciones autorizadas registradas por el sistema; no se presentan como "
-                "operaciones sin autorización."
+                "Incluye excepciones autorizadas y ventas por debajo del costo registrado, "
+                "aunque no tengan autorización histórica. Se usa el costo guardado al vender o, para ventas antiguas, el costo disponible; "
+                "la ausencia de registro de autorización requiere revisión."
             ),
         )
     )

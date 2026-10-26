@@ -11,7 +11,7 @@ from app.core.exceptions import BadRequestError
 from app.core.venezuela_time import venezuela_today
 from app.modules.exchange_rates.models import ExchangeRate
 from app.modules.parts.models import Part
-from app.modules.parts.pricing import DEFAULT_DISCOUNT, price_parts_cost
+from app.modules.parts.pricing import DEFAULT_DISCOUNT, price_catalog
 from app.modules.post_ventas.enums import (
     CATEGORY_PREFIXES,
     TemparioCategory,
@@ -70,6 +70,7 @@ def _tempario_to_read(
     fifo_costs=None,
     discount_label=DEFAULT_DISCOUNT,
 ) -> TemparioRead:
+    list_prices = (fifo_costs.list_prices or {}) if fifo_costs is not None else {}
     price_notes = fifo_costs.notes if fifo_costs is not None else []
     fifo_costs = fifo_costs.costs if fifo_costs is not None else None
     # Same formula a real ODS uses (price_parts_cost/PARTS_MULTIPLIERS in
@@ -88,7 +89,10 @@ def _tempario_to_read(
         }
     parts_cost = sum((cost for cost, _ in groups.values()), Decimal(0))
     parts_price = sum(
-        (price_parts_cost(cost, quantity, discount_label)[1] for cost, quantity in groups.values()),
+        (
+            price_catalog(list_prices.get(key), cost, quantity, discount_label)[1]
+            for key, (cost, quantity) in groups.items()
+        ),
         Decimal(0),
     )
     parts_margin = parts_price - parts_cost
@@ -107,6 +111,11 @@ def _tempario_to_read(
             f"Vincula el repuesto «{p.name}» al catálogo antes de usar este tempario en una ODS."
             for p in t.parts
             if not p.part_id
+        ]
+        + [
+            f"Configura el PVP de lista de «{p.name}» antes de aprobar el presupuesto."
+            for p in t.parts
+            if p.part_id and p.part_id in list_prices and list_prices[p.part_id] is None
         ],
         warranty_mode=t.warranty_mode,
         warranty_days=t.warranty_days,
@@ -132,6 +141,23 @@ def _tempario_to_read(
                 part_id=p.part_id,
                 name=p.name,
                 quantity=p.quantity,
+                unit_price=float(
+                    price_catalog(
+                        list_prices.get(p.part_id),
+                        groups[p.part_id or p.id][0],
+                        groups[p.part_id or p.id][1],
+                        discount_label,
+                    )[0]
+                ),
+                line_total=float(
+                    price_catalog(
+                        list_prices.get(p.part_id),
+                        groups[p.part_id or p.id][0],
+                        groups[p.part_id or p.id][1],
+                        discount_label,
+                    )[0]
+                    * p.quantity
+                ),
                 unit_cost=float(groups[p.part_id or p.id][0] / groups[p.part_id or p.id][1]),
                 subtotal=float(
                     groups[p.part_id or p.id][0] / groups[p.part_id or p.id][1] * p.quantity

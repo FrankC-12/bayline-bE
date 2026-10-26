@@ -38,9 +38,17 @@ def env():
 
 def _create_payload(filial_id, **overrides) -> VehicleCreate:
     data = dict(
-        filial_id=filial_id, condition=VehicleCondition.NUEVO, location=VehicleLocation.PATIO,
-        brand="Toyota", model="Corolla", year=2026, vin=str(uuid.uuid4())[:17], sku="SKU-1",
-        price_cash=10_000, price_financed=11_000, cost_price=8_000,
+        filial_id=filial_id,
+        condition=VehicleCondition.NUEVO,
+        location=VehicleLocation.PATIO,
+        brand="Toyota",
+        model="Corolla",
+        year=2026,
+        vin="1HGCM82633A004352",
+        sku="SKU-1",
+        price_cash=10_000,
+        price_financed=11_000,
+        cost_price=8_000,
     )
     data.update(overrides)
     return VehicleCreate(**data)
@@ -72,9 +80,18 @@ async def test_legacy_vehicle_with_no_location_is_left_null(env):
     field loop only overwrites when a new value is actually supplied."""
     service, session, filial_id, user = env
     vehicle = DealershipVehicle(
-        filial_id=filial_id, status=VehicleStatus.DISPONIBLE, condition=VehicleCondition.USADO, mileage=80000,
-        brand="Ford", model="Fiesta", year=2018, vin=str(uuid.uuid4())[:17], sku="SKU-2",
-        price_cash=5_000, price_financed=5_500, cost_price=4_000,
+        filial_id=filial_id,
+        status=VehicleStatus.DISPONIBLE,
+        condition=VehicleCondition.USADO,
+        mileage=80000,
+        brand="Ford",
+        model="Fiesta",
+        year=2018,
+        vin="1HGCM82633A004352",
+        sku="SKU-2",
+        price_cash=5_000,
+        price_financed=5_500,
+        cost_price=4_000,
     )
     session.add(vehicle)
     session.commit()

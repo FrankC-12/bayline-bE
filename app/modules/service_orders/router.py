@@ -951,6 +951,9 @@ async def force_complete_service_order(
     This forces it anyway with something still pending."""
     order = await service.get_order(order_id)
     await _ensure_access(current_user, order.filial_id, service.db, AccessLevel.EDITAR)
+    await ensure_module_access(
+        service.db, current_user, order.filial_id, "administracion", AccessLevel.EDITAR
+    )
     return await service.force_complete_order(order_id, current_user)
 
 
@@ -1409,7 +1412,7 @@ async def quote_upsell(
 
     from app.core.exceptions import ConflictError
     from app.modules.parts.models import Part
-    from app.modules.parts.pricing import DEFAULT_DISCOUNT, PARTS_MULTIPLIERS
+    from app.modules.parts.pricing import price_catalog
     from app.modules.post_ventas.models import Tempario
     from app.modules.post_ventas.service import PostVentasService
 
@@ -1438,7 +1441,7 @@ async def quote_upsell(
                 quantities[part.part_id] = quantities.get(part.part_id, 0) + part.quantity
     for part in finding.parts:
         quantities[part.part_id] = quantities.get(part.part_id, 0) + part.quantity
-    costs = Decimal(0)
+    parts = Decimal(0)
     for part_id, quantity in quantities.items():
         part = await service.db.get(Part, part_id)
         if part is None:
@@ -1449,8 +1452,7 @@ async def quote_upsell(
         total_cost, _allocations, _shortfall = await service._fifo_preview_cost(
             order.filial_id, part_id, quantity
         )
-        costs += total_cost
-    parts = costs * Decimal(str(PARTS_MULTIPLIERS[DEFAULT_DISCOUNT]))
+        parts += price_catalog(part.list_price, total_cost, quantity, order.discount_label)[1]
     subtotal = labor + parts
     iva = subtotal * Decimal(str(settings.iva_percentage)) / 100
     return {

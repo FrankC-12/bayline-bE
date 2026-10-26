@@ -11,7 +11,6 @@ from app.core.exceptions import BadRequestError
 from app.modules.clients.models import Vehicle
 from app.modules.filiales.models import Filial
 from app.modules.parts.models import Part
-from app.modules.parts.pricing import price_parts_cost
 from app.modules.service_orders.enums import ServiceOrderStatus, TransferStatus
 from app.modules.service_orders.exceptions import TransferNotFoundError
 from app.modules.service_orders.models import (
@@ -253,9 +252,7 @@ class WorkshopDispatchService:
                 )
                 if not row["shortfall_quantity"]:
                     line.cost_total = cost
-                    line.unit_price, line.line_total = price_parts_cost(
-                        cost, line.quantity, order.discount_label
-                    )
+
                 grouped = defaultdict(list)
                 for item in row["allocations"]:
                     if UUID(item["warehouse_id"]) != destination_id:
@@ -412,9 +409,7 @@ class WorkshopDispatchService:
                         Decimal(0),
                     )
                     line.cost_total = cost
-                    line.unit_price, line.line_total = price_parts_cost(
-                        cost, line.quantity, order.discount_label
-                    )
+
                     by_id = {lot.id: lot for lot in lots}
                     for lot, quantity in allocations:
                         by_id[lot.id].quantity_remaining -= quantity

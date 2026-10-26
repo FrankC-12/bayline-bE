@@ -97,6 +97,8 @@ class TemparioPartInput(BaseModel):
 
 
 class TemparioPartRead(BaseModel):
+    unit_price: float | None = None
+    line_total: float | None = None
     id: uuid.UUID
     part_id: uuid.UUID | None
     name: str

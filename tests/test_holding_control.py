@@ -150,6 +150,12 @@ async def test_intercompany_transfer_posts_two_sides_once_and_preserves_consolid
 @pytest.mark.asyncio
 async def test_cash_count_is_evidence_not_a_silent_balance_adjustment(env):
     session, svc, h, other, actor, fs, (a, b, c, bs) = env
+    cashier_role = Role(name="Caja", slug="caja-test", scope=RoleScope.FILIAL)
+    session.add(cashier_role)
+    session.flush()
+    actor.role_id = cashier_role.id
+    actor.filial_id = fs[0].id
+    session.commit()
     row = await svc.register(
         h.id,
         actor.id,
@@ -626,3 +632,66 @@ async def test_same_day_commercial_sales_use_complete_caracas_days_and_percentag
     assert row["sales"]==150
     assert row["ticket"]==75
     assert row["margin"]==100
+
+
+@pytest.mark.asyncio
+async def test_below_cost_alert_includes_legacy_sales_and_respects_scope_and_period(env):
+    from datetime import UTC, datetime, timedelta
+    from app.modules.concesionario.models import DealershipVehicle, VehicleSale
+    from app.modules.concesionario.enums import VehicleCondition, VehicleStatus, SaleType
+
+    session, svc, holding, other, actor, filiales, accounts = env
+    now = datetime.now(UTC)
+    cases = [
+        (filiales[0], 3123, 30000, False, now),
+        (filiales[0], 5000, 6000, True, now),
+        (filiales[0], 30000, 30000, False, now),
+        (filiales[0], 32000, 30000, False, now),
+        (filiales[0], 1000, None, False, now),
+        (filiales[1], 1000, 30000, False, now),
+        (filiales[2], 1000, 30000, False, now),
+        (filiales[0], 1000, 30000, False, now - timedelta(days=40)),
+    ]
+    for index, (filial, price, cost, authorized, created_at) in enumerate(cases):
+        vehicle = DealershipVehicle(
+            filial_id=filial.id,
+            brand="Toyota",
+            model="Corolla",
+            year=2026,
+            vin=str(index).zfill(17),
+            sku=f"RISK-{index}",
+            price_cash=45000,
+            price_financed=45000,
+            cost_price=cost,
+            status=VehicleStatus.VENDIDO,
+            condition=VehicleCondition.NUEVO,
+        )
+        session.add(vehicle)
+        session.flush()
+        session.add(
+            VehicleSale(
+                filial_id=filial.id,
+                vehicle_id=vehicle.id,
+                sequence_number=index + 1,
+                client_name="Cliente",
+                sale_type=SaleType.CONTADO,
+                final_price=price,
+                below_cost_override=authorized,
+                authorized_by_user_id=actor.id if authorized else None,
+                authorized_at=now if authorized else None,
+                created_at=created_at,
+            )
+        )
+    session.commit()
+    # Use a Caracas business date, including executions shortly after UTC midnight.
+    from zoneinfo import ZoneInfo
+
+    today = now.astimezone(ZoneInfo("America/Caracas")).date()
+    report = await svc.report(holding.id, "actividad", today, today, filiales[0].id)
+    rows = next(t.rows for t in report.tables if t.title == "Alertas: ventas bajo costo")
+    by_code = {row["code"]: row for row in rows}
+    assert set(by_code) == {"CV-0001", "CV-0002"}
+    assert by_code["CV-0001"]["loss"] == -26877
+    assert by_code["CV-0001"]["cost"] == 30000
+    assert by_code["CV-0001"]["authorization"] == "Sin autorización registrada: revisar"
+    assert by_code["CV-0002"]["authorization"] == "Autorización registrada"

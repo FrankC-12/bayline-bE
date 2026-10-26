@@ -51,6 +51,7 @@ from app.modules.administracion.schemas import (
 from app.modules.administracion.service import AdministracionService
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
+from app.modules.holdings.control_schemas import RegisterCreate
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 
@@ -729,3 +730,30 @@ async def pay_purchase(
     existing = await service.get_request(request_id)
     await _ensure_egreso_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     return await PurchaseWorkflow(service.db).pay(request_id, payload, current_user.user_id)
+
+
+@router.post("/cash-counts", status_code=status.HTTP_201_CREATED)
+async def register_cash_count(
+    payload: "RegisterCreate",
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AdministracionService = Depends(get_service),
+):
+    from app.core.exceptions import BadRequestError
+    from app.modules.filiales.models import Filial
+    from app.modules.holdings.control import HoldingControlService
+
+    if payload.record.kind != "cash_count":
+        raise BadRequestError("Esta ruta solo registra arqueos de caja.")
+    filial_id = payload.record.filial_id
+    await _ensure_access(current_user, filial_id, service.db, AccessLevel.EDITAR)
+    if current_user.filial_id != filial_id:
+        raise BadRequestError("El arqueo debe registrarse desde el concesionario.")
+    filial = await service.db.get(Filial, filial_id)
+    record = await HoldingControlService(service.db).register(
+        filial.holding_id, current_user.user_id, payload
+    )
+    return {
+        "id": record.id,
+        "entry_date": record.entry_date,
+        "evidence": record.payload["evidence"],
+    }

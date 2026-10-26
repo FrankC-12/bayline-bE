@@ -28,7 +28,7 @@ class VehicleInput(BaseModel):
     model: str = Field(min_length=1, max_length=60)
     year: int | None = Field(default=None, ge=1980, le=2100)
     vin: str | None = Field(default=None, max_length=17)
-    mileage: int | None = Field(default=None, ge=0)
+    mileage: int | None = Field(default=None, ge=0, le=1_500_000)
     purchase_date: date | None = None
     body_type: str | None = Field(default=None, max_length=40)
     plate: str | None = Field(default=None, max_length=8)
@@ -36,6 +36,13 @@ class VehicleInput(BaseModel):
     upholstery: str | None = Field(default=None, max_length=40)
     fuel_type: FuelType | None = None
     transmission: TransmissionType | None = None
+
+    @field_validator("year")
+    @classmethod
+    def validate_year(cls, v):
+        if v is not None and v > date.today().year + 1:
+            raise ValueError("El año no puede superar el próximo año modelo.")
+        return v
 
     @field_validator("vin")
     @classmethod
@@ -45,6 +52,10 @@ class VehicleInput(BaseModel):
         v = v.upper().strip()
         if len(v) != 17:
             raise ValueError("El VIN debe tener exactamente 17 caracteres.")
+        if not re.fullmatch(r"[A-HJ-NPR-Z0-9]{17}", v):
+            raise ValueError(
+                "El VIN debe tener exactamente 17 caracteres alfanuméricos y no puede contener I, O ni Q."
+            )
         return v
 
     @field_validator("plate")
@@ -58,7 +69,12 @@ class VehicleInput(BaseModel):
         # edited. This only normalizes and enforces the column width.
         if not v:
             return None
-        return v.upper().strip() or None
+        v = re.sub(r"[\s-]", "", v.upper())
+        if not v:
+            return None
+        if not re.fullmatch(r"[A-Z0-9]{2,8}", v):
+            raise ValueError("La placa debe contener de 2 a 8 letras o números.")
+        return v
 
 
 class VehicleRead(BaseModel):

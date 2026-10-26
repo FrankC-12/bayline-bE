@@ -191,6 +191,7 @@ class VehicleSale(Base):
     bcv_rate: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
     # base + IVA + luxury tax + igtf_amount (contado) or price_financed
     # (financiado) — the actual amount charged, computed once at sale time.
+    cost_snapshot: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     final_price: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
     # Set only when final_price came out below the vehicle's cost_price —
     # requires an "administracion"-level override, recorded here alongside

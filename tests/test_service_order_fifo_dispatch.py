@@ -311,9 +311,17 @@ async def test_receiving_a_purchase_request_stamps_its_id_on_the_new_lot(env):
     await admin.update_request_status(
         request.id, PurchaseRequestStatus.COTIZADA, [QuoteLineInput(line_id=line.id, unit_cost=5)], None
     )
-    await admin.update_request_status(request.id, PurchaseRequestStatus.PAGADA, None, None)
-    await admin.update_request_status(
-        request.id, PurchaseRequestStatus.RECIBIDA, None, warehouse.id, responsible_user_id=comprador_id
+    from app.modules.administracion.purchase_workflow import PurchaseWorkflow
+    from app.modules.administracion.schemas import PurchaseReceive, PurchaseReceiptLine
+
+    await PurchaseWorkflow(admin.db).receive(
+        request.id,
+        PurchaseReceive(
+            request_id=uuid.uuid4(),
+            warehouse_id=warehouse.id,
+            lines=[PurchaseReceiptLine(line_id=line.id, quantity=4)],
+        ),
+        comprador_id,
     )
 
     lot = session.scalar(select(PartLot).where(PartLot.part_id == part.id))

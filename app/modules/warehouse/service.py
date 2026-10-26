@@ -1234,6 +1234,10 @@ class AlmacenService:
             .where(
                 ServiceOrder.filial_id == filial_id,
                 or_(
+                    ServiceOrder.status != "CANCELADO",
+                    ServiceOrderTransfer.stock_deducted.is_(True),
+                ),
+                or_(
                     ServiceOrderTransfer.closed_at.is_not(None),
                     ServiceOrderTransfer.status.in_(
                         [ServiceOrderTransferStatus.PEDIDO, ServiceOrderTransferStatus.COMPLETADO]

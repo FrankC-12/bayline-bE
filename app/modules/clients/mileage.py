@@ -11,6 +11,11 @@ async def validate_mileage(
 ):
     if mileage is None:
         return
+    if mileage > 1_500_000 and not (correction_reason and correction_reason.strip()):
+        raise ConflictError(
+            "El kilometraje supera el rango habitual. Requiere una corrección justificada por Administración.",
+            error_code="mileage_out_of_range",
+        )
     from datetime import UTC
 
     from app.modules.inspections.models import PreliminaryInspection

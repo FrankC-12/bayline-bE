@@ -23,7 +23,7 @@ def vehicle_input(filial_id, **overrides):
         brand="Mazda",
         model="3",
         year=2022,
-        vin=str(uuid.uuid4())[:17],
+        vin="1HGCM82633A004352",
         sku="MAZDA3",
         price_cash=10000,
         price_financed=12000,

@@ -412,6 +412,7 @@ class UpsellPartRead(BaseModel):
 
 
 class UpsellRead(BaseModel):
+    approved_amount: float | None = None
     resolved_by_user_id: uuid.UUID | None = None
     id: uuid.UUID
     service_order_id: uuid.UUID

@@ -3,7 +3,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
@@ -17,7 +17,7 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.clients.models import Vehicle
 from app.modules.notifications.service import queue_order_event
 from app.modules.parts.models import Part
-from app.modules.parts.pricing import PARTS_MULTIPLIERS, price_parts_cost
+from app.modules.parts.pricing import PARTS_MULTIPLIERS, price_catalog
 from app.modules.post_ventas.enums import WarrantyPolicyAppliesTo, WarrantyPolicyStatus
 from app.modules.post_ventas.models import LaborSettings, Tempario, WarrantyPolicy
 from app.modules.service_orders.enums import (
@@ -465,6 +465,15 @@ class ServiceOrderService:
                 hours[order_id] += float(total or 0)
             if status == TaskStatus.EN_ESPERA_DE_REPUESTOS:
                 waiting.add(order_id)
+        invoice_rows = (
+            await self.db.execute(
+                select(
+                    ServiceOrderInvoice.service_order_id, ServiceOrderInvoice.collected_at
+                ).where(ServiceOrderInvoice.service_order_id.in_(ids))
+            )
+        ).all()
+        invoiced_orders = {order_id for order_id, _ in invoice_rows}
+        paid_orders = {order_id for order_id, collected in invoice_rows if collected is not None}
         now = datetime.now(UTC)
         for order in orders:
             order.estimated_hours = hours[order.id]
@@ -477,8 +486,10 @@ class ServiceOrderService:
                 stage = "cancelada"
             elif order.status == ServiceOrderStatus.ORDEN_CERRADA:
                 stage = "cerrada"
+            elif order.id in invoiced_orders or order.invoiced_at:
+                stage = "por_entregar" if order.id in paid_orders else "por_cobrar"
             elif order.status == ServiceOrderStatus.COMPLETADO:
-                stage = "por_cobrar"
+                stage = "por_facturar"
             elif scheduled and scheduled > now and not order.vehicle_received_at:
                 stage = "agendada"
             elif order.id in waiting:
@@ -576,6 +587,17 @@ class ServiceOrderService:
                     "El reclamo seleccionado todavía no está autorizado."
                 )
 
+        from app.modules.service_orders.guards import require_no_active_visit
+
+        await require_no_active_visit(self.db, payload.vehicle_id, payload.filial_id)
+        from app.modules.service_orders.drafts import DraftService
+
+        await DraftService(self.db)._schedule(
+            payload.filial_id,
+            payload.bay_id,
+            payload.scheduled_at,
+            technician_id=payload.technician_user_id,
+        )
         next_seq = await self._next_sequence_number(payload.filial_id)
         order = ServiceOrder(
             filial_id=payload.filial_id,
@@ -673,8 +695,12 @@ class ServiceOrderService:
             order.discount_label = payload.discount_label
             for transfer in await self.list_transfers(order_id):
                 for line in transfer.lines:
-                    line.unit_price, line.line_total = price_parts_cost(
-                        Decimal(str(line.cost_total)), line.quantity, order.discount_label
+                    part = await self.db.get(Part, line.part_id)
+                    line.unit_price, line.line_total = price_catalog(
+                        part.list_price if part else None,
+                        Decimal(str(line.cost_total)),
+                        line.quantity,
+                        order.discount_label,
                     )
 
         if payload.order_type_id is not None:
@@ -749,6 +775,12 @@ class ServiceOrderService:
         if payload.notes is not None:
             order.notes = payload.notes
 
+        from app.modules.service_orders.drafts import DraftService
+
+        await self.db.flush()
+        await DraftService(self.db)._schedule(
+            order.filial_id, order.bay_id, order.scheduled_at, order.id, order.technician_user_id
+        )
         await self.db.commit()
         await self.db.refresh(order)
         return order
@@ -844,6 +876,9 @@ class ServiceOrderService:
             if tempario is None or tempario.filial_id != order.filial_id:
                 raise BadRequestError("El tempario del plan no pertenece a esta filial.")
         if exit_mileage is not None:
+            from app.modules.clients.mileage import validate_mileage
+
+            await validate_mileage(self.db, order.vehicle_id, exit_mileage)
             if order.intake_mileage is not None and exit_mileage < order.intake_mileage:
                 raise BadRequestError("El kilometraje de salida no puede ser menor al de ingreso.")
             order.exit_mileage = exit_mileage
@@ -929,6 +964,11 @@ class ServiceOrderService:
                 select(Filial.id).where(Filial.id == existing.filial_id).with_for_update()
             )
             order = await require_editable_order(self.db, order_id)
+            if not order.is_draft:
+                raise ConflictError(
+                    "Una ODS enviada al taller se cancela con motivo; no se elimina.",
+                    error_code="order_delete_requires_draft",
+                )
             protected = (
                 await self.db.execute(
                     select(ServiceOrderTransfer.id)
@@ -959,11 +999,25 @@ class ServiceOrderService:
         await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
         result = await self.db.execute(
             select(func.max(ServiceOrder.sequence_number)).where(
-                ServiceOrder.filial_id == filial_id
+                ServiceOrder.filial_id == filial_id,
+                ServiceOrder.sequence_number > 0,
             )
         )
         current_max = result.scalar()
         return (current_max or 2000) + 1
+
+    async def _next_draft_number(self, filial_id):
+        from app.modules.filiales.models import Filial
+
+        await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
+        current = (
+            await self.db.execute(
+                select(func.min(ServiceOrder.sequence_number)).where(
+                    ServiceOrder.filial_id == filial_id, ServiceOrder.sequence_number < 0
+                )
+            )
+        ).scalar()
+        return (current or 0) - 1
 
     # Bays
 
@@ -1176,6 +1230,11 @@ class ServiceOrderService:
                         warnings.append(warning)
 
         await self.db.flush()
+        from app.modules.service_orders.drafts import DraftService
+
+        await DraftService(self.db)._schedule(
+            order.filial_id, order.bay_id, order.scheduled_at, order.id, order.technician_user_id
+        )
         await self._sync_status_from_tasks(order)
         if expected_total is not None:
             from decimal import ROUND_HALF_UP
@@ -1227,6 +1286,37 @@ class ServiceOrderService:
             raise TaskNotFoundError(str(task_id))
         return await self.get_order(task.service_order_id)
 
+    async def _require_work_inspections(self, order):
+        from app.modules.detailed_inspections.models import DetailedInspection
+        from app.modules.inspections.enums import InspectionStatus
+        from app.modules.inspections.models import PreliminaryInspection
+
+        preliminary = (
+            await self.db.execute(
+                select(PreliminaryInspection.id)
+                .where(
+                    PreliminaryInspection.service_order_id == order.id,
+                    PreliminaryInspection.status == InspectionStatus.COMPLETADA,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        detailed = (
+            await self.db.execute(
+                select(DetailedInspection.id)
+                .where(
+                    DetailedInspection.service_order_id == order.id,
+                    DetailedInspection.status == "completada",
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if preliminary is None or detailed is None:
+            raise ConflictError(
+                "Completa las inspecciones preliminar y minuciosa antes de ejecutar tareas.",
+                error_code="work_inspections_required",
+            )
+
     async def _require_task_parts_received(self, task):
         pending = (
             await self.db.execute(
@@ -1254,8 +1344,10 @@ class ServiceOrderService:
             started = task.timer_started_at
             if started.tzinfo is None:
                 started = started.replace(tzinfo=UTC)
+            from math import ceil
+
             task.timer_accumulated_seconds += max(
-                0, round((datetime.now(UTC) - started).total_seconds())
+                0, ceil((datetime.now(UTC) - started).total_seconds())
             )
             task.timer_started_at = None
 
@@ -1297,6 +1389,7 @@ class ServiceOrderService:
         if task.status in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA):
             raise ConflictError("La tarea ya está finalizada.", error_code="task_finished")
         await self._require_task_parts_received(task)
+        await self._require_work_inspections(order)
         task.timer_started_at = datetime.now(UTC)
         task.status = TaskStatus.EN_PROGRESO
         await self.db.flush()
@@ -1336,8 +1429,15 @@ class ServiceOrderService:
                 "Envía el borrador al taller antes de iniciar el trabajo.",
                 error_code="order_is_draft",
             )
-        if status == TaskStatus.EN_PROGRESO:
+        if status in (TaskStatus.EN_PROGRESO, TaskStatus.COMPLETADA):
             await self._require_task_parts_received(task)
+            await self._require_work_inspections(order)
+        if status == TaskStatus.COMPLETADA and task.status != TaskStatus.COMPLETADA:
+            if task.timer_started_at is None and task.timer_accumulated_seconds <= 0:
+                raise ConflictError(
+                    "Inicia el cronómetro antes de completar la tarea.",
+                    error_code="task_not_started",
+                )
         if status in (TaskStatus.COMPLETADA, TaskStatus.CANCELADA):
             self._stop_timer(task)
         if status == TaskStatus.CANCELADA:
@@ -1491,7 +1591,11 @@ class ServiceOrderService:
 
         line.quantity = quantity
         line.cost_total = cost
-        line.unit_price, line.line_total = price_parts_cost(cost, quantity, order.discount_label)
+        part = await self.db.get(Part, line.part_id)
+        # Preserve the quoted unit price when only the requested quantity changes.
+        line.line_total = (Decimal(str(line.unit_price)) * quantity).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
         line.allocations = [
             ServiceOrderTransferLotAllocation(
                 lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost, warehouse_id=lot.warehouse_id
@@ -1641,11 +1745,18 @@ class ServiceOrderService:
                 service_order_task_id=service_order_task_id,
             )
             self.db.add(existing)
+        prior_unit = existing.unit_price
         existing.quantity = new_quantity
         existing.cost_total = cost
-        existing.unit_price, existing.line_total = price_parts_cost(
-            cost, new_quantity, order.discount_label
-        )
+        part = await self.db.get(Part, part_id)
+        if prior_unit is not None:
+            existing.line_total = (Decimal(str(prior_unit)) * new_quantity).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        else:
+            existing.unit_price, existing.line_total = price_catalog(
+                part.list_price if part else None, cost, new_quantity, order.discount_label
+            )
         existing.allocations = [
             ServiceOrderTransferLotAllocation(
                 lot_id=lot.id, quantity=take, unit_cost=lot.unit_cost, warehouse_id=lot.warehouse_id
@@ -2022,7 +2133,12 @@ class ServiceOrderService:
                 name_snapshot=p.name_snapshot,
                 quantity=p.quantity,
                 unit_cost_snapshot=float(p.unit_cost_snapshot),
-                line_total=p.quantity * float(p.unit_cost_snapshot) * multiplier,
+                line_total=p.quantity
+                * (
+                    float(p.unit_price_snapshot)
+                    if p.unit_price_snapshot is not None
+                    else float(p.unit_cost_snapshot) * multiplier
+                ),
             )
             for p in upsell.parts
         ]
@@ -2035,6 +2151,11 @@ class ServiceOrderService:
             else labor_cost + sum(p.line_total for p in parts)
         )
         return UpsellRead(
+            approved_amount=(
+                float(upsell.approved_amount_snapshot)
+                if upsell.approved_amount_snapshot is not None
+                else None
+            ),
             id=upsell.id,
             service_order_id=upsell.service_order_id,
             title=upsell.title,
@@ -2134,7 +2255,6 @@ class ServiceOrderService:
                 "Envía la ODS al taller antes de registrar hallazgos.", error_code="order_is_draft"
             )
         hourly_rate = await self._hourly_rate(order.filial_id, order)
-        multiplier = float(PARTS_MULTIPLIERS[order.discount_label])
         labor_cost = 0.0
         parts_cost = 0.0
 
@@ -2176,7 +2296,10 @@ class ServiceOrderService:
                 order.filial_id, part.id, part_input.quantity
             )
             unit_cost = total_cost / part_input.quantity if part_input.quantity else Decimal(0)
-            parts_cost += float(unit_cost) * part_input.quantity * multiplier
+            unit_price, line_total = price_catalog(
+                part.list_price, total_cost, part_input.quantity, order.discount_label
+            )
+            parts_cost += float(line_total)
             self.db.add(
                 UpsellPart(
                     upsell_id=upsell.id,
@@ -2184,6 +2307,7 @@ class ServiceOrderService:
                     name_snapshot=part.name,
                     quantity=part_input.quantity,
                     unit_cost_snapshot=unit_cost,
+                    unit_price_snapshot=unit_price,
                 )
             )
 
@@ -2256,13 +2380,16 @@ class ServiceOrderService:
             # Additional work gets its own ODT, including catalog-linked parts.
             # Keep the decision, tasks and parts in one transaction.
             transfer = await self._get_or_create_pending_transfer(target_order_id, force_new=True)
+            added_tasks = []
             for task in upsell.tasks:
-                await self.add_task(
-                    target_order_id,
-                    task.tempario_id,
-                    payer=ServiceOrderPayer.CLIENTE,
-                    transfer=transfer,
-                    commit=False,
+                added_tasks.append(
+                    await self.add_task(
+                        target_order_id,
+                        task.tempario_id,
+                        payer=ServiceOrderPayer.CLIENTE,
+                        transfer=transfer,
+                        commit=False,
+                    )
                 )
             for part in upsell.parts:
                 await self.add_transfer_line(
@@ -2283,6 +2410,22 @@ class ServiceOrderService:
             ).scalar_one_or_none()
             if has_lines is None:
                 await self.db.delete(transfer)
+            added_parts = (
+                (
+                    await self.db.execute(
+                        select(ServiceOrderTransferLine.line_total).where(
+                            ServiceOrderTransferLine.transfer_id == transfer.id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            hourly = Decimal(str(await self._hourly_rate(target_order.filial_id, target_order)))
+            upsell.approved_amount_snapshot = (
+                sum((Decimal(str(t.hours_snapshot)) * hourly for t in added_tasks), Decimal(0))
+                + sum((Decimal(str(price)) for price in added_parts), Decimal(0))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             upsell.approved_by_user_id = decided_by_user_id
             upsell.approval_channel = payload.approval_channel
             upsell.applied_to_service_order_id = target_order_id
@@ -2672,8 +2815,10 @@ class ServiceOrderService:
                 if line is None:
                     raise WarrantyClaimReferenceMismatchError()
 
+        from app.modules.clients.mileage import validate_mileage
         from app.modules.clients.service import ClientService
 
+        await validate_mileage(self.db, payload.vehicle_id, payload.reported_mileage)
         current_mileage = await ClientService(self.db).get_current_mileage(payload.vehicle_id)
         mileage_inconsistent = (
             current_mileage is not None and payload.reported_mileage < current_mileage
@@ -2804,7 +2949,11 @@ class ServiceOrderService:
         }
         payer = payer_by_type[claim.claim_type]
 
-        next_seq = await self._next_sequence_number(claim.filial_id)
+        next_seq = await (
+            self._next_draft_number(claim.filial_id)
+            if as_draft
+            else self._next_sequence_number(claim.filial_id)
+        )
         intake_mileage = payload.intake_mileage
         if intake_mileage is None:
             intake_mileage = (

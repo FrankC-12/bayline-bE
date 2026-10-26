@@ -34,7 +34,7 @@ class FilialService:
         await self.holding_service.get_holding(payload.holding_id)
         await self._ensure_slug_is_available(payload.holding_id, payload.slug)
 
-        filial = Filial(holding_id=payload.holding_id, name=payload.name, slug=payload.slug)
+        filial = Filial(**payload.model_dump())
         self.db.add(filial)
         await self.db.flush()
 
@@ -56,8 +56,9 @@ class FilialService:
             await self._ensure_slug_is_available(filial.holding_id, payload.slug)
             filial.slug = payload.slug
 
-        if payload.name:
-            filial.name = payload.name
+        for field, value in payload.model_dump(exclude_unset=True).items():
+            if value is not None:
+                setattr(filial, field, value)
 
         await self.db.commit()
         await self.db.refresh(filial)

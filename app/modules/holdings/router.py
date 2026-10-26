@@ -168,7 +168,7 @@ async def get_control_report(
     _ensure_owns_holding(current_user, holding_id)
     today = datetime.now(ZoneInfo("America/Caracas")).date()
     return await HoldingControlService(db).report(
-        holding_id, section, date_from or today, date_to or today, filial_id
+        holding_id, section, date_from or today.replace(day=1), date_to or today, filial_id
     )
 
 

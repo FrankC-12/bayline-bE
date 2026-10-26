@@ -24,6 +24,9 @@ order_inventory = discount_order_inventory
 
 
 async def _add_task(service, order):
+    from workshop_ready import inspections_ready
+
+    await inspections_ready(service, order)
     tempario = Tempario(
         filial_id=order.filial_id, category=TemparioCategory.MOTOR, sequence_number=1,
         name="Cambio de aceite", estimated_hours=1,

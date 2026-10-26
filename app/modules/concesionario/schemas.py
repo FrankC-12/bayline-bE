@@ -2,8 +2,9 @@ import uuid
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.modules.clients.schemas import VehicleInput
 from app.modules.concesionario.enums import (
     FuelType,
     SaleType,
@@ -15,6 +16,17 @@ from app.modules.concesionario.enums import (
 
 
 class VehicleCreate(BaseModel):
+
+    @field_validator("vin")
+    @classmethod
+    def valid_vin(cls, value):
+        return VehicleInput.validate_vin(value)
+
+    @field_validator("year")
+    @classmethod
+    def valid_year(cls, value):
+        return VehicleInput.validate_year(value)
+
     filial_id: uuid.UUID
     status: VehicleStatus = VehicleStatus.EN_TRANSITO
     condition: VehicleCondition
@@ -90,6 +102,12 @@ class VehicleReservationInput(BaseModel):
 
 
 class VehicleUpdate(BaseModel):
+
+    @field_validator("year")
+    @classmethod
+    def valid_year(cls, value):
+        return VehicleInput.validate_year(value)
+
     status_reason: str | None = Field(default=None, max_length=500)
     status: VehicleStatus | None = None
     condition: VehicleCondition | None = None

@@ -50,7 +50,13 @@ def env():
         )
         session.add(client)
         session.commit()
-        vehicle = Vehicle(client_id=client.id, brand="Toyota", model="Corolla", plate="ABC123")
+        vehicle = Vehicle(
+            client_id=client.id,
+            vin="1HGCM82633A004352",
+            brand="Toyota",
+            model="Corolla",
+            plate="ABC123",
+        )
         other_vehicle = Vehicle(client_id=client.id, brand="Toyota", model="Yaris", plate="XYZ999")
         session.add_all([vehicle, other_vehicle])
         session.commit()

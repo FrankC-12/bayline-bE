@@ -72,7 +72,15 @@ async def test_claim_photo_mileage_authorization_and_atomic_draft(
         )
         from datetime import timedelta
 
-        warranty = WorkshopWarranty(
+        existing_warranty = (
+            await db.execute(
+                select(WorkshopWarranty).where(
+                    WorkshopWarranty.service_order_task_id == task.id,
+                    WorkshopWarranty.coverage_type == "MANO_DE_OBRA",
+                )
+            )
+        ).scalar_one_or_none()
+        warranty = existing_warranty or WorkshopWarranty(
             filial_id=ctx.filial_id,
             vin=vehicle.vin,
             service_order_id=order.id,
@@ -85,6 +93,11 @@ async def test_claim_photo_mileage_authorization_and_atomic_draft(
             expires_at=venezuela_today() + timedelta(days=90),
             expiration_mileage=15000,
         )
+        warranty.starts_at = venezuela_today()
+        warranty.duration_days = 90
+        warranty.duration_km = 5000
+        warranty.expires_at = venezuela_today() + timedelta(days=90)
+        warranty.expiration_mileage = 15000
         db.add(warranty)
         db.add(
             RoleModulePermission(

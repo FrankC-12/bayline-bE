@@ -198,6 +198,10 @@ async def test_comeback_and_campana_also_require_the_matching_claim_type(env):
     )
     assert comeback_order.warranty_claim_id == comeback_claim.id
 
+    from app.modules.service_orders.enums import ServiceOrderStatus
+
+    comeback_order.status = ServiceOrderStatus.ORDEN_CERRADA
+    session.commit()
     campana_inspection = _make_inspection(session, vehicle_id)
     campana_claim = _make_claim(session, filial_id, vehicle_id, WarrantyClaimType.CAMPANA_RECALL)
     campana_order = await service.create_order(

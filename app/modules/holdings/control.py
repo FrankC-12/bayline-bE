@@ -137,6 +137,21 @@ class HoldingControlService:
 
             evidence = await stock_registration(self.db, holding_id, ids, actor_id, r)
         elif r.kind == "cash_count":
+            from app.modules.roles.enums import RoleScope
+            from app.modules.roles.models import Role
+            from app.modules.users.models import User
+
+            actor = await self.db.get(User, actor_id)
+            role = await self.db.get(Role, actor.role_id) if actor else None
+            if (
+                actor is None
+                or actor.filial_id != filial_id
+                or role is None
+                or role.scope != RoleScope.FILIAL
+            ):
+                raise UnprocessableEntityError(
+                    "El arqueo lo registra un usuario del concesionario. El distribuidor solo lo consulta."
+                )
             a = await account(r.account_id, filial_id)
             if a.account_type != AccountType.CAJA:
                 raise UnprocessableEntityError("El arqueo requiere una cuenta de caja.")
@@ -372,6 +387,9 @@ class HoldingControlService:
         report = ControlReport(
             section=section,
             generated_at=datetime.now(UTC),
+            notes=[
+                "Vista operativa de la red del importador/distribuidor. La afiliación no implica propiedad societaria; los totales de concesionarios independientes no equivalen a estados financieros legales consolidados."
+            ],
             date_from=start,
             date_to=end,
             filiales=[{"id": str(f.id), "name": f.name} for f in filiales],

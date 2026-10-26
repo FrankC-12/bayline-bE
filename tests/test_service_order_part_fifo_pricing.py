@@ -93,13 +93,13 @@ async def test_requesting_seven_units_blends_both_lots(env):
 
 
 @pytest.mark.asyncio
-async def test_topping_up_the_same_line_recomputes_the_full_cumulative_fifo(env):
+async def test_topping_up_keeps_the_quoted_unit_price(env):
     service, session, order, part, _warehouse, _older, _newer = env
     await service.add_transfer_line(order.id, part.id, 1)
     transfer = await service.add_transfer_line(order.id, part.id, 6)
     line = transfer.lines[0]
     assert line.quantity == 7
-    assert float(line.line_total) == 161.20
+    assert float(line.line_total) == 182.00
 
 
 @pytest.mark.asyncio
@@ -157,7 +157,7 @@ async def test_dispatch_consumes_the_previewed_lots_and_matches_the_add_time_pri
 
 
 @pytest.mark.asyncio
-async def test_dispatch_reprices_if_stock_shrank_since_the_line_was_added(env):
+async def test_dispatch_updates_cost_without_repricing_the_customer(env):
     service, session, order, part, warehouse, older, newer = env
     transfer = await service.add_transfer_line(order.id, part.id, 1)
     line_id = transfer.lines[0].id
@@ -174,6 +174,5 @@ async def test_dispatch_reprices_if_stock_shrank_since_the_line_was_added(env):
     from app.modules.service_orders.models import ServiceOrderTransferLine
 
     line = session.get(ServiceOrderTransferLine, line_id)
-    # Now only the $12 lot is available, so the real dispatch price differs
-    # from the original preview.
-    assert float(line.line_total) == 15.60
+    assert float(line.cost_total) == 12.00
+    assert float(line.line_total) == 26.00

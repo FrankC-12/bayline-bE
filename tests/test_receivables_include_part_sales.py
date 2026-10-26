@@ -1,4 +1,4 @@
-"""Receivables include unpaid and partially paid parts sales regardless of delivery."""
+"""Receivables include unpaid and partially paid parts sales only after delivery."""
 
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -58,14 +58,7 @@ async def test_uncollected_part_sales_appear_in_receivables_with_aging(env):
     receivables = await admin.list_receivables(filial_id)
     part_receivables = {r.code: r for r in receivables if r.document_type == "part_sale"}
 
-    assert set(part_receivables) == {"VR-5001", "VR-5002"}
-    assert part_receivables["VR-5001"].pending_amount == 150.0
-    assert part_receivables["VR-5002"].pending_amount == 240.0
-    assert sum(r.pending_amount for r in part_receivables.values()) == 390.0
-    assert part_receivables["VR-5001"].aging_bucket == "0-30"
-    assert part_receivables["VR-5002"].aging_bucket == "31-60"
-    assert part_receivables["VR-5001"].invoice_id == vr_5001.id
-    assert part_receivables["VR-5002"].invoice_id == vr_5002.id
+    assert part_receivables == {}  # A preparation/request is not an issued debt.
 
 
 @pytest.mark.asyncio
@@ -118,7 +111,7 @@ async def test_receivables_plus_income_reconciles_with_rentabilidad_net_sales(en
     report = await admin.get_profitability(filial_id, venezuela_today() - timedelta(days=1), venezuela_today() + timedelta(days=1))
     repuestos = next(d for d in report.departments if d.key == "repuestos")
 
-    assert cxc_total == 390.0
-    assert repuestos.net_sales == 490.0  # 150 + 240 + 100, every non-cancelled sale
+    assert cxc_total == 0.0
+    assert repuestos.net_sales == 100.0  # Only the delivered sale is recognized
     income_from_parts = 100.0  # only the completado sale posted income
     assert cxc_total + income_from_parts == repuestos.net_sales

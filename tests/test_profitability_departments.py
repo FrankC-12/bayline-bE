@@ -206,7 +206,12 @@ async def test_taller_direct_cost_uses_fifo_allocation_for_dispatched_lines(env)
     )
     session.add(order)
     session.commit()
-    transfer = ServiceOrderTransfer(service_order_id=order.id, sequence_number=1, status=TransferStatus.PEDIDO)
+    transfer = ServiceOrderTransfer(
+        service_order_id=order.id,
+        sequence_number=1,
+        status=TransferStatus.PEDIDO,
+        stock_deducted=True,
+    )
     session.add(transfer)
     session.commit()
     line = ServiceOrderTransferLine(transfer_id=transfer.id, part_id=part.id, quantity=3, cost_total=999)

@@ -15,12 +15,19 @@ from app.modules.warehouse.reservations import available_lots, reserved_by_lot
 class CatalogCosts:
     costs: dict
     notes: list[str]
+    list_prices: dict | None = None
 
 
 async def catalog_fifo_costs(db, filial_id, temparios):
     part_ids = {p.part_id for t in temparios for p in t.parts if p.part_id}
     if not part_ids:
         return {}
+    from app.modules.parts.models import Part
+
+    list_prices = {
+        p.id: p.list_price
+        for p in (await db.execute(select(Part).where(Part.id.in_(part_ids)))).scalars().all()
+    }
     lots = (
         (
             await db.execute(
@@ -72,5 +79,5 @@ async def catalog_fifo_costs(db, filial_id, temparios):
                 notes.append(
                     "Existencia insuficiente: el faltante se estima con el último costo conocido."
                 )
-        result[tempario.id] = CatalogCosts(costs, list(dict.fromkeys(notes)))
+        result[tempario.id] = CatalogCosts(costs, list(dict.fromkeys(notes)), list_prices)
     return result

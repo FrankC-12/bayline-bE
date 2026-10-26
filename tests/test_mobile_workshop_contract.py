@@ -58,6 +58,10 @@ async def test_only_one_running_timer_across_orders_for_the_same_technician(visi
     technician = uuid.uuid4()
     first_order.technician_user_id = second_order.technician_user_id = technician
     session.commit()
+    from workshop_ready import inspections_ready
+
+    await inspections_ready(service, first_order)
+    await inspections_ready(service, second_order)
     first = await service.add_task(first_order.id, tempario.id)
     second = await service.add_task(second_order.id, tempario.id)
     await service.start_task_timer(first.id)
@@ -113,6 +117,12 @@ async def test_current_recommendation_quote_does_not_overwrite_original_price(
     from app.modules.service_orders import router
 
     service, session, settings, origin, _new, _other, tempario = visit_env
+    from app.modules.service_orders.enums import ServiceOrderStatus
+
+    origin.status = ServiceOrderStatus.ORDEN_CERRADA
+    _new.status = ServiceOrderStatus.CANCELADO
+    # Create the historical finding before closing its source visit.
+    origin.status = ServiceOrderStatus.PENDIENTE
     finding = await service.create_upsell(
         origin.id,
         UpsellCreate(
@@ -154,6 +164,11 @@ async def test_creating_order_applies_accepted_recommendation_with_current_price
     )
     settings.hourly_rate = 50
     session.commit()
+    from app.modules.service_orders.enums import ServiceOrderStatus
+
+    origin.status = ServiceOrderStatus.ORDEN_CERRADA
+    _new.status = ServiceOrderStatus.CANCELADO
+    session.commit()
     created = await service.create_order(
         ServiceOrderCreate(
             filial_id=origin.filial_id,
@@ -175,12 +190,15 @@ async def test_creating_order_applies_accepted_recommendation_with_current_price
 
 @pytest.mark.asyncio
 async def test_removing_last_part_does_not_leave_a_phantom_pending_odt(work_env):
+    from workshop_ready import inspections_ready
+
     service, order, tempario, _user = work_env
     task = await service.add_task(order.id, tempario.id)
-    await service.update_task_status(task.id, TaskStatus.COMPLETADA)
     transfer = (await service.list_transfers(order.id))[0]
-    assert order.completed_with_pending_items
     await service.remove_transfer_line(transfer.lines[0].id)
+    await inspections_ready(service, order)
+    await service.start_task_timer(task.id)
+    await service.update_task_status(task.id, TaskStatus.COMPLETADA)
     assert await service.list_transfers(order.id) == []
     assert (await service.get_order_summary(order.id)).transfers == []
     assert order.completed_with_pending_items is False

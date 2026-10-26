@@ -65,6 +65,10 @@ async def create_inspection(
     service: InspectionService = Depends(get_service),
 ) -> InspectionRead:
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
+    if payload.mileage_correction_reason:
+        await ensure_module_access(
+            service.db, current_user, payload.filial_id, "administracion", AccessLevel.EDITAR
+        )
     return await service.create_inspection(payload, current_user.user_id)
 
 
@@ -77,6 +81,10 @@ async def update_inspection(
 ) -> InspectionRead:
     existing = await service.get_inspection(inspection_id)
     await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    if payload.mileage_correction_reason:
+        await ensure_module_access(
+            service.db, current_user, existing.filial_id, "administracion", AccessLevel.EDITAR
+        )
     return await service.update_inspection(inspection_id, payload)
 
 
