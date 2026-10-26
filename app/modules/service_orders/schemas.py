@@ -277,6 +277,8 @@ class TransferLineQuantityUpdate(BaseModel):
 class TransferLineRead(BaseModel):
     id: uuid.UUID
     part_id: uuid.UUID
+    part_name: str | None = None
+    part_code: str | None = None
     quantity: int
     unit_price: float | None
     subtotal: float | None

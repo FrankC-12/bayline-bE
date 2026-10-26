@@ -29,3 +29,12 @@ No se adelanta visualmente un estado antes de confirmar la respuesta del backend
 - Diferencias de ambos repositorios sin errores de espacios.
 
 No se realizó una sesión de navegador interactiva. Esta mejora de Despachos no introduce cambios de API, migraciones ni variables de entorno.
+
+## Actualización: pendientes de ODS completados en el código
+
+- **BAY-06:** se sustituyó el esquema anterior por el nuevo recurso vectorial `public/images/inspection-vehicle-top.svg`, con orientación frontal/trasera, leyenda de severidad y marcas numeradas relacionadas con la lista. Se mantiene el lienzo 100×200 y las coordenadas normalizadas de los daños históricos. Se revisó una miniatura renderizada de la nueva ilustración; esto no sustituye la aceptación visual del PM en producción.
+- **BAY-08:** se corrigió una dependencia del catálogo activo: cada línea de la ODS entrega ahora `part_name` y `part_code` desde el backend. Los repuestos inactivos siguen identificados y los snapshots antiguos se enriquecen únicamente para su lectura, sin modificar precios guardados. Las tablas de borrador y ODS usan estos campos; la ODT conserva columnas de cantidad, PVP y total con anchos definidos.
+- **BAY-05:** interior y fluidos mantienen sus secciones visibles aun sin datos. Las fotos de daños se incluyen en la galería general, se corrigen sus rutas mediante el proxy de evidencia y el detalle de un daño usa el modal central compartido. Se eliminaron fichas de daños duplicadas debajo del mapa.
+- **BAY-09:** se volvió a ejecutar la prueba del cronómetro y sincronización tarea/ODS; el comportamiento de backend continúa cubierto.
+
+No se desplegó a producción. Los cambios de esta actualización requieren publicar backend y frontend; no agregan una migración de base de datos.

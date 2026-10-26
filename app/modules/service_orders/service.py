@@ -1740,9 +1740,34 @@ class ServiceOrderService:
 
     async def get_order_summary(self, service_order_id: uuid.UUID) -> OrderSummary:
         order = await self.get_order(service_order_id)
+        # Labels belong to the response, not to an independently loaded active catalog.
+        # This keeps inactive parts and old invoices readable without repricing them.
+        frozen = (
+            OrderSummary.model_validate(order.pricing_snapshot)
+            if order.pricing_snapshot is not None
+            and (order.invoiced_at is not None or order.status == ServiceOrderStatus.ORDEN_CERRADA)
+            else None
+        )
+        part_ids = (
+            [line.part_id for transfer in frozen.transfers for line in transfer.lines]
+            if frozen is not None
+            else select(ServiceOrderTransferLine.part_id)
+            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+            .where(ServiceOrderTransfer.service_order_id == order.id)
+        )
+        part_labels = {}
+        if frozen is not None or order.status == ServiceOrderStatus.ORDEN_CERRADA or order.invoiced_at is not None:
+            part_labels = {
+                key: (name, code)
+                for key, name, code in (
+                    await self.db.execute(
+                        select(Part.id, Part.name, Part.code).where(Part.id.in_(part_ids), Part.filial_id == order.filial_id)
+                    )
+                ).all()
+            }
         if order.invoiced_at is not None or order.status == ServiceOrderStatus.ORDEN_CERRADA:
             if order.pricing_snapshot is not None:
-                summary = OrderSummary.model_validate(order.pricing_snapshot)
+                summary = frozen
                 # Financial snapshots stay immutable. Closure is operational
                 # metadata recorded after invoicing, so overlay only those fields.
                 closures = (
@@ -1756,6 +1781,10 @@ class ServiceOrderService:
                 ).all()
                 by_id = {key: (closed_at, actor_id) for key, closed_at, actor_id in closures}
                 for transfer in summary.transfers:
+                    for line in transfer.lines:
+                        name, code = part_labels.get(line.part_id, (None, None))
+                        line.part_name = line.part_name or name
+                        line.part_code = line.part_code or code
                     if transfer.id in by_id:
                         transfer.closed_at, transfer.closed_by_user_id = by_id[transfer.id]
                 return summary
@@ -1790,6 +1819,8 @@ class ServiceOrderService:
                             TransferLineRead(
                                 id=line.id,
                                 part_id=line.part_id,
+                                part_name=part_labels.get(line.part_id, (None, None))[0],
+                                part_code=part_labels.get(line.part_id, (None, None))[1],
                                 quantity=line.quantity,
                                 unit_price=None,
                                 subtotal=None,
@@ -1815,6 +1846,15 @@ class ServiceOrderService:
         service_order_id = order.id
         tasks = await self.list_tasks(service_order_id)
         transfers = await self.list_transfers(service_order_id)
+        part_ids = {line.part_id for transfer in transfers for line in transfer.lines}
+        part_labels = {
+            key: (name, code)
+            for key, name, code in (
+                await self.db.execute(
+                    select(Part.id, Part.name, Part.code).where(Part.id.in_(part_ids), Part.filial_id == order.filial_id)
+                )
+            ).all()
+        }
 
         settings_result = await self.db.execute(
             select(LaborSettings).where(LaborSettings.filial_id == order.filial_id)
@@ -1913,6 +1953,8 @@ class ServiceOrderService:
                         TransferLineRead(
                             id=line.id,
                             part_id=line.part_id,
+                            part_name=part_labels.get(line.part_id, (None, None))[0],
+                            part_code=part_labels.get(line.part_id, (None, None))[1],
                             quantity=line.quantity,
                             unit_price=float(line.unit_price),
                             subtotal=float(line.line_total),
