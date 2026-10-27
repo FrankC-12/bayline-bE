@@ -208,6 +208,9 @@ async def test_vehicle_pdf_retains_mileage_at_sale(vehicle_env):
     vehicle = await service.create_vehicle(
         vehicle_input(filial_id, condition="usado", mileage=65000)
     )
+    vehicle.previous_owners = 1
+    vehicle.registration_documents = {kind: "private://evidence.pdf" for kind in ("titulo", "experticia", "certificado")}
+    session.commit()
     await service.update_vehicle(
         vehicle.id, VehicleUpdate(status="vendido", sale=sale_input()), user
     )
@@ -217,8 +220,8 @@ async def test_vehicle_pdf_retains_mileage_at_sale(vehicle_env):
         sale.id, user.model_copy(update={"role_slug": "filial-admin"}), service
     )
     text = "\n".join(page.extract_text() for page in PdfReader(BytesIO(response.body)).pages)
-    assert "65,000 km" in text
-    assert "99,000 km" not in text
+    assert "65.000 km" in text
+    assert "99.000 km" not in text
 
 
 @pytest.mark.asyncio

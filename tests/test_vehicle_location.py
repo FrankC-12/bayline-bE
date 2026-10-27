@@ -28,6 +28,8 @@ def env():
         filial_id = uuid.uuid4()
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Concesionario", slug="conce"))
         session.commit()
+        from vehicle_sales_helpers import add_sales_advisor
+        add_sales_advisor(session, filial_id)
         db = AsyncAdapter(session)
         current_user = CurrentUser(
             user_id=uuid.uuid4(), email="user@test.com", role_id=uuid.uuid4(), role_slug="vendedor",

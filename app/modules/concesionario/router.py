@@ -1,5 +1,6 @@
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -220,20 +221,22 @@ async def vehicle_sale_invoice_pdf(
     await _ensure_access(current_user, sale.filial_id, service.db)
     vehicle = await service.get_vehicle(sale.vehicle_id)
     filial = await service.db.get(Filial, sale.filial_id)
-    mileage = (
-        f"{sale.mileage_at_sale:,} km" if sale.mileage_at_sale is not None else "No registrado"
-    )
+    from app.modules.concesionario.documents import sale_vehicle_description
+
+    snapshot = sale.vehicle_snapshot or {}
     data = {
         "issuer": filial.name,
         "code": "FAC-" + sale.code,
         "issued_at": sale.created_at.isoformat(),
-        "currency": "Bs." if vehicle.price_currency == "VES" else "USD",
+        "currency": (
+            "Bs." if snapshot.get("price_currency", vehicle.price_currency) == "VES" else "USD"
+        ),
         "client": sale.client_name,
         "client_document": sale.client_document or "",
-        "vehicle": f"{vehicle.brand} {vehicle.model} · {vehicle.year}\nVIN: {vehicle.vin or '—'} · Placa: {vehicle.plate or 'Sin placa'}\nKilometraje al vender: {mileage}",
+        "vehicle": sale_vehicle_description(sale, vehicle),
         "lines": [
             {
-                "description": f"{vehicle.brand} {vehicle.model} · {sale.sale_type.value}",
+                "description": f"{snapshot.get('brand', vehicle.brand)} {snapshot.get('model', vehicle.model)} · {sale.sale_type.value}",
                 "quantity": 1,
                 "total": float(sale.final_price) - float(sale.igtf_amount),
             }
@@ -246,7 +249,15 @@ async def vehicle_sale_invoice_pdf(
             ("IGTF", sale.igtf_amount),
             ("Total", sale.final_price),
         ],
-        "payments": ["Modalidad: " + sale.sale_type.value],
+        "payments": ["Modalidad: " + sale.sale_type.value]
+        + [
+            f"{label}: {channel}"
+            for label, channel in (
+                ("USD", sale.usd_payment_channel),
+                ("Bs", sale.bs_payment_channel),
+            )
+            if channel
+        ],
         "pending": 0 if sale.sale_type.value == "contado" else sale.final_price,
         "notes": ["Precio y kilometraje registrados al vender."],
     }
@@ -255,3 +266,68 @@ async def vehicle_sale_invoice_pdf(
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="factura-{sale.id}.pdf"'},
     )
+
+
+@router.post("/dealership-vehicles/{vehicle_id}/documents/{kind}", response_model=VehicleRead)
+async def upload_vehicle_document(
+    vehicle_id: uuid.UUID,
+    kind: Literal["titulo", "experticia", "certificado"],
+    file: UploadFile = File(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    from app.core.exceptions import BadRequestError
+    from app.core.storage import save_private_attachment
+    from app.modules.concesionario.enums import VehicleCondition
+
+    vehicle = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, vehicle.filial_id, service.db, AccessLevel.EDITAR)
+    if vehicle.condition != VehicleCondition.USADO:
+        raise BadRequestError("Estos documentos corresponden a vehículos usados.")
+    reference = await save_private_attachment(file)
+    vehicle.registration_documents = {**(vehicle.registration_documents or {}), kind: reference}
+    await service.db.commit()
+    await service.db.refresh(vehicle)
+    return vehicle
+
+
+@router.get("/dealership-vehicles/{vehicle_id}/documents/{kind}")
+async def download_vehicle_document(
+    vehicle_id: uuid.UUID,
+    kind: Literal["titulo", "experticia", "certificado"],
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    import asyncio
+    from fastapi.responses import FileResponse, RedirectResponse
+    from app.core.exceptions import NotFoundError
+    from app.core.storage import _s3_client, private_pickup_location
+
+    vehicle = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, vehicle.filial_id, service.db)
+    reference = (vehicle.registration_documents or {}).get(kind)
+    if not reference:
+        raise NotFoundError("Documento no registrado.")
+    storage, bucket, location = private_pickup_location(reference)
+    if storage == "s3":
+        url = await asyncio.to_thread(
+            _s3_client().generate_presigned_url,
+            "get_object",
+            Params={"Bucket": bucket, "Key": location},
+            ExpiresIn=300,
+        )
+        return RedirectResponse(url, headers={"Cache-Control": "no-store"})
+    if not Path(location).is_file():
+        raise NotFoundError("Documento no disponible.")
+    return FileResponse(location, headers={"Cache-Control": "no-store"})
+
+
+@router.get("/dealership-vehicles/{vehicle_id}/sale", response_model=VehicleSaleRead)
+async def vehicle_sale_for_vehicle(
+    vehicle_id: uuid.UUID,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ConcesionarioService = Depends(get_service),
+):
+    vehicle = await service.get_vehicle(vehicle_id)
+    await _ensure_access(current_user, vehicle.filial_id, service.db)
+    return await service.get_vehicle_sale(vehicle_id)

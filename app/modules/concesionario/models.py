@@ -59,6 +59,13 @@ class DealershipVehicle(Base):
     version: Mapped[str | None] = mapped_column(String(60), nullable=True)
     year: Mapped[int] = mapped_column(Integer, nullable=False)
     mileage: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    engine_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    seats: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    upholstery: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    previous_owners: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    registration_documents: Mapped[dict] = mapped_column(
+        JSON, nullable=False, default=dict, server_default="{}"
+    )
     color: Mapped[str | None] = mapped_column(String(40), nullable=True)
     fuel_type: Mapped[FuelType | None] = mapped_column(
         Enum(FuelType, name="dealership_vehicle_fuel_type"), nullable=True
@@ -172,7 +179,9 @@ class VehicleSale(Base):
         nullable=False,
     )
     financing_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
-    financing_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    financing_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     mileage_at_sale: Mapped[int | None] = mapped_column(Integer, nullable=True)
     client_name: Mapped[str] = mapped_column(String(150), nullable=False)
     client_document: Mapped[str | None] = mapped_column(String(20), nullable=True)
@@ -185,7 +194,10 @@ class VehicleSale(Base):
     # Only set for sale_type=contado — how the payment was actually split,
     # since that's what determines the IGTF charged (see igtf_amount below).
     # Null for sale_type=financiado, which never touches IGTF.
+    vehicle_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     payment_method: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    usd_payment_channel: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    bs_payment_channel: Mapped[str | None] = mapped_column(String(20), nullable=True)
     usd_base: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     igtf_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
     bcv_rate: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)

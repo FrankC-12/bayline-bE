@@ -2,7 +2,14 @@ import uuid
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from app.modules.clients.schemas import VehicleInput
 from app.modules.concesionario.enums import (
@@ -33,8 +40,13 @@ class VehicleCreate(BaseModel):
     location: VehicleLocation
     brand: str = Field(min_length=1, max_length=60)
     model: str = Field(min_length=1, max_length=60)
+    version: str | None = Field(default=None, max_length=60)
     year: int = Field(ge=1980, le=2100)
     mileage: int | None = Field(default=None, ge=0, le=2147483647, strict=True)
+    engine_type: str | None = Field(default=None, max_length=100)
+    seats: int | None = Field(default=None, ge=1, le=100, strict=True)
+    upholstery: str | None = Field(default=None, max_length=60)
+    previous_owners: int | None = Field(default=None, ge=0, le=100, strict=True)
     color: str | None = Field(default=None, max_length=40)
     fuel_type: FuelType | None = None
     transmission: TransmissionType | None = None
@@ -55,6 +67,10 @@ class VehicleCreate(BaseModel):
     def _require_used_mileage(self):
         if self.condition == VehicleCondition.USADO and self.mileage is None:
             raise ValueError("El kilometraje es obligatorio para un vehículo usado.")
+        if self.condition == VehicleCondition.USADO and self.previous_owners is None:
+            raise ValueError("Indica la cantidad de dueños anteriores del vehículo usado.")
+        if self.condition != VehicleCondition.USADO and self.previous_owners is not None:
+            raise ValueError("Los dueños anteriores solo corresponden a un vehículo usado.")
         return self
 
 
@@ -62,7 +78,7 @@ class VehicleSaleInput(BaseModel):
     client_id: uuid.UUID | None = None
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None
-    advisor_user_id: uuid.UUID | None = None
+    advisor_user_id: uuid.UUID
     sale_type: SaleType
     # Only meaningful for sale_type=contado — how the payment splits between
     # foreign currency and bolívares, since IGTF only taxes the USD portion.
@@ -70,6 +86,8 @@ class VehicleSaleInput(BaseModel):
     # total is never trusted, the same way service_orders/billing.py freezes
     # its own quote server-side rather than accepting a submitted amount.
     payment_method: Literal["usd", "bs", "mixed"] | None = None
+    usd_payment_channel: Literal["cash", "binance", "paypal", "zelle"] | None = None
+    bs_payment_channel: Literal["pago_movil", "transferencia"] | None = None
     usd_base: float | None = Field(default=None, ge=0)
     # Only meaningful when the computed final_price comes out below the
     # vehicle's cost_price — the caller must explicitly opt in and justify
@@ -83,6 +101,17 @@ class VehicleSaleInput(BaseModel):
             raise ValueError(
                 "Indica cómo se cobra (divisas, bolívares o mixto) para una venta de contado."
             )
+        if self.sale_type == SaleType.CONTADO:
+            if self.payment_method in ("usd", "mixed") and not self.usd_payment_channel:
+                raise ValueError("Indica el método de pago en USD.")
+            if self.payment_method in ("bs", "mixed") and not self.bs_payment_channel:
+                raise ValueError("Indica el método de pago en bolívares.")
+            if self.payment_method == "usd" and self.bs_payment_channel:
+                raise ValueError("Un pago en USD no incluye un método en bolívares.")
+            if self.payment_method == "bs" and self.usd_payment_channel:
+                raise ValueError("Un pago en bolívares no incluye un método en USD.")
+        elif self.usd_payment_channel or self.bs_payment_channel:
+            raise ValueError("El pago financiado se gestiona con la financiera.")
         return self
 
 
@@ -102,12 +131,19 @@ class VehicleReservationInput(BaseModel):
 
 
 class VehicleUpdate(BaseModel):
+    @field_validator("vin")
+    @classmethod
+    def valid_vin(cls, value):
+        return VehicleInput.validate_vin(value) if value is not None else value
 
     @field_validator("year")
     @classmethod
     def valid_year(cls, value):
         return VehicleInput.validate_year(value)
 
+    vin: str | None = Field(default=None, min_length=17, max_length=17)
+    sku: str | None = Field(default=None, min_length=1, max_length=40)
+    version: str | None = Field(default=None, max_length=60)
     status_reason: str | None = Field(default=None, max_length=500)
     status: VehicleStatus | None = None
     condition: VehicleCondition | None = None
@@ -116,6 +152,10 @@ class VehicleUpdate(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=60)
     year: int | None = Field(default=None, ge=1980, le=2100)
     mileage: int | None = Field(default=None, ge=0, le=2147483647, strict=True)
+    engine_type: str | None = Field(default=None, max_length=100)
+    seats: int | None = Field(default=None, ge=1, le=100, strict=True)
+    upholstery: str | None = Field(default=None, max_length=60)
+    previous_owners: int | None = Field(default=None, ge=0, le=100, strict=True)
     color: str | None = Field(default=None, max_length=40)
     fuel_type: FuelType | None = None
     transmission: TransmissionType | None = None
@@ -135,6 +175,17 @@ class VehicleUpdate(BaseModel):
 
 
 class VehicleRead(BaseModel):
+    @field_serializer("registration_documents")
+    def public_document_links(self, documents):
+        from app.core.config import get_settings
+
+        prefix = get_settings().api_v1_prefix
+        if self.condition != VehicleCondition.USADO:
+            return {}
+        return {
+            kind: f"{prefix}/dealership-vehicles/{self.id}/documents/{kind}" for kind in documents
+        }
+
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -144,8 +195,14 @@ class VehicleRead(BaseModel):
     location: VehicleLocation | None
     brand: str
     model: str
+    version: str | None = None
     year: int
     mileage: int | None
+    engine_type: str | None = Field(default=None, max_length=100)
+    seats: int | None = Field(default=None, ge=1, le=100, strict=True)
+    upholstery: str | None = Field(default=None, max_length=60)
+    previous_owners: int | None = Field(default=None, ge=0, le=100, strict=True)
+    registration_documents: dict = Field(default_factory=dict)
     color: str | None
     fuel_type: FuelType | None
     transmission: TransmissionType | None
@@ -188,6 +245,8 @@ class VehicleSaleRead(BaseModel):
     advisor_user_id: uuid.UUID | None
     sale_type: SaleType
     payment_method: str | None
+    usd_payment_channel: str | None = None
+    bs_payment_channel: str | None = None
     usd_base: float | None
     igtf_amount: float
     bcv_rate: float | None

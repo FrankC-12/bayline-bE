@@ -1,3 +1,4 @@
+from vehicle_sales_helpers import ADVISOR_ID, add_sales_advisor
 """Factory warranty per vehicle (VIN-keyed): auto-created when a dealership
 sale closes, manually entered by VIN, or bulk-loaded — mirroring the Parts
 bulk-import skip-duplicates pattern."""
@@ -42,6 +43,7 @@ def env():
         filial_id = uuid.uuid4()
         session.add(Filial(id=filial_id, holding_id=uuid.uuid4(), name="Taller", slug="taller"))
         session.commit()
+        add_sales_advisor(session, filial_id)
         db = AsyncAdapter(session)
         yield PostVentasService(db), session, filial_id
 
@@ -208,7 +210,7 @@ async def test_marking_a_dealership_vehicle_sold_auto_creates_the_warranty(env):
         dealership_vehicle.id,
         VehicleUpdate(
             status=VehicleStatus.VENDIDO,
-            sale=VehicleSaleInput(client_name="Juan Pérez", sale_type=SaleType.CONTADO, payment_method="usd"),
+            sale=VehicleSaleInput(advisor_user_id=ADVISOR_ID, client_name="Juan Pérez", sale_type=SaleType.CONTADO, payment_method="usd", usd_payment_channel="cash"),
         ),
         _CALLER,
     )

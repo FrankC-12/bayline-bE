@@ -1,3 +1,4 @@
+from vehicle_sales_helpers import ADVISOR_ID, add_sales_advisor
 """Selling a dealership vehicle below its cost_price now requires an
 "administracion"-level authorization (the vendedor who makes the sale never
 has that access on its own), and leaves who authorized it and when."""
@@ -62,6 +63,7 @@ def env():
         )
         session.add(vehicle)
         session.commit()
+        add_sales_advisor(session, filial_id)
         db = AsyncAdapter(session)
         vendedor = _user(role_id=vendedor_role.id, role_slug="vendedor", filial_id=filial_id)
         admin = _user(role_id=admin_role.id, role_slug="administrador", filial_id=filial_id)
@@ -69,7 +71,7 @@ def env():
 
 
 def _sale(**overrides):
-    payload = dict(client_name="Cliente de Prueba", sale_type=SaleType.CONTADO, payment_method="usd")
+    payload = dict(advisor_user_id=ADVISOR_ID, client_name="Cliente de Prueba", sale_type=SaleType.CONTADO, payment_method="usd", usd_payment_channel="cash")
     payload.update(overrides)
     return VehicleSaleInput(**payload)
 
@@ -163,7 +165,7 @@ async def test_http_below_cost_sale_is_rejected_with_a_clear_message(env):
             f"/api/v1/dealership-vehicles/{vehicle.id}",
             json={
                 "status": "vendido",
-                "sale": {"client_name": "Cliente", "sale_type": "contado", "payment_method": "usd"},
+                "sale": {"advisor_user_id": str(ADVISOR_ID), "client_name": "Cliente", "sale_type": "contado", "payment_method": "usd", "usd_payment_channel": "cash"},
             },
         )
     assert response.status_code == 400

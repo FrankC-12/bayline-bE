@@ -1,3 +1,4 @@
+from vehicle_sales_helpers import ADVISOR_ID, add_sales_advisor
 """Vehicle status transitions are now a defined graph (not a blind field
 assignment), and reserving requires a client, salesperson, deposit and
 validity date, locking the unit against every other salesperson until it's
@@ -398,7 +399,7 @@ async def test_reserved_unit_cannot_be_sold_to_a_different_client_even_by_admin(
                     client_name="Otro cliente",
                     advisor_user_id=owner.user_id,
                     sale_type="contado",
-                    payment_method="usd",
+                    payment_method="usd", usd_payment_channel="cash",
                 ),
             ),
             _user(filial_id=filial_id, role_slug="filial-admin") if admin else owner,
@@ -436,7 +437,7 @@ async def test_sale_retains_reserved_client_and_advisor_and_audits_sale(env):
                 client_name="Nombre alterado",
                 advisor_user_id=owner.user_id,
                 sale_type="contado",
-                payment_method="usd",
+                payment_method="usd", usd_payment_channel="cash",
             ),
         ),
         owner,
@@ -523,7 +524,7 @@ async def test_sale_failure_rolls_back_sale_income_and_keeps_reservation(env, mo
                     client_name=client.full_name,
                     advisor_user_id=owner.user_id,
                     sale_type="contado",
-                    payment_method="usd",
+                    payment_method="usd", usd_payment_channel="cash",
                 ),
             ),
             owner,

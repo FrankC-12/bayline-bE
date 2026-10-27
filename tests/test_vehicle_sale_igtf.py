@@ -1,3 +1,4 @@
+from vehicle_sales_helpers import ADVISOR_ID, add_sales_advisor
 """IGTF is not part of a vehicle's list price (DealershipVehicle.cash_total
 is base + IVA + luxury tax only) — it's computed at sale time, on whatever
 portion of the payment actually lands in foreign currency, the same
@@ -45,11 +46,15 @@ def env():
         )
         session.add(vehicle)
         session.commit()
+        add_sales_advisor(session, filial_id)
         db = AsyncAdapter(session)
         yield ConcesionarioService(db), session, filial_id, vehicle
 
 
 def _sell(service, vehicle_id, **sale_kwargs):
+    sale_kwargs.setdefault("advisor_user_id", ADVISOR_ID)
+    if sale_kwargs.get("payment_method") in ("usd", "mixed"): sale_kwargs.setdefault("usd_payment_channel", "cash")
+    if sale_kwargs.get("payment_method") in ("bs", "mixed"): sale_kwargs.setdefault("bs_payment_channel", "transferencia")
     return service.update_vehicle(
         vehicle_id,
         VehicleUpdate(
@@ -64,7 +69,7 @@ def _sell(service, vehicle_id, **sale_kwargs):
 async def test_full_usd_payment_charges_igtf_on_price_plus_iva(env):
     service, session, filial_id, vehicle = env
 
-    updated = await _sell(service, vehicle.id, payment_method="usd")
+    updated = await _sell(service, vehicle.id, payment_method="usd", usd_payment_channel="cash")
 
     sale = session.query(VehicleSale).filter_by(vehicle_id=vehicle.id).one()
     # base = 10_000 + 16% IVA = 11_600; IGTF = 3% of 11_600 = 348.
@@ -120,7 +125,7 @@ async def test_financed_sale_never_touches_igtf(env):
         vehicle.id,
         VehicleUpdate(
             status=VehicleStatus.VENDIDO,
-            sale=VehicleSaleInput(client_name="Cliente Financiado", sale_type=SaleType.FINANCIADO),
+            sale=VehicleSaleInput(advisor_user_id=ADVISOR_ID, client_name="Cliente Financiado", sale_type=SaleType.FINANCIADO),
         ),
         _CALLER,
     )

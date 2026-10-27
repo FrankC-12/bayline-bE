@@ -58,14 +58,20 @@ class ConcesionarioService:
         return (
             select(User)
             .join(Role, Role.id == User.role_id)
-            .outerjoin(RoleModulePermission, and_(
-                RoleModulePermission.role_id == Role.id,
-                RoleModulePermission.module_id == "concesionario",
-            ))
-            .outerjoin(UserModulePermission, and_(
-                UserModulePermission.user_id == User.id,
-                UserModulePermission.module_id == "concesionario",
-            ))
+            .outerjoin(
+                RoleModulePermission,
+                and_(
+                    RoleModulePermission.role_id == Role.id,
+                    RoleModulePermission.module_id == "concesionario",
+                ),
+            )
+            .outerjoin(
+                UserModulePermission,
+                and_(
+                    UserModulePermission.user_id == User.id,
+                    UserModulePermission.module_id == "concesionario",
+                ),
+            )
             .where(
                 User.filial_id == filial_id,
                 User.status == UserStatus.ACTIVO,
@@ -82,11 +88,14 @@ class ConcesionarioService:
 
     async def _validate_sale_advisor(self, filial_id, advisor_id):
         if advisor_id is None:
-            return  # Preserve the existing optional assignment contract.
+            raise BadRequestError("Selecciona un asesor de venta de vehículos.")
         from app.modules.users.models import User
-        advisor = (await self.db.execute(
-            self._sales_advisors_query(filial_id).where(User.id == advisor_id)
-        )).scalar_one_or_none()
+
+        advisor = (
+            await self.db.execute(
+                self._sales_advisors_query(filial_id).where(User.id == advisor_id)
+            )
+        ).scalar_one_or_none()
         if advisor is None:
             raise BadRequestError(
                 "Selecciona un asesor de venta de vehículos activo de esta filial.",
@@ -192,13 +201,15 @@ class ConcesionarioService:
         if vehicle.reserved_client_id is not None:
             snapshot = {
                 "client_id": str(vehicle.reserved_client_id),
-                "advisor_user_id": str(vehicle.reserved_by_user_id)
-                if vehicle.reserved_by_user_id
-                else None,
+                "advisor_user_id": (
+                    str(vehicle.reserved_by_user_id) if vehicle.reserved_by_user_id else None
+                ),
                 "deposit_amount": float(vehicle.deposit_amount or 0),
-                "expires_at": vehicle.reservation_expires_at.isoformat()
-                if vehicle.reservation_expires_at
-                else None,
+                "expires_at": (
+                    vehicle.reservation_expires_at.isoformat()
+                    if vehicle.reservation_expires_at
+                    else None
+                ),
             }
         self.db.add(
             VehicleStatusEvent(
@@ -322,9 +333,22 @@ class ConcesionarioService:
         self._ensure_not_reserved_by_someone_else(vehicle, current_user)
         price_changes = any(
             getattr(payload, field) is not None
-            and Decimal(str(getattr(payload, field))) != Decimal(str(getattr(vehicle, field)))
-            for field in ("price_cash", "price_financed", "cost_price")
-            if getattr(vehicle, field) is not None
+            and (
+                Decimal(str(getattr(payload, field))) != Decimal(str(getattr(vehicle, field)))
+                if field not in {"price_currency", "cost_is_estimated"}
+                and getattr(vehicle, field) is not None
+                else getattr(payload, field) != getattr(vehicle, field)
+            )
+            for field in (
+                "price_cash",
+                "price_financed",
+                "cost_price",
+                "cost_is_estimated",
+                "price_currency",
+                "iva_percentage",
+                "igtf_percentage",
+                "luxury_tax_percentage",
+            )
         )
         if price_changes and payload.status == VehicleStatus.VENDIDO:
             raise BadRequestError(
@@ -349,6 +373,15 @@ class ConcesionarioService:
         )
         if effective_condition == VehicleCondition.USADO and effective_mileage is None:
             raise BadRequestError("El kilometraje es obligatorio para un vehículo usado.")
+
+        if effective_condition != VehicleCondition.USADO and payload.previous_owners is not None:
+            raise BadRequestError("Los dueños anteriores solo corresponden a un vehículo usado.")
+        if (
+            payload.condition == VehicleCondition.USADO
+            and vehicle.previous_owners is None
+            and payload.previous_owners is None
+        ):
+            raise BadRequestError("Indica la cantidad de dueños anteriores del vehículo usado.")
 
         status_changing = payload.status is not None and payload.status != vehicle.status
         if status_changing and payload.status not in ALLOWED_TRANSITIONS.get(vehicle.status, set()):
@@ -381,6 +414,16 @@ class ConcesionarioService:
                 raise BadRequestError(
                     "La venta debe conservar el vendedor responsable de la reserva."
                 )
+            if effective_condition == VehicleCondition.USADO:
+                if vehicle.previous_owners is None or any(
+                    not (vehicle.registration_documents or {}).get(kind)
+                    for kind in ("titulo", "experticia", "certificado")
+                ):
+                    raise BadRequestError(
+                        "Completa los dueños anteriores, título, experticia y certificado del usado antes de venderlo."
+                    )
+            if payload.model_fields_set - {"status", "status_reason", "sale", "mileage"}:
+                raise BadRequestError("Guarda los datos del vehículo antes de confirmar su venta.")
             await self._validate_sale_advisor(vehicle.filial_id, payload.sale.advisor_user_id)
             if payload.sale.client_id is not None:
                 client = await self.db.get(Client, payload.sale.client_id)
@@ -460,11 +503,38 @@ class ConcesionarioService:
                     sequence_number=next_sequence,
                     vehicle_id=vehicle.id,
                     mileage_at_sale=effective_mileage,
+                    vehicle_snapshot={
+                        name: (
+                            getattr(vehicle, name).value
+                            if hasattr(getattr(vehicle, name), "value")
+                            else getattr(vehicle, name)
+                        )
+                        for name in (
+                            "brand",
+                            "model",
+                            "version",
+                            "year",
+                            "vin",
+                            "plate",
+                            "sku",
+                            "color",
+                            "condition",
+                            "fuel_type",
+                            "transmission",
+                            "engine_type",
+                            "seats",
+                            "upholstery",
+                            "previous_owners",
+                            "price_currency",
+                        )
+                    },
                     client_name=payload.sale.client_name,
                     client_document=payload.sale.client_document,
                     advisor_user_id=payload.sale.advisor_user_id,
                     sale_type=payload.sale.sale_type,
                     payment_method=payload.sale.payment_method,
+                    usd_payment_channel=payload.sale.usd_payment_channel,
+                    bs_payment_channel=payload.sale.bs_payment_channel,
                     usd_base=usd_base_value,
                     igtf_amount=igtf_amount,
                     bcv_rate=bcv_rate,
@@ -522,7 +592,16 @@ class ConcesionarioService:
                 vehicle, vehicle.status, payload.status, current_user, reason
             )
 
+        if payload.vin is not None and payload.vin != vehicle.vin:
+            await self._ensure_vin_available(vehicle.filial_id, payload.vin)
         for field in (
+            "vin",
+            "sku",
+            "version",
+            "engine_type",
+            "seats",
+            "upholstery",
+            "previous_owners",
             "status",
             "condition",
             "location",
@@ -545,8 +624,27 @@ class ConcesionarioService:
             "financing_external_id",
         ):
             value = getattr(payload, field)
-            if value is not None:
+            if value is not None or (
+                field in payload.model_fields_set
+                and field
+                in {
+                    "version",
+                    "engine_type",
+                    "seats",
+                    "upholstery",
+                    "previous_owners",
+                    "plate",
+                    "color",
+                    "fuel_type",
+                    "transmission",
+                    "financing_provider",
+                    "financing_external_id",
+                }
+            ):
                 setattr(vehicle, field, value)
+
+        if effective_condition != VehicleCondition.USADO:
+            vehicle.previous_owners = None
 
         if "mileage" in payload.model_fields_set:
             vehicle.mileage = payload.mileage
@@ -592,6 +690,20 @@ class ConcesionarioService:
         )
         if result.scalar_one_or_none() is not None:
             raise VinAlreadyExistsError(vin)
+
+    async def get_vehicle_sale(self, vehicle_id: uuid.UUID) -> VehicleSale:
+        from app.core.exceptions import NotFoundError
+
+        result = await self.db.execute(
+            select(VehicleSale)
+            .where(VehicleSale.vehicle_id == vehicle_id)
+            .order_by(VehicleSale.created_at.desc())
+            .limit(1)
+        )
+        sale = result.scalar_one_or_none()
+        if sale is None:
+            raise NotFoundError("Este vehículo no tiene una venta registrada.")
+        return sale
 
     async def get_sale(self, sale_id: uuid.UUID) -> VehicleSale:
         from app.core.exceptions import NotFoundError

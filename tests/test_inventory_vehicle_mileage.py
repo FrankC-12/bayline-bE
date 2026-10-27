@@ -1,3 +1,4 @@
+from vehicle_sales_helpers import ADVISOR_ID, add_sales_advisor
 """Inventory mileage is mandatory for used units and frozen into the sale."""
 
 import uuid
@@ -30,11 +31,12 @@ def vehicle_input(filial_id, **overrides):
         cost_price=8000,
     )
     values.update(overrides)
+    if values["condition"] == "usado": values.setdefault("previous_owners", 1)
     return VehicleCreate(**values)
 
 
 def sale_input(**overrides):
-    values = dict(client_name="Cliente", sale_type="contado", payment_method="usd")
+    values = dict(advisor_user_id=ADVISOR_ID, client_name="Cliente", sale_type="contado", payment_method="usd", usd_payment_channel="cash")
     values.update(overrides)
     return VehicleSaleInput(**values)
 
@@ -82,7 +84,7 @@ async def test_changing_to_used_requires_existing_or_supplied_mileage(inventory_
     with pytest.raises(BadRequestError, match="kilometraje"):
         await service.update_vehicle(vehicle.id, VehicleUpdate(condition="usado"), user)
     assert vehicle.condition.value == "nuevo"
-    await service.update_vehicle(vehicle.id, VehicleUpdate(condition="usado", mileage=50000), user)
+    await service.update_vehicle(vehicle.id, VehicleUpdate(condition="usado", mileage=50000, previous_owners=1), user)
     assert vehicle.condition.value == "usado"
     assert vehicle.mileage == 50000
 
@@ -101,6 +103,9 @@ async def test_sale_snapshot_and_document_do_not_change_with_current_odometer(in
     vehicle = await service.create_vehicle(
         vehicle_input(filial_id, condition="usado", mileage=65000)
     )
+    vehicle.previous_owners = 1
+    vehicle.registration_documents = {kind: "private://evidence.pdf" for kind in ("titulo", "experticia", "certificado")}
+    session.commit()
     await service.update_vehicle(
         vehicle.id,
         VehicleUpdate(status="vendido", sale=sale_input(client_name="<script>alert('x')</script>")),
@@ -121,6 +126,9 @@ async def test_sale_snapshot_and_document_do_not_change_with_current_odometer(in
 async def test_mileage_supplied_with_sale_is_frozen_before_sale_persistence(inventory_env):
     service, session, filial_id, user = inventory_env
     vehicle = await service.create_vehicle(vehicle_input(filial_id, condition="usado", mileage=100))
+    vehicle.previous_owners = 1
+    vehicle.registration_documents = {kind: "private://evidence.pdf" for kind in ("titulo", "experticia", "certificado")}
+    session.commit()
     await service.update_vehicle(
         vehicle.id, VehicleUpdate(status="vendido", mileage=200, sale=sale_input()), user
     )
@@ -156,6 +164,10 @@ async def test_http_used_creation_and_edit_and_document_scope(inventory_env):
         vehicle_id = created.json()["id"]
         clearing = await http.patch(f"/dealership-vehicles/{vehicle_id}", json={"mileage": None})
         assert clearing.status_code == 400
+        vehicle = await service.get_vehicle(uuid.UUID(vehicle_id))
+        vehicle.previous_owners = 1
+        vehicle.registration_documents = {kind: "private://evidence.pdf" for kind in ("titulo", "experticia", "certificado")}
+        session.commit()
         sold = await http.patch(
             f"/dealership-vehicles/{vehicle_id}",
             json={"status": "vendido", "sale": sale_input().model_dump(mode="json")},
