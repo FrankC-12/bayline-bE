@@ -208,3 +208,19 @@ def test_push_message_carries_the_inbox_data_and_plays_a_sound_on_ios():
         "notification_id": str(notification.id),
     }
     assert message.apns.payload.aps.sound == "default"
+
+
+@pytest.mark.asyncio
+async def test_push_data_names_the_order(auth_env):
+    from types import SimpleNamespace
+
+    from app.modules.notifications.service import queue_order_event
+
+    service, session, user = auth_env
+    order = SimpleNamespace(
+        id=uuid.uuid4(), code="ODS-1", filial_id=uuid.uuid4(), advisor_user_id=user.id
+    )
+    await queue_order_event(service.db, order, "orden_lista", order.id)
+    session.commit()
+    row = session.scalars(select(Notification)).one()
+    assert row.data["service_order_code"] == "ODS-1"

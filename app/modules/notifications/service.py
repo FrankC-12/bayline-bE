@@ -50,6 +50,7 @@ async def queue_order_event(db, order, kind, entity_id, recipients=None):
                     body=f"{order.code}: {TITLES[kind].lower()}.",
                     data={
                         "service_order_id": str(order.id),
+                        "service_order_code": order.code,
                         "event": kind,
                         "entity_id": str(entity_id),
                         "filial_id": str(order.filial_id),
