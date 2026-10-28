@@ -432,6 +432,9 @@ class ClientService:
                 self.db.add(self._build_vehicle(client.id, v))
 
             await self.db.commit()
+        except ConflictError:
+            await self.db.rollback()
+            raise
         except IntegrityError:
             # The app-level check above is only a fast path — this is the
             # real backstop against two concurrent creates (e.g. a
@@ -491,7 +494,9 @@ class ClientService:
                 setattr(client, field, value)
 
         if payload.vehicles is not None:
-            await self._validate_vehicle_identities(client.filial_id, payload.vehicles)
+            await self._validate_vehicle_identities(
+                client.filial_id, payload.vehicles, existing_ids={v.id for v in client.vehicles}
+            )
             await self._reconcile_vehicles(client, payload.vehicles)
         # Vehicle-only changes also advance the parent version.
         client.updated_at = datetime.now(UTC)
@@ -508,21 +513,26 @@ class ClientService:
         await self.db.delete(client)
         await self.db.commit()
 
-    async def _validate_vehicle_identities(self, filial_id, vehicles):
+    async def _validate_vehicle_identities(self, filial_id, vehicles, *, existing_ids=None):
         from app.modules.filiales.models import Filial
 
         await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
+        existing_ids = existing_ids or set()
         seen = {"vin": set(), "plate": set()}
-        for incoming in vehicles:
+        conflicts = []
+        for index, incoming in enumerate(vehicles):
             for field, label in (("vin", "VIN"), ("plate", "placa")):
                 value = getattr(incoming, field)
                 if not value:
                     continue
                 if value in seen[field]:
-                    raise ConflictError(
-                        f"La {label} está repetida en los vehículos del cliente.",
-                        error_code="duplicate_vehicle_identity",
+                    message = (
+                        "El VIN está repetido en los vehículos del cliente."
+                        if field == "vin"
+                        else "La placa está repetida en los vehículos del cliente."
                     )
+                    conflicts.append({"field": f"vehicles.{index}.{field}", "message": message})
+                    continue
                 seen[field].add(value)
                 normalized = func.upper(
                     func.replace(func.replace(getattr(Vehicle, field), " ", ""), "-", "")
@@ -532,13 +542,27 @@ class ClientService:
                     .join(Client, Client.id == Vehicle.client_id)
                     .where(Client.filial_id == filial_id, normalized == value)
                 )
-                if incoming.id:
+                # Only a vehicle already belonging to the edited client may exclude
+                # itself. A client-supplied ID cannot bypass uniqueness on creation.
+                if incoming.id in existing_ids:
                     query = query.where(Vehicle.id != incoming.id)
                 if (await self.db.execute(query.limit(1))).scalar_one_or_none():
-                    raise ConflictError(
-                        f"Ya existe un vehículo con esta {label} en el concesionario.",
-                        error_code="duplicate_vehicle_identity",
+                    conflicts.append(
+                        {
+                            "field": f"vehicles.{index}.{field}",
+                            "message": f"Ya existe un vehículo con {'este VIN' if field == 'vin' else 'esta placa'} en el concesionario.",
+                        }
                     )
+        if conflicts:
+            raise ConflictError(
+                (
+                    conflicts[0]["message"]
+                    if len(conflicts) == 1
+                    else "Hay placas o VIN duplicados. Revisa los vehículos indicados."
+                ),
+                error_code="duplicate_vehicle_identity",
+                details=conflicts,
+            )
 
     async def _reconcile_vehicles(self, client: Client, vehicles: list[VehicleInput]) -> None:
         """Diffs the incoming vehicle list against what's stored: deletes the ones
