@@ -14,6 +14,9 @@ TITLES = {
     "tecnico_asignado": "Nueva orden asignada",
     "repuestos_listos": "Repuestos listos para retirar",
     "upsell_identificado": "Nuevo hallazgo del técnico",
+    "upsell_aprobado": "Hallazgo aprobado",
+    "upsell_rechazado": "Hallazgo rechazado",
+    "upsell_pospuesto": "Hallazgo pospuesto",
     "tarea_cerrada": "Tarea finalizada",
     "orden_lista": "Orden lista",
 }

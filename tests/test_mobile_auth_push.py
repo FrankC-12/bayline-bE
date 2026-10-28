@@ -168,7 +168,7 @@ async def test_outbox_is_rolled_back_with_the_workshop_transaction(auth_env):
 
 
 @pytest.mark.asyncio
-async def test_all_five_events_are_persisted_once_and_have_the_correct_recipient(auth_env):
+async def test_every_event_is_persisted_once_and_has_the_correct_recipient(auth_env):
     from types import SimpleNamespace
 
     from app.modules.notifications.service import TITLES, queue_order_event
@@ -183,7 +183,7 @@ async def test_all_five_events_are_persisted_once_and_have_the_correct_recipient
     session.commit()
     rows = session.scalars(select(Notification)).all()
     assert {row.kind for row in rows} == set(TITLES)
-    assert len(rows) == 5
+    assert len(rows) == len(TITLES)
     assert all(row.user_id == user.id for row in rows)
 
 

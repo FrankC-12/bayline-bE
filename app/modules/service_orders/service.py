@@ -2439,6 +2439,21 @@ class ServiceOrderService:
         upsell.status = status
         upsell.resolved_by_user_id = decided_by_user_id
         upsell.resolved_at = datetime.now(UTC)
+        # The technician learns whether the work goes ahead; an approval lands
+        # on the order that receives the work, which may not be the original.
+        decided_order = (
+            target_order
+            if status == UpsellStatus.APROBADO
+            else await self.get_order(upsell.service_order_id)
+        )
+        if decided_order.technician_user_id != decided_by_user_id:
+            await queue_order_event(
+                self.db,
+                decided_order,
+                f"upsell_{status.value}",
+                upsell.id,
+                [decided_order.technician_user_id],
+            )
         if commit:
             await self.db.commit()
         else:
