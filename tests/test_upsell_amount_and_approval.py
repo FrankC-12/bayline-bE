@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from test_part_sales_fifo import AsyncAdapter, make_order_type
 
@@ -17,9 +17,12 @@ from app.core.database import Base
 from app.modules.clients.enums import ClientType, DocumentType
 from app.modules.clients.models import Client, Vehicle
 from app.modules.filiales.models import Filial
+from app.modules.notifications.models import Notification
 from app.modules.parts.models import Part
 from app.modules.post_ventas.enums import TemparioCategory
 from app.modules.post_ventas.models import LaborSettings, Tempario, TemparioPart
+from app.modules.roles.enums import RoleScope
+from app.modules.roles.models import Role
 from app.modules.service_orders.enums import UpsellDiscardReason, UpsellSeverity, UpsellStatus
 from app.modules.service_orders.models import ServiceOrder
 from app.modules.service_orders.schemas import (
@@ -29,6 +32,8 @@ from app.modules.service_orders.schemas import (
     UpsellTaskInput,
 )
 from app.modules.service_orders.service import ServiceOrderService
+from app.modules.users.enums import UserStatus
+from app.modules.users.models import User
 from app.modules.warehouse.models import PartLot, Warehouse
 
 
@@ -329,3 +334,74 @@ async def test_legacy_recommendation_without_lines_cannot_be_silently_approved(e
     assert (await service.get_upsell(finding.id)).status == UpsellStatus.PENDIENTE
     assert await service.list_tasks(order.id) == []
     assert await service.list_transfers(order.id) == []
+
+
+def _assign_technician(session, order):
+    role = Role(name="Técnico", slug="tecnico", scope=RoleScope.FILIAL)
+    session.add(role)
+    session.flush()
+    technician = User(
+        full_name="Técnico",
+        email="tecnico@taller.com",
+        status=UserStatus.ACTIVO,
+        role_id=role.id,
+        filial_id=order.filial_id,
+    )
+    session.add(technician)
+    session.flush()
+    order.technician_user_id = technician.id
+    session.commit()
+    return technician
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "decision",
+    [
+        UpsellDecisionInput(status="aprobado", approval_channel="whatsapp"),
+        UpsellDecisionInput(status="rechazado", discard_reason=UpsellDiscardReason.YA_NO_APLICA),
+        UpsellDecisionInput(status="pospuesto"),
+    ],
+)
+async def test_the_technician_is_told_how_the_client_decided(env, decision):
+    service, session, order, tempario, _part = env
+    technician = _assign_technician(session, order)
+    finding = await service.create_upsell(
+        order.id,
+        UpsellCreate(
+            title="Extra",
+            description="Trabajo adicional",
+            severity=UpsellSeverity.MONITOREAR,
+            tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+        ),
+        [],
+    )
+
+    await service.decide_upsell(finding.id, decision, uuid.uuid4())
+
+    notices = session.scalars(
+        select(Notification).where(Notification.user_id == technician.id)
+    ).all()
+    assert [(n.kind, n.body, n.data["entity_id"]) for n in notices] == [
+        (f"upsell_{decision.status}", f"{order.code}: hallazgo {decision.status}.", str(finding.id))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_technician_recording_the_decision_is_not_told_about_it(env):
+    service, session, order, tempario, _part = env
+    technician = _assign_technician(session, order)
+    finding = await service.create_upsell(
+        order.id,
+        UpsellCreate(
+            title="Extra",
+            description="Trabajo adicional",
+            severity=UpsellSeverity.MONITOREAR,
+            tasks=[UpsellTaskInput(tempario_id=tempario.id)],
+        ),
+        [],
+    )
+
+    await service.decide_upsell(finding.id, UpsellDecisionInput(status="pospuesto"), technician.id)
+
+    assert session.scalars(select(Notification)).all() == []

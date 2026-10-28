@@ -27,6 +27,7 @@ Eventos y destinatarios:
 | `tecnico_asignado` | Alta o cambio de asignación | Técnico asignado |
 | `repuestos_listos` | Almacén completa el despacho | Técnico y asesor de la ODS |
 | `upsell_identificado` | Se registra un hallazgo | Asesor de la ODS |
+| `upsell_aprobado`, `upsell_rechazado`, `upsell_pospuesto` | El asesor registra la decisión del cliente sobre un hallazgo | Técnico de la ODS (en la aprobación, la ODS que recibe el trabajo) |
 | `tarea_cerrada` | Tarea completada o cancelada | Asesor de la ODS |
 | `orden_lista` | ODS pasa a completada | Asesor de la ODS |
 
