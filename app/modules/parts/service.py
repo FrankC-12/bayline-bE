@@ -811,6 +811,7 @@ class PartsService:
                     error_code="sale_quote_changed",
                 )
             sale = PartSale(
+                created_by_user_id=responsible_user_id,
                 filial_id=payload.filial_id,
                 client_name=payload.client_name,
                 client_document=payload.client_document,
@@ -858,6 +859,9 @@ class PartsService:
                     )
                 part.stock_quantity = max(0, part.stock_quantity - quantity)
                 _sync_availability(part)
+            from app.modules.parts.notifications import queue_counter_event
+
+            await queue_counter_event(self.db, sale, "counter_waiting")
             await self.db.commit()
             return await self.get_sale(sale.id)
         except Exception:
@@ -872,7 +876,11 @@ class PartsService:
         was sold — stock was already deducted FIFO at sale creation, so a
         mismatch here means a real, unresolved inventory discrepancy."""
         lines_by_id = {line.id: line for line in sale.lines}
-        if dispatched_lines is None or {d.line_id for d in dispatched_lines} != set(lines_by_id):
+        if (
+            dispatched_lines is None
+            or len(dispatched_lines) != len(lines_by_id)
+            or {d.line_id for d in dispatched_lines} != set(lines_by_id)
+        ):
             raise DispatchQuantityRequiredError()
 
         for dispatch in dispatched_lines:
@@ -913,6 +921,17 @@ class PartsService:
                 )
 
     async def update_sale_status(
+        self, sale_id, new_status, dispatched_lines=None, responsible_user_id=None
+    ):
+        try:
+            return await self._update_sale_status(
+                sale_id, new_status, dispatched_lines, responsible_user_id
+            )
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    async def _update_sale_status(
         self,
         sale_id: uuid.UUID,
         new_status: PartSaleStatus,
@@ -927,15 +946,31 @@ class PartsService:
             .execution_options(populate_existing=True)
         )
         sale = await self.get_sale(sale_id)
+        if (
+            new_status == PartSaleStatus.COMPLETADO
+            and sale.status == PartSaleStatus.PEDIDO
+            and not sale.dispatched_at
+        ):
+            raise BadRequestError(
+                "Esperando despacho de almacén. Almacén debe confirmar el despacho antes de recibir en mostrador."
+            )
+        if (
+            new_status == PartSaleStatus.PEDIDO
+            and sale.status in (PartSaleStatus.PENDIENTE, PartSaleStatus.PEDIDO)
+            and not sale.dispatched_at
+        ):
+            self._apply_dispatch(sale, dispatched_lines)
+            sale.dispatched_at = datetime.now(timezone.utc)
+            sale.dispatched_by_user_id = responsible_user_id
+            from app.modules.parts.notifications import queue_counter_event
+
+            await queue_counter_event(self.db, sale, "counter_ready")
         if new_status != sale.status:
             if new_status not in SALE_TRANSITIONS.get(sale.status, set()):
                 raise InvalidSaleStatusTransitionError(sale.status.value, new_status.value)
 
             if new_status == PartSaleStatus.CANCELADO and sale.amount_collected > 0:
                 raise BadRequestError("No se puede cancelar una venta con cobros registrados.")
-
-            if new_status == PartSaleStatus.PEDIDO:
-                self._apply_dispatch(sale, dispatched_lines)
 
             sale.status = new_status
 
@@ -971,6 +1006,7 @@ class PartsService:
 
             if new_status == PartSaleStatus.COMPLETADO:
                 sale.completed_at = datetime.now(timezone.utc)
+                sale.received_by_user_id = responsible_user_id
                 # Confirming at the counter only means the part was handed
                 # over — it no longer silently posts income on its own.
                 # Payment is now its own step (see collect_sale_payment),

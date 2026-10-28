@@ -85,3 +85,22 @@ class UpsellConversionRate(BaseModel):
     postponed_count: int
     converted_count: int
     rate: float
+
+class WorkshopTrendDay(BaseModel):
+    day: date
+    created: int
+    delivered: int
+
+
+class WorkshopOverview(BaseModel):
+    as_of: date
+    registered_vehicles: int
+    active_orders: int
+    pending_orders: int
+    in_progress_orders: int
+    ready_orders: int
+    draft_orders: int
+    maintenance_due_7: int
+    maintenance_due_30: int
+    maintenance_overdue: int
+    trend: list[WorkshopTrendDay]

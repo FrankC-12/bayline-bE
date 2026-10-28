@@ -1412,6 +1412,7 @@ class AlmacenService:
                 )
             requests.append(
                 PartSaleRequestRead(
+                    dispatched_at=sale.dispatched_at,
                     id=sale.id,
                     code=sale.code,
                     client_name=sale.client_name,

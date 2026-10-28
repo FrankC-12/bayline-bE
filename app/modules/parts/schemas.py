@@ -194,6 +194,8 @@ class PartWarrantyRead(BaseModel):
 
 
 class PartSaleLineRead(BaseModel):
+    part_name: str | None = None
+    part_code: str | None = None
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -227,6 +229,10 @@ class PartSaleUpdate(BaseModel):
 
 
 class PartSaleRead(BaseModel):
+    created_by_user_id: uuid.UUID | None = None
+    dispatched_by_user_id: uuid.UUID | None = None
+    dispatched_at: datetime | None = None
+    received_by_user_id: uuid.UUID | None = None
     completed_at: datetime | None = None
     model_config = ConfigDict(from_attributes=True)
 

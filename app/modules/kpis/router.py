@@ -9,6 +9,7 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
 from app.modules.kpis.schemas import (
     KpiReport,
+    WorkshopOverview,
     ManualMovementsRate,
     MaintenanceDueReport,
     ReworkReport,
@@ -112,3 +113,13 @@ async def get_upsell_conversion_rate(
 ) -> UpsellConversionRate:
     await _ensure_access(current_user, filial_id, service.db)
     return await service.get_upsell_conversion_rate(filial_id, date_from, date_to)
+
+
+@router.get("/kpis/resumen", response_model=WorkshopOverview)
+async def get_workshop_overview(
+    filial_id: uuid.UUID = Query(...),
+    current_user: CurrentUser = Depends(get_current_user),
+    service: KpiService = Depends(get_service),
+):
+    await _ensure_access(current_user, filial_id, service.db)
+    return await service.get_overview(filial_id)

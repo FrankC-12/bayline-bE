@@ -163,6 +163,7 @@ class PartSaleRequestLineRead(BaseModel):
 
 
 class PartSaleRequestRead(BaseModel):
+    dispatched_at: datetime | None = None
     """A counter parts sale (Venta de Repuestos) surfaced to almacén staff
     the same way a dispatched ODT is — its destination is the sales
     counter/mostrador, not a taller bay, which is exactly what almacén

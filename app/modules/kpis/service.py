@@ -126,6 +126,99 @@ class KpiService:
         ]
         return _build_report(rows)
 
+    async def get_overview(self, filial_id):
+        from sqlalchemy import case
+        from app.core.venezuela_time import business_period_bounds
+        from app.modules.kpis.schemas import WorkshopOverview, WorkshopTrendDay
+        from app.modules.service_orders.enums import ServiceOrderStatus
+
+        today = venezuela_today()
+        start_day = today - timedelta(days=6)
+        start, end = business_period_bounds(start_day, today)
+        groups = (
+            await self.db.execute(
+                select(ServiceOrder.status, ServiceOrder.is_draft, func.count())
+                .where(ServiceOrder.filial_id == filial_id)
+                .group_by(ServiceOrder.status, ServiceOrder.is_draft)
+            )
+        ).all()
+        counts = {status: 0 for status in ServiceOrderStatus}
+        drafts = 0
+        for status, is_draft, count in groups:
+            if is_draft:
+                drafts += count
+            else:
+                counts[status] = count
+        fleet = (
+            await self.db.execute(
+                select(
+                    func.count(Vehicle.id),
+                    func.sum(case((Vehicle.next_maintenance_due_at < today, 1), else_=0)),
+                    func.sum(
+                        case(
+                            (
+                                Vehicle.next_maintenance_due_at.between(
+                                    today, today + timedelta(days=7)
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                    func.sum(
+                        case(
+                            (
+                                Vehicle.next_maintenance_due_at.between(
+                                    today, today + timedelta(days=30)
+                                ),
+                                1,
+                            ),
+                            else_=0,
+                        )
+                    ),
+                )
+                .join(Client, Client.id == Vehicle.client_id)
+                .where(Client.filial_id == filial_id)
+            )
+        ).one()
+        days = {start_day + timedelta(days=i): {"created": 0, "delivered": 0} for i in range(7)}
+        for column, metric in (
+            (ServiceOrder.created_at, "created"),
+            (ServiceOrder.closed_at, "delivered"),
+        ):
+            if self.db.get_bind().dialect.name == "postgresql":
+                day = func.date(func.timezone("America/Caracas", column))
+            else:
+                day = func.date(column, "-4 hours")
+            query = select(day, func.count()).where(
+                ServiceOrder.filial_id == filial_id,
+                ServiceOrder.is_draft.is_(False),
+                column >= start,
+                column < end,
+            )
+            if metric == "delivered":
+                query = query.where(ServiceOrder.status == ServiceOrderStatus.ORDEN_CERRADA)
+            for bucket, count in (await self.db.execute(query.group_by(day))).all():
+                key = date.fromisoformat(bucket) if isinstance(bucket, str) else bucket
+                if key in days:
+                    days[key][metric] = count
+        pending = counts[ServiceOrderStatus.PENDIENTE]
+        progress = counts[ServiceOrderStatus.EN_PROGRESO]
+        ready = counts[ServiceOrderStatus.COMPLETADO]
+        return WorkshopOverview(
+            as_of=today,
+            registered_vehicles=fleet[0],
+            active_orders=pending + progress + ready,
+            pending_orders=pending,
+            in_progress_orders=progress,
+            ready_orders=ready,
+            draft_orders=drafts,
+            maintenance_due_7=fleet[2] or 0,
+            maintenance_due_30=fleet[3] or 0,
+            maintenance_overdue=fleet[1] or 0,
+            trend=[WorkshopTrendDay(day=key, **values) for key, values in days.items()],
+        )
+
     async def get_maintenance_due(
         self, filial_id: uuid.UUID, window_days: int
     ) -> MaintenanceDueReport:

@@ -153,6 +153,16 @@ class PartSale(Base):
     iva_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
     igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0, server_default="0")
     igtf_amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0, server_default="0")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    dispatched_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -220,6 +230,16 @@ class PartSaleLine(Base):
         cascade="all, delete-orphan", lazy="selectin"
     )
     warehouse: Mapped["Warehouse | None"] = relationship(lazy="selectin")
+
+    part: Mapped["Part"] = relationship(lazy="selectin")
+
+    @property
+    def part_name(self):
+        return self.part.name if self.part else None
+
+    @property
+    def part_code(self):
+        return self.part.code if self.part else None
 
     sale: Mapped["PartSale"] = relationship(back_populates="lines")
 

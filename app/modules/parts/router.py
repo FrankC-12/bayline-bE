@@ -41,6 +41,8 @@ from app.modules.parts.service import PartsService
 from app.modules.roles.enums import AccessLevel
 from app.modules.roles.permissions import ensure_module_access
 
+from app.modules.parts.enums import PartSaleStatus
+
 MODULE_ID = "repuestos"
 
 router = APIRouter(tags=["Parts"])
@@ -57,6 +59,15 @@ async def _ensure_access(
     level: AccessLevel = AccessLevel.VER,
 ) -> None:
     await ensure_module_access(db, current_user, filial_id, MODULE_ID, level)
+
+
+async def _ensure_sale_read_access(current_user, filial_id, db):
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    try:
+        await _ensure_access(current_user, filial_id, db)
+    except InsufficientPermissionsError:
+        await ensure_module_access(db, current_user, filial_id, "almacen", AccessLevel.VER)
 
 
 COBRAR_MODULE_ID = "finanzas-cobrar"
@@ -317,7 +328,7 @@ async def list_part_sales(
     current_user: CurrentUser = Depends(get_current_user),
     service: PartsService = Depends(get_service),
 ) -> list[PartSaleRead]:
-    await _ensure_access(current_user, filial_id, service.db)
+    await _ensure_sale_read_access(current_user, filial_id, service.db)
     return await service.list_sales(filial_id, search)
 
 
@@ -338,7 +349,7 @@ async def get_part_sale(
     service: PartsService = Depends(get_service),
 ) -> PartSaleRead:
     sale = await service.get_sale(sale_id)
-    await _ensure_access(current_user, sale.filial_id, service.db)
+    await _ensure_sale_read_access(current_user, sale.filial_id, service.db)
     return sale
 
 
@@ -360,7 +371,24 @@ async def update_part_sale(
     service: PartsService = Depends(get_service),
 ) -> PartSaleRead:
     existing = await service.get_sale(sale_id)
-    await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
+    if payload.status == PartSaleStatus.COMPLETADO and (
+        current_user.role_slug == "almacenista"
+        or (
+            existing.dispatched_by_user_id == current_user.user_id
+            and current_user.role_slug != "filial-admin"
+        )
+    ):
+        from app.core.exceptions import ForbiddenError
+
+        raise ForbiddenError(
+            "La recepción debe confirmarla el asesor de mostrador, distinto del usuario que despachó en almacén."
+        )
+    if payload.status == PartSaleStatus.PEDIDO:
+        await ensure_module_access(
+            service.db, current_user, existing.filial_id, "almacen", AccessLevel.EDITAR
+        )
+    else:
+        await _ensure_access(current_user, existing.filial_id, service.db, AccessLevel.EDITAR)
     if payload.status is None:
         return existing
     return await service.update_sale_status(
