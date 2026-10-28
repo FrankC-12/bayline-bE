@@ -76,17 +76,24 @@ def firebase_app():
     )
 
 
+def build_message(device, notification):
+    from firebase_admin import messaging
+
+    return messaging.Message(
+        token=device.token,
+        notification=messaging.Notification(title=notification.title, body=notification.body),
+        data={**notification.data, "notification_id": str(notification.id)},
+        # APNs plays no sound unless the payload asks for one.
+        apns=messaging.APNSConfig(
+            payload=messaging.APNSPayload(aps=messaging.Aps(sound="default"))
+        ),
+    )
+
+
 def send_fcm(device, notification):
     from firebase_admin import messaging
 
-    return messaging.send(
-        messaging.Message(
-            token=device.token,
-            notification=messaging.Notification(title=notification.title, body=notification.body),
-            data={**notification.data, "notification_id": str(notification.id)},
-        ),
-        app=firebase_app(),
-    )
+    return messaging.send(build_message(device, notification), app=firebase_app())
 
 
 async def deliver_batch(db, sender=send_fcm):

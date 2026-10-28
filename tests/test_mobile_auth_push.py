@@ -185,3 +185,26 @@ async def test_all_five_events_are_persisted_once_and_have_the_correct_recipient
     assert {row.kind for row in rows} == set(TITLES)
     assert len(rows) == 5
     assert all(row.user_id == user.id for row in rows)
+
+
+def test_push_message_carries_the_inbox_data_and_plays_a_sound_on_ios():
+    from types import SimpleNamespace
+
+    from app.modules.notifications.service import build_message
+
+    device = SimpleNamespace(token="test-device-token")
+    notification = SimpleNamespace(
+        id=uuid.uuid4(),
+        title="Nueva orden asignada",
+        body="ODS-1: nueva orden asignada.",
+        data={"event": "tecnico_asignado", "service_order_id": "order-1"},
+    )
+    message = build_message(device, notification)
+    assert message.token == "test-device-token"
+    assert message.notification.title == "Nueva orden asignada"
+    assert message.data == {
+        "event": "tecnico_asignado",
+        "service_order_id": "order-1",
+        "notification_id": str(notification.id),
+    }
+    assert message.apns.payload.aps.sound == "default"

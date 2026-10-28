@@ -30,7 +30,7 @@ Eventos y destinatarios:
 | `tarea_cerrada` | Tarea completada o cancelada | Asesor de la ODS |
 | `orden_lista` | ODS pasa a completada | Asesor de la ODS |
 
-Cada push lleva `notification_id`, `event`, `service_order_id`, `entity_id` y `filial_id` como strings para abrir la pantalla correspondiente. Mobile debe deduplicar por `notification_id`: un reinicio entre la aceptación de Firebase y el commit local puede repetir una entrega.
+Cada push lleva `notification_id`, `event`, `service_order_id`, `entity_id` y `filial_id` como strings para abrir la pantalla correspondiente. Mobile debe deduplicar por `notification_id`: un reinicio entre la aceptación de Firebase y el commit local puede repetir una entrega. En iOS el aviso suena con el sonido del sistema (`aps.sound = "default"`); APNs no reproduce sonido si el payload no lo pide.
 
 Los eventos se guardan dentro de la transacción del taller. Un worker procesa la cola con bloqueos `SKIP LOCKED`, reintentos y registro de los dispositivos ya entregados. No se envían eventos revertidos. Tokens inválidos se desactivan; no se escriben tokens ni mensajes del SDK en logs.
 
