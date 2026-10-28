@@ -8,6 +8,8 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.database import get_db
+from auth_test_support import account_database
 from app.core.exception_handlers import register_exception_handlers
 from app.core.http_security import HttpSecurityMiddleware
 from app.core.security import create_access_token, create_refresh_token, decode_refresh_token
@@ -53,7 +55,10 @@ def session_app(monkeypatch):
             refresh_expires_in=3600,
         )
 
+    account_db = account_database(claims)
+
     class FakeAuth:
+        db = account_db
         async def check_login_budget(self, email, ip):
             pass
 
@@ -74,6 +79,7 @@ def session_app(monkeypatch):
     app.include_router(routes.router, prefix="/api/v1")
     app.add_middleware(HttpSecurityMiddleware)
     register_exception_handlers(app)
+    app.dependency_overrides[get_db] = lambda: account_db
     app.dependency_overrides[routes.get_auth_service] = FakeAuth
     return app
 

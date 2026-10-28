@@ -71,8 +71,8 @@ async def refresh(
 async def logout(request: Request, payload: LogoutRequest = LogoutRequest(), service: AuthService = Depends(get_auth_service)):
     # Identify authenticated logouts without breaking expired-session cleanup.
     try:
-        get_current_user(request)
-    except InvalidTokenError:
+        await get_current_user(request, db=service.db)
+    except DomainError:
         pass
     await service.logout(request.cookies.get(REFRESH_COOKIE) or payload.refresh_token or "", payload.device_id)
     response = Response(status_code=204)

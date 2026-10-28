@@ -45,6 +45,7 @@ class AuthService:
         settings = get_settings()
         claims = {
             "sub": str(user.id),
+            "session_version": user.session_version or 0,
             "email": user.email,
             "full_name": user.full_name,
             "role_id": str(role.id),
@@ -126,7 +127,7 @@ class AuthService:
             raise error
 
     async def login(self, email: str, password: str) -> TokenResponse:
-        result = await self.db.execute(select(User).where(User.email == email))
+        result = await self.db.execute(select(User).where(User.email == email).with_for_update())
         user = result.scalar_one_or_none()
 
         if user is None or user.password_hash is None:
@@ -148,7 +149,7 @@ class AuthService:
         except (jwt.PyJWTError, KeyError, ValueError) as exc:
             raise InvalidRefreshTokenError() from exc
 
-        result = await self.db.execute(select(User).where(User.id == user_id))
+        result = await self.db.execute(select(User).where(User.id == user_id).with_for_update())
         user = result.scalar_one_or_none()
         if user is None:
             raise InvalidRefreshTokenError()

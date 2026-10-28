@@ -12,6 +12,8 @@ from app.modules.roles.permissions import ensure_module_access
 from app.modules.roles.service import RoleService
 from app.modules.users.schemas import UserCreate, UserDirectoryEntry, UserRead, UserUpdate
 from app.modules.users.service import UserService
+from app.modules.users.enums import UserStatus
+from app.core.exceptions import BadRequestError
 
 MODULE_ID = "usuarios-accesos"
 
@@ -142,6 +144,11 @@ async def update_user(
 ) -> UserRead:
     """Update a user. Authorization depends on the target role's scope and tenant ownership."""
     existing = await service.get_user(user_id)
+    await _authorize_user_access(
+        existing.role_id, existing.holding_id, existing.filial_id, current_user, role_service
+    )
+    if user_id == current_user.user_id and payload.status not in (None, UserStatus.ACTIVO):
+        raise BadRequestError("No puedes suspender tu propia cuenta.", error_code="self_suspension")
     target_role_id = payload.role_id or existing.role_id
     target_holding_id = payload.holding_id if payload.holding_id is not None else existing.holding_id
     target_filial_id = payload.filial_id if payload.filial_id is not None else existing.filial_id

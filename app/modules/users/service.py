@@ -1,6 +1,8 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from datetime import UTC, datetime
+from app.modules.auth.models import RefreshSession
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -93,6 +95,9 @@ class UserService:
         return await self.get_user(user.id)
 
     async def update_user(self, user_id: uuid.UUID, payload: UserUpdate) -> User:
+        # Serialize changes to the same account so every suspension advances
+        # its access-token generation and revokes refresh sessions atomically.
+        await self.db.execute(select(User.id).where(User.id == user_id).with_for_update())
         user = await self.get_user(user_id)
         role = await self.role_service.get_role(payload.role_id or user.role_id)
 
@@ -114,6 +119,11 @@ class UserService:
         if payload.full_name:
             user.full_name = payload.full_name
         if payload.status:
+            if payload.status != UserStatus.ACTIVO and user.status != payload.status:
+                user.session_version += 1
+                await self.db.execute(update(RefreshSession).where(
+                    RefreshSession.user_id == user.id, RefreshSession.revoked_at.is_(None)
+                ).values(revoked_at=datetime.now(UTC)))
             user.status = payload.status
 
         if payload.permission_overrides is not None:

@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,6 +24,8 @@ class User(Base):
     status: Mapped[UserStatus] = mapped_column(
         Enum(UserStatus, name="user_status"), nullable=False, default=UserStatus.INVITADO
     )
+
+    session_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     role_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("roles.id", ondelete="RESTRICT"), nullable=False, index=True

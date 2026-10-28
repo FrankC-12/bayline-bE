@@ -20,7 +20,9 @@ from app.core.audit_logging import (
 from app.core.exception_handlers import register_exception_handlers
 from app.core.exceptions import BadRequestError
 from app.core.request_tracking import RequestTrackingMiddleware
-from app.core.security import create_access_token
+from app.core.security import create_access_token, decode_access_token
+from app.core.database import get_db
+from auth_test_support import account_database
 from app.core.telemetry import router as telemetry_router
 from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.schemas import CurrentUser
@@ -72,6 +74,9 @@ async def test_http_audit_correlates_actor_failures_and_redacts_sensitive_data(t
             "holding_id": None,
         }
     )
+
+    account_db = account_database(decode_access_token(token))
+    app.dependency_overrides[get_db] = lambda: account_db
 
     @app.post("/audit/{resource_id}")
     async def action(

@@ -12,7 +12,7 @@ class InactiveUserError(UnauthorizedError):
     """Raised when a user with valid credentials is not in 'activo' status."""
 
     def __init__(self) -> None:
-        super().__init__("This user account is not active.", error_code="inactive_user")
+        super().__init__("Tu usuario está suspendido. Contacta a un administrador para reactivarlo.", error_code="inactive_user")
 
 
 class InvalidTokenError(UnauthorizedError):
