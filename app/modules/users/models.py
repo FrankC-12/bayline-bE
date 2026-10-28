@@ -25,6 +25,9 @@ class User(Base):
         Enum(UserStatus, name="user_status"), nullable=False, default=UserStatus.INVITADO
     )
 
+    recovery_phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    recovery_phone_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     session_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     role_id: Mapped[uuid.UUID] = mapped_column(

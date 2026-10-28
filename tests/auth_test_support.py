@@ -4,6 +4,8 @@ import uuid
 from types import SimpleNamespace
 from app.modules.roles.enums import RoleScope
 from app.modules.users.enums import UserStatus
+from app.modules.filiales.models import Filial
+from app.modules.holdings.models import Holding
 
 
 def account_database(claims):
@@ -23,6 +25,18 @@ def account_database(claims):
 
     class Database:
         async def execute(self, statement):
-            return SimpleNamespace(one_or_none=lambda: (account, role))
+            entity = statement.column_descriptions[0].get("entity")
+            item = (
+                SimpleNamespace(
+                    id=account.filial_id,
+                    holding_id=account.holding_id or uuid.UUID(int=1),
+                    is_active=True,
+                )
+                if entity == Filial
+                else SimpleNamespace(is_active=True) if entity == Holding else None
+            )
+            return SimpleNamespace(
+                one_or_none=lambda: (account, role), scalar_one_or_none=lambda: item
+            )
 
     return Database()

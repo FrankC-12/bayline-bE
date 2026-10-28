@@ -65,7 +65,13 @@ class FilialService:
         return filial
 
     async def set_active_status(self, filial_id: uuid.UUID, is_active: bool) -> Filial:
+        from app.modules.users.models import User
+        from app.modules.auth.organization_access import revoke_accounts
+
+        await self.db.execute(select(Filial.id).where(Filial.id == filial_id).with_for_update())
         filial = await self.get_filial(filial_id)
+        if not is_active and filial.is_active:
+            await revoke_accounts(self.db, select(User.id).where(User.filial_id == filial_id))
         filial.is_active = is_active
         await self.db.commit()
         await self.db.refresh(filial)

@@ -35,6 +35,19 @@ class Settings(BaseSettings):
     platform_admin_email: str
     platform_admin_password: str
 
+    recovery_otp_minutes: int = Field(default=10, ge=1, le=30)
+    recovery_otp_attempts: int = Field(default=5, ge=1, le=10)
+    smtp_host: str | None = None
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str | None = None
+    smtp_password: str | None = Field(default=None, repr=False)
+    smtp_from_email: str | None = None
+    smtp_starttls: bool = True
+    smtp_ssl: bool = False
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = Field(default=None, repr=False)
+    twilio_from_number: str | None = None
+
     logs_dir: str = "logs"
     logs_timezone: str = "America/Caracas"
 

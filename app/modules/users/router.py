@@ -10,7 +10,13 @@ from app.modules.auth.schemas import CurrentUser
 from app.modules.roles.enums import AccessLevel, RoleScope
 from app.modules.roles.permissions import ensure_module_access
 from app.modules.roles.service import RoleService
-from app.modules.users.schemas import UserCreate, UserDirectoryEntry, UserRead, UserUpdate
+from app.modules.users.schemas import (
+    UserCreate,
+    UserDirectoryEntry,
+    UserRead,
+    UserUpdate,
+    UserPasswordReset,
+)
 from app.modules.users.service import UserService
 from app.modules.users.enums import UserStatus
 from app.core.exceptions import BadRequestError
@@ -53,7 +59,11 @@ async def _authorize_user_access(
         return
 
     # role.scope == RoleScope.FILIAL
-    if current_user.scope == RoleScope.HOLDING and holding_id and current_user.holding_id == holding_id:
+    if (
+        current_user.scope == RoleScope.HOLDING
+        and holding_id
+        and current_user.holding_id == holding_id
+    ):
         return
 
     if (
@@ -116,7 +126,9 @@ async def get_user(
     or updating one — nothing in the app fetches a bare user by id outside
     the admin screen, so there's no dropdown-style use to preserve here."""
     user = await service.get_user(user_id)
-    await _authorize_user_access(user.role_id, user.holding_id, user.filial_id, current_user, role_service)
+    await _authorize_user_access(
+        user.role_id, user.holding_id, user.filial_id, current_user, role_service
+    )
     return user
 
 
@@ -150,9 +162,31 @@ async def update_user(
     if user_id == current_user.user_id and payload.status not in (None, UserStatus.ACTIVO):
         raise BadRequestError("No puedes suspender tu propia cuenta.", error_code="self_suspension")
     target_role_id = payload.role_id or existing.role_id
-    target_holding_id = payload.holding_id if payload.holding_id is not None else existing.holding_id
+    target_holding_id = (
+        payload.holding_id if payload.holding_id is not None else existing.holding_id
+    )
     target_filial_id = payload.filial_id if payload.filial_id is not None else existing.filial_id
     await _authorize_user_access(
         target_role_id, target_holding_id, target_filial_id, current_user, role_service
     )
     return await service.update_user(user_id, payload)
+
+
+@router.post("/{user_id}/reset-password", status_code=204)
+async def reset_user_password(
+    user_id: uuid.UUID,
+    payload: UserPasswordReset,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: UserService = Depends(get_user_service),
+    role_service: RoleService = Depends(get_role_service),
+):
+    existing = await service.get_user(user_id)
+    role = await role_service.get_role(existing.role_id)
+    if role.scope != RoleScope.FILIAL:
+        raise InsufficientPermissionsError()
+    await _authorize_user_access(
+        existing.role_id, existing.holding_id, existing.filial_id, current_user, role_service
+    )
+    await service.reset_password(
+        user_id, current_user.user_id, payload.current_password, payload.new_password
+    )

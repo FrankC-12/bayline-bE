@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from app.modules.roles.schemas import ModulePermissionSchema
 from app.modules.users.enums import UserStatus
@@ -53,3 +53,15 @@ class UserDirectoryEntry(BaseModel):
     id: uuid.UUID
     full_name: str
     role_id: uuid.UUID
+
+
+class UserPasswordReset(BaseModel):
+    current_password: str = Field(min_length=1, max_length=72)
+    new_password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("new_password")
+    @classmethod
+    def password_byte_limit(cls, value):
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("La contraseña excede el máximo de 72 bytes.")
+        return value

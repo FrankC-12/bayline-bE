@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.holdings.exceptions import HoldingNotFoundError, HoldingSlugAlreadyExistsError
@@ -53,7 +53,20 @@ class HoldingService:
         return holding
 
     async def set_active_status(self, holding_id: uuid.UUID, is_active: bool) -> Holding:
+        from app.modules.users.models import User
+        from app.modules.filiales.models import Filial
+        from app.modules.auth.organization_access import revoke_accounts
+
+        await self.db.execute(select(Holding.id).where(Holding.id == holding_id).with_for_update())
         holding = await self.get_holding(holding_id)
+        if not is_active and holding.is_active:
+            members = select(User.id).where(
+                or_(
+                    User.holding_id == holding_id,
+                    User.filial_id.in_(select(Filial.id).where(Filial.holding_id == holding_id)),
+                )
+            )
+            await revoke_accounts(self.db, members)
         holding.is_active = is_active
         await self.db.commit()
         await self.db.refresh(holding)

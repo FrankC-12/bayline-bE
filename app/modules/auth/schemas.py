@@ -58,11 +58,17 @@ class CurrentUser(BaseModel):
     # CurrentUser directly (bypassing login) without it, and the greeting
     # that needs this is the only consumer that cares if it's blank.
     full_name: str = ""
+    holding_context: bool = False
+    filial_name: str | None = None
     role_id: uuid.UUID
     role_slug: str
     scope: RoleScope
     holding_id: uuid.UUID | None
     filial_id: uuid.UUID | None
+
+
+class HoldingContextRequest(BaseModel):
+    filial_id: uuid.UUID | None = None
 
 
 class AccessMapResponse(BaseModel):

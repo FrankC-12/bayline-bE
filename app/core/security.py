@@ -33,12 +33,16 @@ def create_access_token(claims: dict[str, Any], expires_minutes: int | None = No
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 
-def create_refresh_token(subject: str, expires_days: int | None = None) -> str:
+def create_refresh_token(
+    subject: str, expires_days: int | None = None, *, holding_context_filial_id: str | None = None
+) -> str:
     """Create a longer-lived JWT that can only be used to renew a session."""
     settings = get_settings()
     days = expires_days or settings.refresh_token_expire_days
     expire_at = datetime.now(UTC) + timedelta(days=days)
     payload = {"sub": subject, "type": "refresh", "exp": expire_at, "jti": uuid.uuid4().hex}
+    if holding_context_filial_id is not None:
+        payload["holding_context_filial_id"] = holding_context_filial_id
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
 
 

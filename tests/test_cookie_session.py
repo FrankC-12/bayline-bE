@@ -59,6 +59,7 @@ def session_app(monkeypatch):
 
     class FakeAuth:
         db = account_db
+
         async def check_login_budget(self, email, ip):
             pass
 
@@ -176,7 +177,9 @@ async def test_login_and_refresh_waive_the_origin_check_but_logout_does_not(sess
 
 
 @pytest.mark.asyncio
-async def test_refresh_accepts_a_body_token_and_bearer_only_authenticates_access_tokens(session_app):
+async def test_refresh_accepts_a_body_token_and_bearer_only_authenticates_access_tokens(
+    session_app,
+):
     """The mobile contract: a refresh_token in the body (no cookie) renews
     the session — but a Bearer header only ever authenticates a real access
     token, never a refresh token (decode_access_token rejects type=refresh),
@@ -194,7 +197,9 @@ async def test_refresh_accepts_a_body_token_and_bearer_only_authenticates_access
         client.cookies.clear()
 
         assert (
-            await client.get("/api/v1/auth/me", headers={"Authorization": "Bearer " + valid_refresh})
+            await client.get(
+                "/api/v1/auth/me", headers={"Authorization": "Bearer " + valid_refresh}
+            )
         ).status_code == 401
 
 
@@ -244,3 +249,18 @@ async def test_native_logout_accepts_custom_csrf_header_without_invented_origin(
         response = await client.post("/api/v1/auth/logout", headers={"X-CSRF-Protection": "1"})
         assert response.status_code == 204
         assert (await client.post("/api/v1/auth/logout")).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_public_recovery_keeps_csrf_header_for_native_clients(session_app):
+    from app.modules.auth.recovery_router import router as recovery_router
+
+    session_app.include_router(recovery_router, prefix="/api/v1")
+    async with AsyncClient(transport=ASGITransport(app=session_app), base_url=ORIGIN) as client:
+        for action in ["options", "request", "reset"]:
+            path = f"/api/v1/auth/password-recovery/{action}"
+            assert (await client.post(path, json={})).status_code == 403
+            # No Origin for a native caller, but the required custom header remains.
+            assert (
+                await client.post(path, json={}, headers={"X-CSRF-Protection": "1"})
+            ).status_code == 422

@@ -20,6 +20,7 @@ from app.core.exception_handlers import register_exception_handlers
 from app.modules.notifications.router import router as notifications_router
 from app.modules.notifications.service import worker as push_worker
 from app.modules.auth.router import router as auth_router
+from app.modules.auth.recovery_router import router as recovery_router
 from app.modules.holdings.router import router as holdings_router
 from app.modules.filiales.router import router as filiales_router
 from app.modules.roles.router import router as roles_router
@@ -105,6 +106,7 @@ register_exception_handlers(app)
 
 app.include_router(notifications_router, prefix=settings.api_v1_prefix)
 app.include_router(auth_router, prefix=settings.api_v1_prefix)
+app.include_router(recovery_router, prefix=settings.api_v1_prefix)
 app.include_router(telemetry_router, prefix=settings.api_v1_prefix)
 app.include_router(holdings_router, prefix=settings.api_v1_prefix)
 app.include_router(filiales_router, prefix=settings.api_v1_prefix)

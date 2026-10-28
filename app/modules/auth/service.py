@@ -15,14 +15,16 @@ from app.core.security import (
     verify_password,
 )
 from app.modules.auth.exceptions import (
-    InactiveUserError,
     InvalidCredentialsError,
     InvalidRefreshTokenError,
 )
 from app.modules.auth.models import LoginBucket, RefreshSession
-from app.modules.auth.schemas import TokenResponse
+from app.modules.auth.schemas import TokenResponse, CurrentUser
+from app.modules.auth.holding_context import apply_holding_context
+from app.modules.auth.organization_access import ensure_account_available
+from app.modules.auth.exceptions import InsufficientPermissionsError
+from app.modules.roles.enums import RoleScope
 from app.modules.roles.models import Role
-from app.modules.users.enums import UserStatus
 from app.modules.users.models import User
 
 
@@ -32,9 +34,10 @@ class AuthService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
-    async def _token_response(self, user: User, *, record_login: bool = False) -> TokenResponse:
-        if user.status != UserStatus.ACTIVO:
-            raise InactiveUserError()
+    async def _token_response(
+        self, user: User, *, record_login: bool = False, context_filial_id: uuid.UUID | None = None
+    ) -> TokenResponse:
+        await ensure_account_available(self.db, user)
 
         role_result = await self.db.execute(select(Role).where(Role.id == user.role_id))
         role = role_result.scalar_one_or_none()
@@ -54,9 +57,33 @@ class AuthService:
             "holding_id": str(user.holding_id) if user.holding_id else None,
             "filial_id": str(user.filial_id) if user.filial_id else None,
         }
+        if context_filial_id is not None:
+            context = await apply_holding_context(
+                self.db,
+                CurrentUser(
+                    user_id=user.id,
+                    email=user.email,
+                    full_name=user.full_name,
+                    role_id=role.id,
+                    role_slug=role.slug,
+                    scope=role.scope,
+                    holding_id=user.holding_id,
+                    filial_id=user.filial_id,
+                ),
+                context_filial_id,
+            )
+            claims.update(
+                scope=context.scope.value,
+                role_slug=context.role_slug,
+                filial_id=str(context.filial_id),
+                holding_context_filial_id=str(context_filial_id),
+            )
         tokens = TokenResponse(
             access_token=create_access_token(claims),
-            refresh_token=create_refresh_token(str(user.id)),
+            refresh_token=create_refresh_token(
+                str(user.id),
+                holding_context_filial_id=str(context_filial_id) if context_filial_id else None,
+            ),
             expires_in=settings.access_token_expire_minutes * 60,
             refresh_expires_in=settings.refresh_token_expire_days * 24 * 60 * 60,
         )
@@ -94,6 +121,47 @@ class AuthService:
         )
         await self.db.commit()
         return tokens
+
+    async def switch_holding_context(self, user_id: uuid.UUID, filial_id: uuid.UUID | None):
+        user = (
+            await self.db.execute(select(User).where(User.id == user_id).with_for_update())
+        ).scalar_one_or_none()
+        if user is None:
+            raise InsufficientPermissionsError()
+        role = (
+            await self.db.execute(select(Role).where(Role.id == user.role_id))
+        ).scalar_one_or_none()
+        if role is None or role.scope != RoleScope.HOLDING:
+            raise InsufficientPermissionsError()
+        # Record selection in the transactional audit, keeping the real actor.
+        from app.modules.holdings.control_models import HoldingAuditEvent
+
+        if filial_id is not None:
+            await apply_holding_context(
+                self.db,
+                CurrentUser(
+                    user_id=user.id,
+                    email=user.email,
+                    role_id=role.id,
+                    role_slug=role.slug,
+                    scope=role.scope,
+                    holding_id=user.holding_id,
+                    filial_id=user.filial_id,
+                ),
+                filial_id,
+            )
+        self.db.add(
+            HoldingAuditEvent(
+                holding_id=user.holding_id,
+                filial_id=filial_id,
+                user_id=user.id,
+                action="context_switch",
+                entity="filiales",
+                resource_id=str(filial_id) if filial_id else str(user.holding_id),
+                changed_fields=[],
+            )
+        )
+        return await self._token_response(user, context_filial_id=filial_id)
 
     async def check_login_budget(self, email: str, ip: str) -> None:
         from sqlalchemy.dialects.postgresql import insert
@@ -171,7 +239,14 @@ class AuthService:
         ):
             raise InvalidRefreshTokenError()
         session.revoked_at = datetime.now(UTC)
-        return await self._token_response(user)
+        return await self._token_response(
+            user,
+            context_filial_id=(
+                uuid.UUID(payload["holding_context_filial_id"])
+                if payload.get("holding_context_filial_id")
+                else None
+            ),
+        )
 
     async def logout(self, refresh_token: str, device_id: uuid.UUID | None = None) -> None:
         digest = hashlib.sha256(refresh_token.encode()).hexdigest()

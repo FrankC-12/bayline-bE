@@ -120,10 +120,22 @@ class UserService:
             user.full_name = payload.full_name
         if payload.status:
             if payload.status != UserStatus.ACTIVO and user.status != payload.status:
+                from app.modules.auth.models import RecoveryChallenge
+
+                await self.db.execute(
+                    update(RecoveryChallenge)
+                    .where(
+                        RecoveryChallenge.user_id == user.id,
+                        RecoveryChallenge.consumed_at.is_(None),
+                    )
+                    .values(consumed_at=datetime.now(UTC))
+                )
                 user.session_version += 1
-                await self.db.execute(update(RefreshSession).where(
-                    RefreshSession.user_id == user.id, RefreshSession.revoked_at.is_(None)
-                ).values(revoked_at=datetime.now(UTC)))
+                await self.db.execute(
+                    update(RefreshSession)
+                    .where(RefreshSession.user_id == user.id, RefreshSession.revoked_at.is_(None))
+                    .values(revoked_at=datetime.now(UTC))
+                )
             user.status = payload.status
 
         if payload.permission_overrides is not None:
@@ -140,6 +152,52 @@ class UserService:
 
         await self.db.commit()
         return await self.get_user(user.id)
+
+    async def reset_password(self, user_id, actor_id, current_password, new_password):
+        from app.core.security import verify_password
+        from app.core.exceptions import BadRequestError
+        from app.modules.auth.organization_access import ensure_account_available, revoke_accounts
+
+        accounts = (
+            (
+                await self.db.execute(
+                    select(User)
+                    .where(User.id.in_([user_id, actor_id]))
+                    .order_by(User.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_id = {account.id: account for account in accounts}
+        actor, target = by_id.get(actor_id), by_id.get(user_id)
+        if target is None:
+            raise UserNotFoundError(str(user_id))
+        if (
+            actor is None
+            or not actor.password_hash
+            or not verify_password(current_password, actor.password_hash)
+        ):
+            raise BadRequestError(
+                "La contraseña del administrador es incorrecta.",
+                error_code="invalid_current_password",
+            )
+        await ensure_account_available(self.db, actor)
+        from app.core.exceptions import DomainError
+
+        try:
+            await ensure_account_available(self.db, target)
+        except DomainError:
+            raise BadRequestError(
+                "No se puede restablecer la contraseña de una cuenta u organización suspendida.",
+                error_code="account_unavailable",
+            ) from None
+        target.password_hash = hash_password(new_password)
+        await self.db.flush()
+        await revoke_accounts(self.db, select(User.id).where(User.id == user_id))
+        await self.db.commit()
 
     async def _resolve_tenant(
         self, scope: RoleScope, holding_id: uuid.UUID | None, filial_id: uuid.UUID | None
@@ -163,7 +221,9 @@ class UserService:
             raise FilialHoldingMismatchError()
         return filial.holding_id, filial_id
 
-    def _validate_overrides(self, scope: RoleScope, overrides: list[ModulePermissionSchema]) -> None:
+    def _validate_overrides(
+        self, scope: RoleScope, overrides: list[ModulePermissionSchema]
+    ) -> None:
         if scope != RoleScope.FILIAL and overrides:
             raise PermissionOverridesNotAllowedError()
         for perm in overrides:

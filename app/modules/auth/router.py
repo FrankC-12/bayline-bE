@@ -10,6 +10,7 @@ from app.modules.auth.dependencies import get_current_user
 from app.modules.auth.exceptions import InvalidTokenError
 from app.modules.auth.schemas import (
     AccessMapResponse,
+    HoldingContextRequest,
     CurrentUser,
     LoginRequest,
     LogoutRequest,
@@ -39,7 +40,9 @@ async def login(
     tokens in the body — a mobile client has no cookie jar to lean on, so it
     stores access_token/refresh_token itself and sends the former as
     `Authorization: Bearer <access_token>` on every subsequent call."""
-    await service.check_login_budget(str(payload.email), request.client.host if request.client else "unknown")
+    await service.check_login_budget(
+        str(payload.email), request.client.host if request.client else "unknown"
+    )
     tokens = await service.login(payload.email, payload.password)
     set_session_cookies(response, tokens)
     return tokens
@@ -68,13 +71,19 @@ async def refresh(
 
 
 @router.post("/logout", status_code=204)
-async def logout(request: Request, payload: LogoutRequest = LogoutRequest(), service: AuthService = Depends(get_auth_service)):
+async def logout(
+    request: Request,
+    payload: LogoutRequest = LogoutRequest(),
+    service: AuthService = Depends(get_auth_service),
+):
     # Identify authenticated logouts without breaking expired-session cleanup.
     try:
         await get_current_user(request, db=service.db)
     except DomainError:
         pass
-    await service.logout(request.cookies.get(REFRESH_COOKIE) or payload.refresh_token or "", payload.device_id)
+    await service.logout(
+        request.cookies.get(REFRESH_COOKIE) or payload.refresh_token or "", payload.device_id
+    )
     response = Response(status_code=204)
     clear_session_cookies(response)
     return response
@@ -102,3 +111,15 @@ async def get_access_map(
     )
     modules.update({row.module_id: row.access.value for row in override_rows.scalars().all()})
     return AccessMapResponse(modules=modules)
+
+
+@router.post("/holding-context", response_model=TokenResponse)
+async def switch_holding_context(
+    payload: HoldingContextRequest,
+    response: Response,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: AuthService = Depends(get_auth_service),
+):
+    tokens = await service.switch_holding_context(current_user.user_id, payload.filial_id)
+    set_session_cookies(response, tokens)
+    return tokens

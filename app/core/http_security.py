@@ -46,6 +46,9 @@ class HttpSecurityMiddleware(BaseHTTPMiddleware):
                 is_token_endpoint = request.url.path in {
                     f"{settings.api_v1_prefix}/auth/login",
                     f"{settings.api_v1_prefix}/auth/refresh",
+                    f"{settings.api_v1_prefix}/auth/password-recovery/options",
+                    f"{settings.api_v1_prefix}/auth/password-recovery/request",
+                    f"{settings.api_v1_prefix}/auth/password-recovery/reset",
                 }
                 origin_ok = (
                     request.headers.get("origin") is None

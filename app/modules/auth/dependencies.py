@@ -7,20 +7,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.modules.users.models import User
-from app.modules.users.enums import UserStatus
 from app.modules.roles.models import Role
 
 from app.core.audit_logging import set_actor
 from app.core.security import decode_access_token
 from app.modules.auth.cookies import ACCESS_COOKIE
 from app.modules.auth.exceptions import (
-    InactiveUserError,
     InsufficientPermissionsError,
     InvalidTokenError,
 )
 from app.modules.auth.schemas import CurrentUser
+from app.modules.auth.holding_context import apply_holding_context
+from app.modules.auth.organization_access import ensure_account_available
 from app.modules.roles.enums import RoleScope
-
 
 api_bearer = HTTPBearer(auto_error=False)
 
@@ -68,8 +67,7 @@ async def get_current_user(
         if record is None:
             raise InvalidTokenError()
         account, role = record
-        if account.status != UserStatus.ACTIVO:
-            raise InactiveUserError()
+        await ensure_account_available(db, account)
         if payload.get("session_version", 0) != account.session_version:
             raise InvalidTokenError()
         # Tenant and role permissions always follow the current database values.
@@ -83,6 +81,12 @@ async def get_current_user(
             holding_id=account.holding_id,
             filial_id=account.filial_id,
         )
+        if payload.get("holding_context_filial_id") and not request.url.path.endswith(
+            "/auth/holding-context"
+        ):
+            user = await apply_holding_context(
+                db, user, uuid.UUID(payload["holding_context_filial_id"])
+            )
         set_actor(user.user_id, user.filial_id, user.holding_id)
         return user
     except (KeyError, ValueError) as exc:
