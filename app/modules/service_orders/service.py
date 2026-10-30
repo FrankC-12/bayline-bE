@@ -321,10 +321,18 @@ class ServiceOrderService:
         access but may still see their own assigned work (see router._ensure_access)."""
         query = select(ServiceOrder).where(ServiceOrder.filial_id == filial_id)
         from sqlalchemy import or_
+
         if drafts_only:
-            query = query.where(ServiceOrder.is_draft.is_(True), ServiceOrder.status == ServiceOrderStatus.PENDIENTE)
+            query = query.where(
+                ServiceOrder.is_draft.is_(True), ServiceOrder.status == ServiceOrderStatus.PENDIENTE
+            )
         elif not include_drafts:
-            query = query.where(or_(ServiceOrder.is_draft.is_(False), ServiceOrder.status == ServiceOrderStatus.CANCELADO))
+            query = query.where(
+                or_(
+                    ServiceOrder.is_draft.is_(False),
+                    ServiceOrder.status == ServiceOrderStatus.CANCELADO,
+                )
+            )
         if technician_user_id is not None:
             query = query.where(ServiceOrder.is_draft.is_(False))
         if statuses:
@@ -385,9 +393,16 @@ class ServiceOrderService:
             ACTIVE_STATUSES if view == "active" else HISTORY_STATUSES if view == "history" else None
         )
         if view == "drafts":
-            query = query.where(ServiceOrder.is_draft.is_(True), ServiceOrder.status == ServiceOrderStatus.PENDIENTE)
+            query = query.where(
+                ServiceOrder.is_draft.is_(True), ServiceOrder.status == ServiceOrderStatus.PENDIENTE
+            )
         elif not include_drafts:
-            query = query.where(or_(ServiceOrder.is_draft.is_(False), ServiceOrder.status == ServiceOrderStatus.CANCELADO))
+            query = query.where(
+                or_(
+                    ServiceOrder.is_draft.is_(False),
+                    ServiceOrder.status == ServiceOrderStatus.CANCELADO,
+                )
+            )
         if technician_user_id is not None:
             query = query.where(ServiceOrder.is_draft.is_(False))
         if statuses:
@@ -911,6 +926,10 @@ class ServiceOrderService:
         self, order_id: uuid.UUID, reason: str, cancelled_by_user_id: uuid.UUID
     ) -> ServiceOrder:
         order = await require_editable_order(self.db, order_id)
+        if order.order_type.code == "pdi":
+            raise ConflictError(
+                "La PDI pertenece a una venta facturada. Reasigna el trabajo sin cancelarla."
+            )
         if ServiceOrderStatus.CANCELADO not in ALLOWED_TRANSITIONS.get(order.status, set()):
             raise InvalidStatusTransitionError(
                 order.status.value, ServiceOrderStatus.CANCELADO.value
@@ -964,6 +983,10 @@ class ServiceOrderService:
                 select(Filial.id).where(Filial.id == existing.filial_id).with_for_update()
             )
             order = await require_editable_order(self.db, order_id)
+            if order.order_type.code == "pdi":
+                raise ConflictError(
+                    "La PDI está vinculada a una venta facturada y no se puede eliminar."
+                )
             if not order.is_draft:
                 raise ConflictError(
                     "Una ODS enviada al taller se cancela con motivo; no se elimina.",
@@ -1119,6 +1142,8 @@ class ServiceOrderService:
         expected_total: float | None = None,
     ) -> ServiceOrderTask:
         order = await require_editable_order(self.db, service_order_id)
+        if order.order_type.code == "pdi":
+            payer = ServiceOrderPayer.INTERNO
         if order.is_draft and not order.vehicle_id:
             raise ConflictError("Selecciona el vehículo antes de agregar tareas.")
         tempario_result = await self.db.execute(
@@ -1456,7 +1481,9 @@ class ServiceOrderService:
         task = await self.db.get(ServiceOrderTask, task_id)
         if task is None:
             raise TaskNotFoundError(str(task_id))
-        await require_editable_order(self.db, task.service_order_id)
+        order = await require_editable_order(self.db, task.service_order_id)
+        if order.order_type.code == "pdi" and payer != ServiceOrderPayer.INTERNO:
+            raise BadRequestError("La PDI es interna y no se cobra al cliente.")
         task.payer = payer
         await self.db.commit()
         await self.db.refresh(task)
@@ -1534,7 +1561,9 @@ class ServiceOrderService:
         transfer: ServiceOrderTransfer | None = None,
         commit: bool = True,
     ) -> ServiceOrderTransfer:
-        await require_editable_order(self.db, service_order_id)
+        order = await require_editable_order(self.db, service_order_id)
+        if order.order_type.code == "pdi":
+            payer = ServiceOrderPayer.INTERNO
         part = await self.db.get(Part, part_id)
         if part is None:
             raise TransferNotFoundError(str(part_id))
@@ -1553,7 +1582,9 @@ class ServiceOrderService:
         if line is None:
             raise TransferNotFoundError(str(line_id))
         transfer = await self.db.get(ServiceOrderTransfer, line.transfer_id)
-        await require_editable_order(self.db, transfer.service_order_id)
+        order = await require_editable_order(self.db, transfer.service_order_id)
+        if order.order_type.code == "pdi" and payer != ServiceOrderPayer.INTERNO:
+            raise BadRequestError("La PDI es interna y no se cobra al cliente.")
         line.payer = payer
         await self.db.commit()
         await self.db.refresh(line)
@@ -1870,16 +1901,25 @@ class ServiceOrderService:
             [line.part_id for transfer in frozen.transfers for line in transfer.lines]
             if frozen is not None
             else select(ServiceOrderTransferLine.part_id)
-            .join(ServiceOrderTransfer, ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id)
+            .join(
+                ServiceOrderTransfer,
+                ServiceOrderTransfer.id == ServiceOrderTransferLine.transfer_id,
+            )
             .where(ServiceOrderTransfer.service_order_id == order.id)
         )
         part_labels = {}
-        if frozen is not None or order.status == ServiceOrderStatus.ORDEN_CERRADA or order.invoiced_at is not None:
+        if (
+            frozen is not None
+            or order.status == ServiceOrderStatus.ORDEN_CERRADA
+            or order.invoiced_at is not None
+        ):
             part_labels = {
                 key: (name, code)
                 for key, name, code in (
                     await self.db.execute(
-                        select(Part.id, Part.name, Part.code).where(Part.id.in_(part_ids), Part.filial_id == order.filial_id)
+                        select(Part.id, Part.name, Part.code).where(
+                            Part.id.in_(part_ids), Part.filial_id == order.filial_id
+                        )
                     )
                 ).all()
             }
@@ -1969,7 +2009,9 @@ class ServiceOrderService:
             key: (name, code)
             for key, name, code in (
                 await self.db.execute(
-                    select(Part.id, Part.name, Part.code).where(Part.id.in_(part_ids), Part.filial_id == order.filial_id)
+                    select(Part.id, Part.name, Part.code).where(
+                        Part.id.in_(part_ids), Part.filial_id == order.filial_id
+                    )
                 )
             ).all()
         }
@@ -2542,13 +2584,25 @@ class ServiceOrderService:
             resulting_service_order_code = resulting_order.code if resulting_order else None
 
         from app.modules.service_orders.claim_coverage import assess_coverage
-        source_order = await self.db.get(ServiceOrder, claim.service_order_id) if claim.service_order_id else None
+
+        source_order = (
+            await self.db.get(ServiceOrder, claim.service_order_id)
+            if claim.service_order_id
+            else None
+        )
         from app.modules.users.models import User
-        source_technician = await self.db.get(User, source_order.technician_user_id) if source_order and source_order.technician_user_id else None
+
+        source_technician = (
+            await self.db.get(User, source_order.technician_user_id)
+            if source_order and source_order.technician_user_id
+            else None
+        )
         return WarrantyClaimRead(
             failure_confirmed=claim.failure_confirmed,
             odometer_photo_url=claim.odometer_photo_url,
-            warranty_assessment=assess_coverage(claim.coverage_snapshot, claim.claimed_at, claim.reported_mileage),
+            warranty_assessment=assess_coverage(
+                claim.coverage_snapshot, claim.claimed_at, claim.reported_mileage
+            ),
             source_order_closed_at=source_order.closed_at if source_order else None,
             source_order_exit_mileage=source_order.exit_mileage if source_order else None,
             source_technician_name=source_technician.full_name if source_technician else None,
@@ -2971,9 +3025,7 @@ class ServiceOrderService:
         )
         intake_mileage = payload.intake_mileage
         if intake_mileage is None:
-            intake_mileage = (
-                claim.reported_mileage
-            )
+            intake_mileage = claim.reported_mileage
         cause_label = claim.failure_cause or claim.reported_symptom or claim.claim_type.value
         retrabajo_type = (
             await self.db.execute(
@@ -2982,7 +3034,8 @@ class ServiceOrderService:
                     ServiceOrderTypeCatalog.code
                     == (
                         SYSTEM_ORDER_TYPE_GARANTIA_FABRICA
-                        if claim.claim_type == WarrantyClaimType.FABRICA or (as_draft and claim.claim_type == WarrantyClaimType.CAMPANA_RECALL)
+                        if claim.claim_type == WarrantyClaimType.FABRICA
+                        or (as_draft and claim.claim_type == WarrantyClaimType.CAMPANA_RECALL)
                         else (
                             SYSTEM_ORDER_TYPE_CAMPANA
                             if claim.claim_type == WarrantyClaimType.CAMPANA_RECALL
@@ -2998,7 +3051,11 @@ class ServiceOrderService:
             vehicle_id=claim.vehicle_id,
             order_type_id=retrabajo_type.id,
             warranty_claim_id=claim.id,
-            advisor_user_id=claim.recorded_by_user_id if as_draft else original_order.advisor_user_id if original_order else None,
+            advisor_user_id=claim.recorded_by_user_id
+            if as_draft
+            else original_order.advisor_user_id
+            if original_order
+            else None,
             intake_mileage=intake_mileage,
             customer_reason=cause_label if as_draft else f"Retrabajo de garantía — {cause_label}",
             promised_at=payload.promised_at,
@@ -3014,11 +3071,18 @@ class ServiceOrderService:
         await self.db.flush()
 
         if claim.tempario_id is not None:
-            new_task = await self.add_task(new_order.id, claim.tempario_id, payer=payer, commit=False)
+            new_task = await self.add_task(
+                new_order.id, claim.tempario_id, payer=payer, commit=False
+            )
             if as_draft and claim.workshop_warranty_id:
                 from app.modules.post_ventas.models import WorkshopWarranty
+
                 warranty = await self.db.get(WorkshopWarranty, claim.workshop_warranty_id)
-                source_task = await self.db.get(ServiceOrderTask, warranty.service_order_task_id) if warranty else None
+                source_task = (
+                    await self.db.get(ServiceOrderTask, warranty.service_order_task_id)
+                    if warranty
+                    else None
+                )
                 if source_task:
                     new_task.code_snapshot = source_task.code_snapshot
                     new_task.name_snapshot = source_task.name_snapshot

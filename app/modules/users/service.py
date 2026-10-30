@@ -37,13 +37,19 @@ class UserService:
         self.filial_service = FilialService(db)
 
     async def list_users(
-        self, holding_id: uuid.UUID | None = None, filial_id: uuid.UUID | None = None
+        self,
+        holding_id: uuid.UUID | None = None,
+        filial_id: uuid.UUID | None = None,
+        *,
+        active_only: bool = False,
     ) -> list[User]:
         query = (
             select(User)
             .options(selectinload(User.permission_overrides))
             .order_by(User.created_at.desc())
         )
+        if active_only:
+            query = query.where(User.status == UserStatus.ACTIVO)
         if holding_id is not None:
             query = query.where(User.holding_id == holding_id)
         if filial_id is not None:

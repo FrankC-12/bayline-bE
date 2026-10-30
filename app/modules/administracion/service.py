@@ -1238,6 +1238,10 @@ class AdministracionService:
         original = await self.db.get(IncomeEntry, entry_id)
         if original is None:
             raise EntryNotFoundError(str(entry_id))
+        if original.source_type == MovementSourceType.VEHICLE_RESERVATION:
+            raise BadRequestError(
+                "El abono se liquida desde la cancelación de su reserva, con retención y devolución."
+            )
         existing = await self.db.execute(
             select(IncomeEntry).where(IncomeEntry.reverses_entry_id == entry_id)
         )
@@ -1412,6 +1416,10 @@ class AdministracionService:
         original = await self.db.get(ExpenseEntry, entry_id)
         if original is None:
             raise EntryNotFoundError(str(entry_id))
+        if original.source_type == MovementSourceType.VEHICLE_RESERVATION:
+            raise BadRequestError(
+                "La devolución está vinculada a la liquidación de una reserva y no se revierte por separado."
+            )
         purchases = []
         if original.source_type == MovementSourceType.PURCHASE_REQUEST:
             from app.modules.administracion.purchase_workflow import PurchaseWorkflow
@@ -2041,25 +2049,31 @@ class AdministracionService:
         today = venezuela_today()
         period_is_closed = (date_to.year, date_to.month) != (today.year, today.month)
 
-        nuevos_row, nuevos_count, nuevos_estimated, nuevos_negative = (
-            await self._vehicle_department(
-                filial_ids,
-                date_from,
-                date_to,
-                VehicleCondition.NUEVO,
-                "vehiculos_nuevos",
-                "Vehículos nuevos",
-            )
+        (
+            nuevos_row,
+            nuevos_count,
+            nuevos_estimated,
+            nuevos_negative,
+        ) = await self._vehicle_department(
+            filial_ids,
+            date_from,
+            date_to,
+            VehicleCondition.NUEVO,
+            "vehiculos_nuevos",
+            "Vehículos nuevos",
         )
-        usados_row, usados_count, usados_estimated, usados_negative = (
-            await self._vehicle_department(
-                filial_ids,
-                date_from,
-                date_to,
-                VehicleCondition.USADO,
-                "vehiculos_usados",
-                "Vehículos usados",
-            )
+        (
+            usados_row,
+            usados_count,
+            usados_estimated,
+            usados_negative,
+        ) = await self._vehicle_department(
+            filial_ids,
+            date_from,
+            date_to,
+            VehicleCondition.USADO,
+            "vehiculos_usados",
+            "Vehículos usados",
         )
         repuestos_row, repuestos_negative = await self._parts_department(
             filial_ids, date_from, date_to
@@ -2123,7 +2137,8 @@ class AdministracionService:
         operating_expenses = sum(
             self._entry_usd_amount(e, bcv_rate)
             for e in expenses
-            if e.category
+            if e.source_type != MovementSourceType.VEHICLE_RESERVATION
+            and e.category
             not in (
                 ExpenseCategory.COMPRAS_PROVEEDORES,
                 ExpenseCategory.NOMINA_COMISIONES,
@@ -2156,7 +2171,29 @@ class AdministracionService:
         for filial_id in filial_ids:
             warranty_cost += await self._warranty_cost(filial_id, date_from, date_to)
 
+        from app.modules.concesionario.opportunity_models import ReservationSettlement
+
+        reservation_retained = float(
+            (
+                await self.db.execute(
+                    select(func.coalesce(func.sum(ReservationSettlement.retained_amount), 0)).where(
+                        ReservationSettlement.filial_id.in_(filial_ids),
+                        ReservationSettlement.created_at
+                        >= business_period_bounds(date_from, date_to)[0],
+                        ReservationSettlement.created_at
+                        < business_period_bounds(date_from, date_to)[1],
+                    )
+                )
+            ).scalar()
+            or 0
+        )
         adjustments = [
+            ProfitabilityAdjustmentRow(
+                key="retenciones_reservas",
+                label="Retenciones por desistimiento",
+                origin="Reservas canceladas",
+                amount=reservation_retained,
+            ),
             ProfitabilityAdjustmentRow(
                 key="gastos_operacionales",
                 label="Gastos operacionales",

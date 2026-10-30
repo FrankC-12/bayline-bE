@@ -50,6 +50,21 @@ class LaborSettings(Base):
         unique=True,
         index=True,
     )
+    vehicle_quote_valid_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=15, server_default="15"
+    )
+    vehicle_reservation_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=7, server_default="7"
+    )
+    vehicle_min_deposit_percentage: Mapped[float] = mapped_column(
+        Numeric(5, 2), nullable=False, default=10, server_default="10"
+    )
+    vehicle_discount_without_approval_percentage: Mapped[float] = mapped_column(
+        Numeric(5, 2), nullable=False, default=3, server_default="3"
+    )
+    vehicle_withdrawal_retention_percentage: Mapped[float] = mapped_column(
+        Numeric(5, 2), nullable=False, default=10, server_default="10"
+    )
     hourly_rate: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False, default=25)
     commission_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=30)
     igtf_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=3)

@@ -1,4 +1,5 @@
 import uuid
+from typing import Literal
 from datetime import date
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
@@ -18,6 +19,7 @@ from app.modules.clients.schemas import (
     VehiclePlanStatusRead,
     VehicleServiceHistoryRead,
 )
+from app.modules.clients.schemas import LeadCreate, LeadUpdate
 from app.modules.clients.service import ClientService
 from app.modules.post_ventas.schemas import VehicleWarrantyRead
 from app.modules.roles.enums import AccessLevel
@@ -50,6 +52,26 @@ async def _ensure_profile_access(current_user, filial_id, db, level=AccessLevel.
         await _ensure_access(current_user, filial_id, db, level)
 
 
+async def _ensure_lead_access(current_user, filial_id, db):
+    from app.modules.auth.exceptions import InsufficientPermissionsError
+
+    for module in (MODULE_ID, "asesor-servicios", "concesionario"):
+        try:
+            await ensure_module_access(db, current_user, filial_id, module, AccessLevel.EDITAR)
+            return
+        except InsufficientPermissionsError:
+            pass
+    raise InsufficientPermissionsError()
+
+
+def _lead_registration_source(payload, current_user):
+    if current_user.role_slug in {"asesor", "vendedor"}:
+        if "lead_origin" not in payload.model_fields_set:
+            payload.lead_origin = "taller" if current_user.role_slug == "asesor" else "walk_in"
+        if "lead_interest" not in payload.model_fields_set:
+            payload.lead_interest = "taller" if current_user.role_slug == "asesor" else "vehiculo"
+
+
 @router.get("", response_model=list[ClientRead])
 async def list_clients(
     filial_id: uuid.UUID = Query(...),
@@ -66,13 +88,45 @@ async def list_clients(
 async def page_clients(
     filial_id: uuid.UUID = Query(...),
     search: str | None = Query(None, max_length=150),
+    lifecycle: Literal["lead", "cliente"] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(30, ge=1, le=100),
     current_user: CurrentUser = Depends(get_current_user),
     service: ClientService = Depends(get_client_service),
 ):
     await _ensure_access(current_user, filial_id, service.db)
-    return await service.page_clients(filial_id, search=search, page=page, page_size=page_size)
+    return await service.page_clients(
+        filial_id, search=search, page=page, page_size=page_size, lifecycle=lifecycle
+    )
+
+
+@router.post("/leads", response_model=ClientRead, status_code=201)
+async def create_lead(
+    payload: LeadCreate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ClientService = Depends(get_client_service),
+):
+    await _ensure_lead_access(current_user, payload.filial_id, service.db)
+    _lead_registration_source(payload, current_user)
+    client = await service.create_client(payload, created_by_user_id=current_user.user_id, commit=False)
+    if payload.lead_interest == "vehiculo":
+        from app.modules.concesionario.opportunities import OpportunityService
+        advisor=current_user.user_id if current_user.role_slug=="vendedor" else None
+        await OpportunityService(service.db).prospect(client,current_user.user_id,advisor)
+    await service.db.commit()
+    return await service.get_client(client.id)
+
+
+@router.patch("/{client_id}/lead", response_model=ClientRead)
+async def update_lead(
+    client_id: uuid.UUID,
+    payload: LeadUpdate,
+    current_user: CurrentUser = Depends(get_current_user),
+    service: ClientService = Depends(get_client_service),
+):
+    client = await service.get_client(client_id)
+    await _ensure_lead_access(current_user, client.filial_id, service.db)
+    return await service.update_lead(client_id, payload)
 
 
 @router.get("/{client_id}", response_model=ClientRead)
@@ -95,7 +149,8 @@ async def create_client(
 ) -> ClientRead:
     """Create a client, optionally with its vehicles, within your filial."""
     await _ensure_access(current_user, payload.filial_id, service.db, AccessLevel.EDITAR)
-    return await service.create_client(payload)
+    _lead_registration_source(payload, current_user)
+    return await service.create_client(payload, created_by_user_id=current_user.user_id)
 
 
 @router.patch("/{client_id}", response_model=ClientRead)

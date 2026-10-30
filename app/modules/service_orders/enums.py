@@ -107,6 +107,7 @@ class WarrantyClaimStatus(str, enum.Enum):
 
 
 class ServiceOrderPayer(str, enum.Enum):
+    INTERNO = "interno"
     CLIENTE = "cliente"
     GARANTIA_TALLER = "garantia_taller"
     GARANTIA_FABRICA = "garantia_fabrica"

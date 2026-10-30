@@ -114,7 +114,7 @@ async def test_reserve_vehicle_locks_it_to_the_chosen_advisor(env):
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=advisor_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         caller,
@@ -123,7 +123,7 @@ async def test_reserve_vehicle_locks_it_to_the_chosen_advisor(env):
     assert reserved.status == VehicleStatus.RESERVADO
     assert reserved.reserved_client_id == client.id
     assert reserved.reserved_by_user_id == advisor_id
-    assert float(reserved.deposit_amount) == 500
+    assert float(reserved.deposit_amount) == 1500
     assert reserved.reservation_expires_at == venezuela_today() + timedelta(days=7)
     assert reserved.reserved_at is not None
 
@@ -138,7 +138,7 @@ async def test_reserving_with_a_past_expiration_is_rejected(env):
             VehicleReservationInput(
                 client_id=client.id,
                 advisor_user_id=caller.user_id,
-                deposit_amount=500,
+                deposit_amount=1500,
                 expires_at=venezuela_today() - timedelta(days=1),
             ),
             caller,
@@ -156,7 +156,7 @@ async def test_another_salesperson_cannot_touch_a_reserved_vehicle(env):
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
@@ -189,7 +189,7 @@ async def test_a_filial_admin_can_override_someone_elses_reservation(env):
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
@@ -214,7 +214,7 @@ async def test_releasing_a_reservation_clears_its_fields(env):
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
@@ -256,7 +256,7 @@ async def test_disallowed_transitions_are_rejected_with_a_message(env, current, 
                 VehicleReservationInput(
                     client_id=client.id,
                     advisor_user_id=caller.user_id,
-                    deposit_amount=500,
+                    deposit_amount=1500,
                     expires_at=venezuela_today() + timedelta(days=7),
                 ),
                 caller,
@@ -291,7 +291,7 @@ async def test_reserved_vehicle_cannot_jump_back_to_shipping_or_preparation(env,
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
@@ -348,7 +348,7 @@ async def test_reservation_snapshot_is_retained_after_release(env):
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
             reason="Cliente solicita reserva",
         ),
@@ -362,7 +362,7 @@ async def test_reservation_snapshot_is_retained_after_release(env):
     history = await service.list_status_history(vehicle.id)
     assert [e.new_status for e in history] == ["disponible", "reservado"]
     assert history[0].reservation_snapshot["client_id"] == str(client.id)
-    assert history[0].reservation_snapshot["deposit_amount"] == 500
+    assert history[0].reservation_snapshot["deposit_amount"] == 1500
     assert history[1].reason == "Cliente solicita reserva"
     assert vehicle.reserved_client_id is None
     with pytest.raises(BadRequestError):
@@ -384,7 +384,7 @@ async def test_reserved_unit_cannot_be_sold_to_a_different_client_even_by_admin(
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
@@ -423,7 +423,7 @@ async def test_sale_retains_reserved_client_and_advisor_and_audits_sale(env):
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,
@@ -495,7 +495,7 @@ async def test_sale_failure_rolls_back_sale_income_and_keeps_reservation(env, mo
         VehicleReservationInput(
             client_id=client.id,
             advisor_user_id=owner.user_id,
-            deposit_amount=500,
+            deposit_amount=1500,
             expires_at=venezuela_today() + timedelta(days=7),
         ),
         owner,

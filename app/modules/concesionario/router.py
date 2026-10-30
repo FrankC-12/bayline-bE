@@ -224,6 +224,7 @@ async def vehicle_sale_invoice_pdf(
     from app.modules.concesionario.documents import sale_vehicle_description
 
     snapshot = sale.vehicle_snapshot or {}
+    deposit = float(snapshot.get("deposit_amount", 0) or 0)
     data = {
         "issuer": filial.name,
         "code": "FAC-" + sale.code,
@@ -250,15 +251,24 @@ async def vehicle_sale_invoice_pdf(
             ("Total", sale.final_price),
         ],
         "payments": ["Modalidad: " + sale.sale_type.value]
+        + (
+            [
+                f"Abono recibido: USD {deposit:,.2f} · {snapshot.get('deposit_payment_channel') or ''} · {snapshot.get('deposit_reference') or ''}"
+            ]
+            if deposit
+            else []
+        )
         + [
             f"{label}: {channel}"
             for label, channel in (
-                ("USD", sale.usd_payment_channel),
+                ("Saldo USD" if deposit else "USD", sale.usd_payment_channel),
                 ("Bs", sale.bs_payment_channel),
             )
             if channel
         ],
-        "pending": 0 if sale.sale_type.value == "contado" else sale.final_price,
+        "pending": 0
+        if sale.sale_type.value == "contado"
+        else max(0, float(sale.final_price) - deposit),
         "notes": ["Precio y kilometraje registrados al vender."],
     }
     return Response(

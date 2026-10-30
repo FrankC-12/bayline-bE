@@ -48,3 +48,5 @@ from app.modules.auth.models import RefreshSession, LoginBucket, RecoveryChallen
 from app.modules.notifications.models import Device, Notification  # noqa: F401
 
 from app.modules.holdings.control_models import HoldingRegister, HoldingAuditEvent  # noqa: F401
+
+from app.modules.concesionario.opportunity_models import VehicleOpportunity  # noqa: F401

@@ -810,7 +810,13 @@ class PartsService:
                     "La cotización cambió. Revisa los nuevos precios antes de confirmar la venta.",
                     error_code="sale_quote_changed",
                 )
+            from app.modules.clients.lifecycle import resolve_sale_client
+            sale_client = await resolve_sale_client(self.db,payload.filial_id,payload.client_id,payload.client_document)
+            if sale_client is not None:
+                payload.client_name = sale_client.full_name
+                payload.client_document = f"{sale_client.document_type.value}-{sale_client.document_number}"
             sale = PartSale(
+                client_id=sale_client.id if sale_client else None,
                 created_by_user_id=responsible_user_id,
                 filial_id=payload.filial_id,
                 client_name=payload.client_name,

@@ -297,6 +297,51 @@ class ConcesionarioService:
         await self._validate_reservation_advisor(vehicle, payload.advisor_user_id, current_user)
         if len(payload.reason.strip()) < 3:
             raise BadRequestError("Indica el motivo de la reserva.")
+        from datetime import timedelta
+        from decimal import Decimal, ROUND_HALF_UP
+        from app.modules.concesionario.opportunity_models import VehicleOpportunity
+        from app.modules.post_ventas.service import PostVentasService
+
+        rules = await PostVentasService(self.db).get_labor_settings(vehicle.filial_id, commit=False)
+        quote = (
+            await self.db.execute(
+                select(VehicleOpportunity)
+                .where(
+                    VehicleOpportunity.filial_id == vehicle.filial_id,
+                    VehicleOpportunity.client_id == payload.client_id,
+                    VehicleOpportunity.vehicle_id == vehicle.id,
+                    VehicleOpportunity.sale_id.is_(None),
+                    VehicleOpportunity.stage != "perdida",
+                )
+                .order_by(VehicleOpportunity.quoted_at.desc().nullslast())
+                .limit(1)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if quote and quote.quote_expires_at and quote.quote_expires_at < venezuela_today():
+            raise BadRequestError("La cotización venció. Actualízala antes de reservar.")
+        base = (
+            quote.quoted_amount if quote and quote.quoted_amount is not None else vehicle.cash_total
+        )
+        minimum = (
+            Decimal(str(base)) * Decimal(str(rules.vehicle_min_deposit_percentage)) / 100
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if Decimal(str(payload.deposit_amount)) < minimum:
+            raise BadRequestError(
+                f"El abono mínimo para reservar es {minimum} {vehicle.price_currency}."
+            )
+        if Decimal(str(payload.deposit_amount)) > Decimal(str(base)):
+            raise BadRequestError("El abono no puede superar el precio cotizado.")
+        if payload.expires_at > venezuela_today() + timedelta(days=rules.vehicle_reservation_days):
+            raise BadRequestError(
+                f"La reserva no puede superar {rules.vehicle_reservation_days} días."
+            )
+        if quote and quote.workflow_version:
+            from app.modules.concesionario.opportunities import OpportunityService
+            from app.modules.concesionario.sales_workflow import SalesWorkflow
+
+            OpportunityService(self.db).assert_version(quote, payload.opportunity_version)
+            await SalesWorkflow(self.db).deposit(quote, payload, current_user, rules)
         previous_status = vehicle.status
         vehicle.status = VehicleStatus.RESERVADO
         vehicle.reserved_client_id = payload.client_id
@@ -308,6 +353,11 @@ class ConcesionarioService:
             vehicle, previous_status, vehicle.status, current_user, payload.reason
         )
 
+        from app.modules.concesionario.opportunities import OpportunityService
+
+        await OpportunityService(self.db).operation(
+            vehicle, payload.client_id, payload.advisor_user_id, current_user.user_id
+        )
         await self.db.commit()
         await self.db.refresh(vehicle)
         return vehicle
@@ -397,6 +447,28 @@ class ConcesionarioService:
             )
 
         was_reserved = vehicle.status == VehicleStatus.RESERVADO
+        if was_reserved and payload.status == VehicleStatus.DISPONIBLE:
+            from app.modules.concesionario.opportunity_models import VehicleOpportunity
+
+            active_opps = (
+                (
+                    await self.db.execute(
+                        select(VehicleOpportunity).where(
+                            VehicleOpportunity.vehicle_id == vehicle.id,
+                            VehicleOpportunity.client_id == vehicle.reserved_client_id,
+                            VehicleOpportunity.sale_id.is_(None),
+                            VehicleOpportunity.stage != "perdida",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if any(o.workflow_version and (o.workflow or {}).get("deposit") for o in active_opps):
+                raise BadRequestError(
+                    "Cancela la reserva desde su oportunidad para registrar la retención y la devolución en Finanzas."
+                )
+
         becoming_sold = status_changing and payload.status == VehicleStatus.VENDIDO
 
         if becoming_sold:
@@ -425,15 +497,56 @@ class ConcesionarioService:
             if payload.model_fields_set - {"status", "status_reason", "sale", "mileage"}:
                 raise BadRequestError("Guarda los datos del vehículo antes de confirmar su venta.")
             await self._validate_sale_advisor(vehicle.filial_id, payload.sale.advisor_user_id)
-            if payload.sale.client_id is not None:
-                client = await self.db.get(Client, payload.sale.client_id)
-                if client is None or client.filial_id != vehicle.filial_id:
-                    raise BadRequestError("El cliente no pertenece a esta filial.")
-                # Identity comes from the selected client, never from a free-text label.
+            from app.modules.clients.lifecycle import resolve_sale_client
+
+            client = await resolve_sale_client(
+                self.db, vehicle.filial_id, payload.sale.client_id, payload.sale.client_document
+            )
+            if client is not None:
+                payload.sale.client_id = client.id
                 payload.sale.client_name = client.full_name
                 payload.sale.client_document = (
                     f"{client.document_type.value}-{client.document_number}"
                 )
+
+            accepted_quote = None
+            if payload.sale.opportunity_id:
+                from app.modules.concesionario.opportunities import OpportunityService
+
+                accepted_quote = await OpportunityService(self.db).get(
+                    payload.sale.opportunity_id, True
+                )
+                if (
+                    accepted_quote.filial_id != vehicle.filial_id
+                    or accepted_quote.vehicle_id != vehicle.id
+                    or accepted_quote.client_id != payload.sale.client_id
+                    or accepted_quote.sale_id
+                    or accepted_quote.stage == "perdida"
+                    or accepted_quote.quoted_amount is None
+                ):
+                    raise BadRequestError("La cotización no corresponde a esta venta.")
+                if payload.sale.opportunity_version != accepted_quote.version:
+                    raise BadRequestError("La oportunidad cambió. Recarga antes de vender.")
+                if accepted_quote.sale_type != payload.sale.sale_type.value:
+                    raise BadRequestError(
+                        "Actualiza la cotización antes de cambiar la forma de venta."
+                    )
+                if (
+                    accepted_quote.quote_expires_at
+                    and accepted_quote.quote_expires_at < venezuela_today()
+                ):
+                    raise BadRequestError("La cotización venció. Actualízala antes de facturar.")
+                if accepted_quote.quoted_currency != vehicle.price_currency:
+                    raise BadRequestError("Cambió la moneda del vehículo. Actualiza la cotización.")
+            if accepted_quote and accepted_quote.workflow_version:
+                from app.modules.concesionario.sales_workflow import SalesWorkflow
+
+                SalesWorkflow(self.db).validate_sale(accepted_quote)
+                if vehicle.price_currency != "USD":
+                    raise BadRequestError(
+                        "Este flujo de cobro requiere una cotización en USD; permite cobrar el saldo en USD o Bs."
+                    )
+            sale_base = accepted_quote.quoted_amount if accepted_quote else vehicle.cash_total
 
             sequence_result = await self.db.execute(
                 select(func.max(VehicleSale.sequence_number)).where(
@@ -463,7 +576,7 @@ class ConcesionarioService:
                     ).scalar_one_or_none()
                     bcv_rate = float(rate_row.rate_ves) if rate_row else None
                 payment = calculate_payment(
-                    Decimal(str(vehicle.cash_total)),
+                    Decimal(str(sale_base)),
                     payload.sale.payment_method,
                     Decimal(str(payload.sale.usd_base or 0)),
                     vehicle.igtf_percentage,
@@ -473,7 +586,11 @@ class ConcesionarioService:
                 usd_base_value = payment["usd_base"]
                 final_price = payment["total_usd"]
             else:
-                final_price = vehicle.price_financed
+                final_price = (
+                    float(accepted_quote.quoted_amount)
+                    if accepted_quote
+                    else vehicle.price_financed
+                )
 
             is_below_cost = vehicle.cost_price is not None and final_price < float(
                 vehicle.cost_price
@@ -504,30 +621,55 @@ class ConcesionarioService:
                     vehicle_id=vehicle.id,
                     mileage_at_sale=effective_mileage,
                     vehicle_snapshot={
-                        name: (
-                            getattr(vehicle, name).value
-                            if hasattr(getattr(vehicle, name), "value")
-                            else getattr(vehicle, name)
+                        **{
+                            name: (
+                                getattr(vehicle, name).value
+                                if hasattr(getattr(vehicle, name), "value")
+                                else getattr(vehicle, name)
+                            )
+                            for name in (
+                                "brand",
+                                "model",
+                                "version",
+                                "year",
+                                "vin",
+                                "plate",
+                                "sku",
+                                "color",
+                                "condition",
+                                "fuel_type",
+                                "transmission",
+                                "engine_type",
+                                "seats",
+                                "upholstery",
+                                "previous_owners",
+                                "price_currency",
+                            )
+                        },
+                        "deposit_amount": float(
+                            (accepted_quote.workflow or {}).get("deposit", {}).get("amount", 0)
                         )
-                        for name in (
-                            "brand",
-                            "model",
-                            "version",
-                            "year",
-                            "vin",
-                            "plate",
-                            "sku",
-                            "color",
-                            "condition",
-                            "fuel_type",
-                            "transmission",
-                            "engine_type",
-                            "seats",
-                            "upholstery",
-                            "previous_owners",
-                            "price_currency",
-                        )
+                        if accepted_quote
+                        else 0,
+                        "deposit_payment_channel": (accepted_quote.workflow or {})
+                        .get("deposit", {})
+                        .get("payment_channel")
+                        if accepted_quote
+                        else None,
+                        "deposit_reference": (accepted_quote.workflow or {})
+                        .get("deposit", {})
+                        .get("reference")
+                        if accepted_quote
+                        else None,
+                        "quote_id": str(accepted_quote.id) if accepted_quote else None,
+                        "quoted_amount": float(accepted_quote.quoted_amount)
+                        if accepted_quote
+                        else None,
+                        "discount_percentage": float(accepted_quote.discount_percentage)
+                        if accepted_quote
+                        else 0,
                     },
+                    client_id=payload.sale.client_id,
                     client_name=payload.sale.client_name,
                     client_document=payload.sale.client_document,
                     advisor_user_id=payload.sale.advisor_user_id,
@@ -549,23 +691,55 @@ class ConcesionarioService:
                 )
             )
 
+            await self.db.flush()
+            from app.modules.concesionario.opportunities import OpportunityService
+
+            actual_sale = (
+                await self.db.execute(
+                    select(VehicleSale)
+                    .where(
+                        VehicleSale.vehicle_id == vehicle.id,
+                        VehicleSale.filial_id == vehicle.filial_id,
+                    )
+                    .order_by(VehicleSale.created_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one()
+            await OpportunityService(self.db).operation(
+                vehicle,
+                payload.sale.client_id,
+                payload.sale.advisor_user_id,
+                current_user.user_id,
+                actual_sale,
+            )
             from app.modules.administracion.enums import MovementSourceType
             from app.modules.administracion.service import AdministracionService
 
             admin_service = AdministracionService(self.db)
-            await admin_service.record_automatic_income(
-                vehicle.filial_id,
-                f"Venta de vehículo pagada · {payload.sale.client_name}",
-                final_price,
-                f"CV-{next_sequence:04d}",
-                source_type=MovementSourceType.VEHICLE_SALE,
-                source_id=sale_id,
-                commit=False,
-            )
+            if accepted_quote and accepted_quote.workflow_version:
+                await SalesWorkflow(self.db).record_sale_receipts(
+                    accepted_quote,
+                    actual_sale,
+                    payment if payload.sale.sale_type == SaleType.CONTADO else None,
+                    payload.sale,
+                    current_user,
+                )
+            else:
+                await admin_service.record_automatic_income(
+                    vehicle.filial_id,
+                    f"Venta de vehículo pagada · {payload.sale.client_name}",
+                    final_price,
+                    f"CV-{next_sequence:04d}",
+                    source_type=MovementSourceType.VEHICLE_SALE,
+                    source_id=sale_id,
+                    commit=False,
+                )
 
             from app.modules.post_ventas.service import PostVentasService
 
-            if vehicle.condition == VehicleCondition.NUEVO:
+            if vehicle.condition == VehicleCondition.NUEVO and not (
+                accepted_quote and accepted_quote.workflow_version
+            ):
                 await PostVentasService(self.db).create_or_renew_warranty_from_sale(
                     vehicle.filial_id,
                     vehicle.vin,

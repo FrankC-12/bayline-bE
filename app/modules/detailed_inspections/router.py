@@ -39,12 +39,12 @@ async def context(order_id, user, db, *, edit=False):
 @router.get("/template", summary="Consultar estructura y opciones del formulario móvil")
 async def template(user: UserDependency):
     return {
-        "version": 2,
+        "version": 3,
         "total_steps": 5,
         "sections": [
             {"key": "engine", "label": "Compartimiento del motor", "required": True},
             {"key": "underbody", "label": "Debajo del vehículo", "required": True},
-            {"key": "tires", "label": "Presión y desgaste de neumáticos", "required": True},
+            {"key": "tires", "label": "Presión de neumáticos", "required": True},
             {"key": "brakes", "label": "Frenos", "required": True},
             {"key": "fluids", "label": "Fluidos y niveles", "required": False},
             {"key": "interior", "label": "Interior del vehículo", "required": False},

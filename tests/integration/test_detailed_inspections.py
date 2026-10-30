@@ -69,7 +69,7 @@ def complete_payload():
         data[section] = {field: "bien" for field in data[section]}
     data["engine"].update(battery="cargada", battery_voltage=12.6)
     data["brakes"]["rear_shoes"] = "no_aplica"
-    data["tires"] = {position: {"tread_depth": 0, "pressure": 32} for position in data["tires"]}
+    data["tires"] = {position: {"pressure": 32} for position in data["tires"]}
     return data
 
 
@@ -80,7 +80,9 @@ async def test_mobile_detailed_inspection_progress_completion_and_annexes(billin
     path = f"/api/v1/detailed-inspections/by-order/{ctx.order_id}"
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as http:
         assert (await http.get(path)).json() is None
-        assert (await http.get("/api/v1/detailed-inspections/template")).json()["total_steps"] == 5
+        template=(await http.get("/api/v1/detailed-inspections/template")).json()
+        assert template["total_steps"] == 5
+        assert "tread_depth" not in str(template["schema"])
         first = await http.patch(path, json={"engine": {"leaks": "regular"}})
         assert first.status_code == 200
         assert first.json()["completed_steps"] == 0

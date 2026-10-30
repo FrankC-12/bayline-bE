@@ -216,6 +216,7 @@ class PartSaleLineDispatch(BaseModel):
 
 
 class PartSaleCreate(PartSaleQuoteInput):
+    client_id: uuid.UUID | None = None
     quote_hash: str | None = Field(default=None, min_length=64, max_length=64)
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None

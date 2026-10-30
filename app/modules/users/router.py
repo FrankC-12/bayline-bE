@@ -99,6 +99,7 @@ async def list_users(
 
 @router.get("/directory", response_model=list[UserDirectoryEntry])
 async def list_users_directory(
+    active_only: bool = Query(default=False),
     holding_id: uuid.UUID | None = Query(default=None),
     filial_id: uuid.UUID | None = Query(default=None),
     current_user: CurrentUser = Depends(get_current_user),
@@ -112,7 +113,7 @@ async def list_users_directory(
         holding_id = current_user.holding_id
     elif current_user.scope == RoleScope.FILIAL:
         filial_id = current_user.filial_id
-    return await service.list_users(holding_id, filial_id)
+    return await service.list_users(holding_id, filial_id, active_only=active_only)
 
 
 @router.get("/{user_id}", response_model=UserRead)

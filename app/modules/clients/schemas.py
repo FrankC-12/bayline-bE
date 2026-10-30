@@ -1,6 +1,7 @@
 import re
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
@@ -149,7 +150,23 @@ class VehiclePlanStatusRead(BaseModel):
     entries: list[VehiclePlanEntryStatusRead]
 
 
-class ClientBase(BaseModel):
+LeadOrigin = Literal[
+    "registro_directo", "walk_in", "whatsapp", "referido", "marketplace", "taller", "otro"
+]
+LeadInterest = Literal["vehiculo", "taller", "repuestos", "otro"]
+LeadStatus = Literal["nuevo", "en_seguimiento", "descartado"]
+
+
+class LeadMetadata(BaseModel):
+    lead_origin: LeadOrigin = "registro_directo"
+    lead_interest: LeadInterest = "otro"
+    lead_vehicle_interest: str | None = Field(default=None, max_length=255)
+    lead_notes: str | None = Field(default=None, max_length=3000)
+    lead_assigned_user_id: uuid.UUID | None = None
+    lead_next_contact_at: date | None = None
+
+
+class ClientBase(LeadMetadata):
     full_name: str = Field(min_length=2, max_length=150)
     client_type: ClientType
     document_type: DocumentType
@@ -161,6 +178,14 @@ class ClientBase(BaseModel):
     address: str = Field(min_length=3, max_length=255)
     address_type: AddressType | None = None
     is_holding_billing: bool = False
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_full_name(cls, value):
+        value = value.strip()
+        if len(value) < 2:
+            raise ValueError("El nombre completo es obligatorio.")
+        return value
 
     @field_validator("document_number")
     @classmethod
@@ -192,6 +217,27 @@ class ClientBase(BaseModel):
 class ClientCreate(ClientBase):
     filial_id: uuid.UUID
     vehicles: list[VehicleInput] = Field(default_factory=list)
+
+
+class LeadCreate(ClientCreate):
+    address: str = Field(default="", max_length=255)
+
+
+class LeadUpdate(BaseModel):
+    lead_origin: LeadOrigin | None = None
+    lead_interest: LeadInterest | None = None
+    lead_vehicle_interest: str | None = Field(default=None, max_length=255)
+    lead_notes: str | None = Field(default=None, max_length=3000)
+    lead_assigned_user_id: uuid.UUID | None = None
+    lead_next_contact_at: date | None = None
+    lead_status: LeadStatus | None = None
+
+    @field_validator("lead_origin", "lead_interest", "lead_status")
+    @classmethod
+    def no_null_status(cls, value):
+        if value is None:
+            raise ValueError("Este campo no puede estar vacío.")
+        return value
 
 
 class ClientUpdate(BaseModel):
@@ -240,7 +286,11 @@ class ClientUpdate(BaseModel):
         return digits
 
 
-class ClientRead(BaseModel):
+class ClientRead(LeadMetadata):
+    lead_assigned_user_name: str | None = None
+    is_lead: bool = False
+    lead_status: LeadStatus = "nuevo"
+    created_by_user_id: uuid.UUID | None = None
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID

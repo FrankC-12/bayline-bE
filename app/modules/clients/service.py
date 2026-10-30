@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.exceptions import BadRequestError, ConflictError
 from app.core.search import fold_search
+from app.modules.clients.lifecycle import attach_lifecycle, lead_predicate, link_unassigned_sales
 from app.core.venezuela_time import caracas_date, venezuela_today
 from app.modules.administracion.exceptions import SupplierNotFoundError
 from app.modules.administracion.models import Supplier
@@ -91,11 +92,12 @@ class ClientService:
                     for v in c.vehicles
                 )
             ]
+        await attach_lifecycle(self.db, clients)
         await self._attach_current_mileage(clients)
         await self._attach_next_maintenance_plan(clients)
         return clients
 
-    async def page_clients(self, filial_id, *, search=None, page=1, page_size=30):
+    async def page_clients(self, filial_id, *, search=None, page=1, page_size=30, lifecycle=None):
         from sqlalchemy import func, or_
 
         from app.core.pagination import Page, page_query
@@ -108,6 +110,10 @@ class ClientService:
             .where(Client.filial_id == filial_id)
             .order_by(Client.full_name, Client.id)
         )
+        if lifecycle == "lead":
+            query = query.where(lead_predicate())
+        elif lifecycle == "cliente":
+            query = query.where(~lead_predicate())
         if search and search.strip():
             term = fold_search(search.strip())
             vehicle_match = Client.vehicles.any(
@@ -125,6 +131,7 @@ class ClientService:
             )
         rows, metadata = await page_query(self.db, query, page, page_size)
         clients = list(rows.scalars())
+        await attach_lifecycle(self.db, clients)
         await self._attach_current_mileage(clients)
         await self._attach_next_maintenance_plan(clients)
         return Page[ClientRead](
@@ -137,6 +144,7 @@ class ClientService:
         client = result.scalar_one_or_none()
         if client is None:
             raise ClientNotFoundError(str(client_id))
+        await attach_lifecycle(self.db, [client])
         await self._attach_current_mileage([client])
         await self._attach_next_maintenance_plan([client])
         return client
@@ -186,10 +194,12 @@ class ClientService:
         ranked_departures = (
             select(
                 ServiceOrder.id,
-                func.row_number().over(
+                func.row_number()
+                .over(
                     partition_by=ServiceOrder.vehicle_id,
                     order_by=(ServiceOrder.closed_at.desc(), ServiceOrder.id),
-                ).label("position"),
+                )
+                .label("position"),
             )
             .where(
                 ServiceOrder.vehicle_id.in_(vehicle_ids),
@@ -285,10 +295,12 @@ class ClientService:
         ranked = (
             select(
                 PreliminaryInspection.id,
-                func.row_number().over(
+                func.row_number()
+                .over(
                     partition_by=PreliminaryInspection.vehicle_id,
                     order_by=(PreliminaryInspection.created_at.desc(), PreliminaryInspection.id),
-                ).label("position"),
+                )
+                .label("position"),
             )
             .where(
                 PreliminaryInspection.vehicle_id.in_(vehicle_ids),
@@ -310,12 +322,18 @@ class ClientService:
     async def get_current_mileage(self, vehicle_id: uuid.UUID) -> int | None:
         return (await self.get_mileage_context(vehicle_id))[0]
 
-    async def get_mileage_context(self, vehicle_id: uuid.UUID) -> tuple[int | None, date | None, uuid.UUID | None]:
+    async def get_mileage_context(
+        self, vehicle_id: uuid.UUID
+    ) -> tuple[int | None, date | None, uuid.UUID | None]:
         vehicle = await self.db.get(Vehicle, vehicle_id)
         if vehicle is None:
             return None, None, None
         await self.attach_vehicle_mileage([vehicle])
-        return vehicle.current_mileage, vehicle.current_mileage_visit_date, vehicle.current_mileage_service_order_id
+        return (
+            vehicle.current_mileage,
+            vehicle.current_mileage_visit_date,
+            vehicle.current_mileage_service_order_id,
+        )
 
     async def list_mileage_history(self, vehicle_id: uuid.UUID) -> list[VehicleMileageHistoryEntry]:
         """Every recorded odometer reading for this vehicle, newest first —
@@ -406,10 +424,22 @@ class ClientService:
         await self.db.refresh(client)
         return client
 
-    async def create_client(self, payload: ClientCreate) -> Client:
+    async def create_client(self, payload: ClientCreate, *, created_by_user_id=None, commit=True) -> Client:
         await self._ensure_document_is_available(payload.filial_id, payload.document_number)
 
+        await self._validate_lead_assignee(payload.filial_id, payload.lead_assigned_user_id)
         client = Client(
+            created_by_user_id=created_by_user_id,
+            **payload.model_dump(
+                include={
+                    "lead_origin",
+                    "lead_interest",
+                    "lead_vehicle_interest",
+                    "lead_notes",
+                    "lead_assigned_user_id",
+                    "lead_next_contact_at",
+                }
+            ),
             filial_id=payload.filial_id,
             full_name=payload.full_name,
             client_type=payload.client_type,
@@ -426,12 +456,14 @@ class ClientService:
         try:
             self.db.add(client)
             await self.db.flush()
+            await link_unassigned_sales(self.db, client)
 
             await self._validate_vehicle_identities(payload.filial_id, payload.vehicles)
             for v in payload.vehicles:
                 self.db.add(self._build_vehicle(client.id, v))
 
-            await self.db.commit()
+            if commit: await self.db.commit()
+            else: await self.db.flush()
         except ConflictError:
             await self.db.rollback()
             raise
@@ -442,6 +474,32 @@ class ClientService:
             await self.db.rollback()
             raise DocumentAlreadyExistsError(payload.document_number) from None
         return await self.get_client(client.id)
+
+    async def _validate_lead_assignee(self, filial_id, user_id):
+        if user_id is None:
+            return
+        from app.modules.users.models import User
+        from app.modules.users.enums import UserStatus
+
+        user = await self.db.get(User, user_id)
+        if user is None or user.filial_id != filial_id or user.status != UserStatus.ACTIVO:
+            raise BadRequestError("Selecciona un responsable activo de esta filial.")
+
+    async def update_lead(self, client_id, payload):
+        await self.db.execute(select(Client.id).where(Client.id == client_id).with_for_update())
+        client = await self.get_client(client_id)
+        if not client.is_lead:
+            raise BadRequestError("Esta persona ya es cliente. Consulta su ficha e historial.")
+        changes = payload.model_dump(exclude_unset=True)
+        if (
+            "lead_assigned_user_id" in changes
+            and changes["lead_assigned_user_id"] != client.lead_assigned_user_id
+        ):
+            await self._validate_lead_assignee(client.filial_id, changes["lead_assigned_user_id"])
+        for name, value in changes.items():
+            setattr(client, name, value)
+        await self.db.commit()
+        return await self.get_client(client_id)
 
     async def update_client(self, client_id: uuid.UUID, payload: ClientUpdate) -> Client:
         # Serialize updates and compare the version before changing any fields.

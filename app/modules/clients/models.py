@@ -89,6 +89,15 @@ class Client(Base):
         nullable=True,
         unique=True,
     )
+    lead_origin: Mapped[str] = mapped_column(String(30), nullable=False, default="registro_directo", server_default="registro_directo")
+    lead_interest: Mapped[str] = mapped_column(String(20), nullable=False, default="otro", server_default="otro")
+    lead_vehicle_interest: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lead_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lead_status: Mapped[str] = mapped_column(String(25), nullable=False, default="nuevo", server_default="nuevo")
+    lead_next_contact_at: Mapped[date | None] = mapped_column(Date, nullable=True)
+    lead_assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

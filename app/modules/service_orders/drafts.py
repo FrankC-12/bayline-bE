@@ -382,6 +382,10 @@ class DraftService:
 
     async def discard(self, order_id):
         order = await self.editable(order_id)
+        if order.order_type.code == "pdi":
+            raise ConflictError(
+                "La PDI está vinculada a una venta facturada y no se puede eliminar."
+            )
         from app.modules.service_orders.models import ServiceOrderTransferLine
 
         dispatched = (

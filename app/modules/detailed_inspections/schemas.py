@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Condition(StrEnum):
@@ -49,10 +49,14 @@ class Underbody(StrictModel):
 
 
 class Tire(StrictModel):
-    tread_depth: float | None = Field(
-        None, ge=0, allow_inf_nan=False, description="Profundidad (mm)"
-    )
     pressure: float | None = Field(None, ge=0, allow_inf_nan=False, description="Presión (psi)")
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_legacy_depth(cls, value):
+        if isinstance(value, dict):
+            value = {key: item for key, item in value.items() if key != "tread_depth"}
+        return value
 
 
 class Tires(StrictModel):

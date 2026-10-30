@@ -36,6 +36,12 @@ class LaborSettingsUpdate(BaseModel):
 class LaborSettingsRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
+    vehicle_quote_valid_days: int = 15
+    vehicle_reservation_days: int = 7
+    vehicle_min_deposit_percentage: float = 10
+    vehicle_discount_without_approval_percentage: float = 3
+    vehicle_withdrawal_retention_percentage: float = 10
+
     bcv_rate_mode: str = "automatic"
     field_changes: dict = Field(default_factory=dict)
     filial_id: uuid.UUID
@@ -60,6 +66,12 @@ class LaborSettingsRead(BaseModel):
 
 
 class SettingsPatch(BaseModel):
+    vehicle_quote_valid_days: int | None = Field(default=None, ge=1, le=365)
+    vehicle_reservation_days: int | None = Field(default=None, ge=1, le=90)
+    vehicle_min_deposit_percentage: float | None = Field(default=None, ge=0, le=100)
+    vehicle_discount_without_approval_percentage: float | None = Field(default=None, ge=0, le=100)
+    vehicle_withdrawal_retention_percentage: float | None = Field(default=None, ge=0, le=100)
+
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     hourly_rate: float | None = Field(default=None, ge=0)
     commission_percentage: float | None = Field(default=None, ge=0, le=100)

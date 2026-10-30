@@ -178,11 +178,15 @@ class VehicleSale(Base):
         ForeignKey("dealership_vehicles.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_by_user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    delivery_reference: Mapped[str | None] = mapped_column(String(500), nullable=True)
     financing_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     financing_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     mileage_at_sale: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    client_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="SET NULL"), nullable=True, index=True)
     client_name: Mapped[str] = mapped_column(String(150), nullable=False)
     client_document: Mapped[str | None] = mapped_column(String(20), nullable=True)
     advisor_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -238,3 +242,7 @@ class VehicleStatusEvent(Base):
     reason: Mapped[str] = mapped_column(String(500), nullable=False)
     reservation_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# Register pipeline tables whenever the dealership domain is loaded.
+from app.modules.concesionario.opportunity_models import VehicleOpportunity  # noqa: E402,F401

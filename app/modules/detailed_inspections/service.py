@@ -70,7 +70,13 @@ class DetailedInspectionService:
         inspection = await self.draft(order_id, user_id)
         self.ensure_draft(inspection)
         merged = merge_patch(inspection.data, patch.model_dump(mode="json", exclude_unset=True))
-        inspection.data = InspectionData.model_validate(merged).model_dump(mode="json")
+        data = InspectionData.model_validate(merged).model_dump(mode="json")
+        # Keep historical measurements in storage, but never require or expose
+        # the retired field or accept new measurements from older mobile apps.
+        for position, previous in inspection.data.get("tires", {}).items():
+            if isinstance(previous, dict) and "tread_depth" in previous:
+                data["tires"].setdefault(position, {})["tread_depth"] = previous["tread_depth"]
+        inspection.data = data
         inspection.updated_by_user_id = user_id
         await self.db.commit()
         await self.db.refresh(inspection)

@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     logs_dir: str = "logs"
     logs_timezone: str = "America/Caracas"
 
+    vehicle_financing_webhook_secret: str | None = Field(default=None, min_length=32, repr=False)
+
     push_enabled: bool = False
     firebase_project_id: str | None = None
     firebase_credentials_file: str | None = None

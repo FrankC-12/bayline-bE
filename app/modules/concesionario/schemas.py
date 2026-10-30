@@ -23,7 +23,6 @@ from app.modules.concesionario.enums import (
 
 
 class VehicleCreate(BaseModel):
-
     @field_validator("vin")
     @classmethod
     def valid_vin(cls, value):
@@ -75,6 +74,10 @@ class VehicleCreate(BaseModel):
 
 
 class VehicleSaleInput(BaseModel):
+    usd_account_id: uuid.UUID | None = None
+    bs_account_id: uuid.UUID | None = None
+    opportunity_id: uuid.UUID | None = None
+    opportunity_version: int | None = Field(default=None, ge=1)
     client_id: uuid.UUID | None = None
     client_name: str = Field(min_length=2, max_length=150)
     client_document: str | None = None
@@ -120,6 +123,10 @@ class VehiclePhotoRemoveInput(BaseModel):
 
 
 class VehicleReservationInput(BaseModel):
+    opportunity_version: int | None = Field(default=None, ge=1)
+    account_id: uuid.UUID | None = None
+    payment_reference: str | None = Field(default=None, min_length=3, max_length=60)
+    payment_channel: Literal["cash", "binance", "paypal", "zelle"] | None = None
     client_id: uuid.UUID
     # The vendedor the reservation — and the unit — is locked to, distinct
     # from whoever is submitting the request (e.g. an admin reserving on a

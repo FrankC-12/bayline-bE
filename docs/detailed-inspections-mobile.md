@@ -17,7 +17,7 @@ Base: `/api/v1/detailed-inspections`.
 
 - `engine`: `leaks` (fugas), `accessory_belt` (correa de accesorio), `air_filter` (filtro de aire), `battery` y `battery_voltage` (voltios).
 - `underbody`: `steering_box` (cajetín de dirección), `tie_rod_ends` (terminales), `dust_boots` (guardapolvos), `pipes` (tuberías), `leaks`, `exhaust_pipe`, `suspension` y `tripod_joints` (tripoides).
-- `tires`: `front_left`, `front_right`, `rear_left`, `rear_right` y `spare`. Cada posición tiene `tread_depth` en mm y `pressure` en psi; ambos admiten cero y rechazan números negativos o no finitos.
+- `tires`: `front_left`, `front_right`, `rear_left`, `rear_right` y `spare`. Cada posición tiene únicamente `pressure` en psi; admite cero y rechaza números negativos o no finitos. La profundidad `tread_depth` se retiró del contrato y ya no se solicita para completar la inspección.
 - `brakes`: `front_pads`, `front_shoes`, `rear_pads` y `rear_shoes`.
 - `observations`: observaciones opcionales del mecánico, hasta 5000 caracteres.
 
@@ -28,7 +28,7 @@ Ejemplo de guardado parcial:
 ```json
 {
   "engine": {"leaks": "bien", "battery": "cargada", "battery_voltage": 12.6},
-  "tires": {"front_left": {"tread_depth": 6.5, "pressure": 32}},
+  "tires": {"front_left": {"pressure": 32}},
   "observations": "Revisar desgaste del neumático delantero derecho."
 }
 ```
@@ -52,3 +52,7 @@ Se registran usuarios de creación, modificación y culminación; cada anexo inc
 ## Despliegue
 
 Ejecutar `alembic upgrade head` con el backend actualizado: revisión `d1e84a790b62`, tabla `detailed_inspections`. No requiere seed ni permisos nuevos; reutiliza los permisos existentes de asesor y técnico.
+
+La plantilla es versión 3. Las mediciones históricas de profundidad se conservan
+en almacenamiento, pero no se muestran ni se devuelven como campos del formulario.
+Si una app anterior envía `tread_depth`, se ignora ese campo sin rechazar la presión.

@@ -132,6 +132,7 @@ class PartSale(Base):
         index=True,
     )
     sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    client_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("clients.id", ondelete="SET NULL"), nullable=True, index=True)
     client_name: Mapped[str] = mapped_column(String(150), nullable=False)
     client_document: Mapped[str | None] = mapped_column(String(20), nullable=True)
     request_reason: Mapped[str] = mapped_column(

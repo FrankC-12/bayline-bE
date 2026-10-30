@@ -107,6 +107,7 @@ class CounterpartyType(str, enum.Enum):
 
 
 class MovementSourceType(str, enum.Enum):
+    VEHICLE_RESERVATION = "vehicle_reservation"
     """What generated an Income/Expense entry when it wasn't typed in by
     hand — lets the account-detail screen link a movement straight back to
     the document that produced it instead of just showing its description."""
